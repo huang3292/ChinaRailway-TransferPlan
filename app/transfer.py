@@ -129,13 +129,15 @@ def _load_screen() -> dict:
         ss, run = _minutes(r["start_start_time"]), _dur_min(r["running_time"])
         ea = _minutes(r["end_arrive_time"])
         if sd is not None and ss is not None:
-            so = t["obs"].setdefault(t["start_key"], {"name": t["start_name"], "telecode": None, "no": 1})
+            so = t["obs"].setdefault(t["start_key"], {"name": t["start_name"],
+                                                      "telecode": r["start_station_telecode"] or None, "no": 1})
             so.setdefault("dep", sd + ss)
             so.setdefault("name", t["start_name"])
             if run is not None and ea is not None:
                 total_mod = (ea - ss) % 1440
                 total = run + (total_mod - run) % 1440
-                eo = t["obs"].setdefault(t["end_key"], {"name": t["end_name"], "telecode": None, "no": None})
+                eo = t["obs"].setdefault(t["end_key"], {"name": t["end_name"],
+                                                        "telecode": r["end_station_telecode"] or None, "no": None})
                 eo.setdefault("arr", sd + ss + total)
                 eo.setdefault("name", t["end_name"])
         no = r["station_no"]
@@ -431,10 +433,13 @@ def _load_services(screen: dict, tt: list) -> list[dict]:
         origin = next((o["dep"] for o in obs if o.get("dep") is not None), None)
         if origin is None:
             continue
+        # 保留始发的实际发车时刻（仅平移到始发当日零点），跨天停站按累计分钟表示，
+        # 与时刻表服务的表示一致，避免发车时刻被归零成 00:00
+        base = origin - (origin % 1440)
         stops = []
         for o in obs:
-            dep = o["dep"] - origin if o.get("dep") is not None else None
-            arr = o["arr"] - origin if o.get("arr") is not None else None
+            dep = o["dep"] - base if o.get("dep") is not None else None
+            arr = o["arr"] - base if o.get("arr") is not None else None
             if dep is None:
                 dep = arr
             if arr is None:
