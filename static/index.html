@@ -92,8 +92,8 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
       <div><label>出发站</label><input id="s-from" class="station-ac" placeholder="输入站名/拼音/电报码，如：厦门"></div>
       <div><label>到达站</label><input id="s-to" class="station-ac" placeholder="如：南平市"></div>
       <div><label>日期</label><input id="s-date" type="date"></div>
-      <div class="narrow"><label>最短换乘(分)</label><input id="s-min" type="number" value="30"></div>
-      <div class="narrow"><label>最长换乘(分)</label><input id="s-max" type="number" value="360"></div>
+      <div class="narrow transfer-only"><label>最短换乘(分)</label><input id="s-min" type="number" value="30"></div>
+      <div class="narrow transfer-only"><label>最长换乘(分)</label><input id="s-max" type="number" value="360"></div>
       <div style="flex:0"><button class="btn" id="s-go">搜索</button></div>
     </div>
     <div class="row" style="margin-top:10px">
@@ -120,7 +120,7 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
       <div style="flex:0 0 210px"><label>到达时间</label>
         <div style="display:flex;gap:4px"><input id="s-arr1" type="time"><input id="s-arr2" type="time"></div></div>
     </div>
-    <div class="row" style="margin-top:10px">
+    <div class="row transfer-only" style="margin-top:10px">
       <div style="flex:0 0 210px"><label>换乘等待(分)</label>
         <div style="display:flex;gap:4px"><input id="s-wmin" type="number" placeholder="最小"><input id="s-wmax" type="number" placeholder="最大"></div></div>
       <div><label>换乘站</label><input id="s-tst" placeholder="如 福州"></div>
@@ -135,6 +135,20 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
 
 <!-- ============ 爬取 ============ -->
 <section class="tab" id="tab-crawl">
+  <div class="card">
+    <h3>请求速率（限速）</h3>
+    <div class="row">
+      <div style="flex:0 0 150px"><label>模式</label>
+        <select id="c-rate-mode">
+          <option value="auto">智能（自动）</option>
+          <option value="manual">手动</option>
+        </select></div>
+      <div style="flex:0 0 130px"><label>手动间隔(秒)</label><input id="c-rate-interval" type="number" step="0.1" min="0.4" max="12" value="1.5"></div>
+      <div style="flex:0"><button class="btn sec" id="c-rate-save">应用</button></div>
+      <div style="flex:2"><label>&nbsp;</label><span class="hint" id="c-rate-status" style="margin:0">加载中…</span></div>
+    </div>
+    <div class="hint">智能模式：无风控时自动加快（最快 0.4s/次），检测到风控（非 JSON / 4xx / 返回异常）立刻放缓（最慢 12s/次），连续成功 3 次后逐步提速。手动模式：固定按设定间隔请求。</div>
+  </div>
   <div class="card">
     <h3>车站站名表（电报码）</h3>
     <button class="btn sec" id="c-stations">更新车站站名表</button>
@@ -229,6 +243,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');$('tab-'+b.dataset.tab).classList.add('active');
   if(b.dataset.tab==='browse')loadStats();
+  if(b.dataset.tab==='crawl')loadRate();
 });
 
 function msg(id,text,ok=true){const el=$(id);el.textContent=text;el.className='msg '+(ok?'ok':'err');}
@@ -296,7 +311,14 @@ $('s-go').onclick=async()=>{
   }catch(e){msg('s-msg',e.message,false);}
   btn.disabled=false;
 };
-['s-sort','s-type','s-size','s-seat','s-same'].forEach(id=>$(id).onchange=()=>{page=1;render();});
+['s-sort','s-type','s-size','s-seat','s-same'].forEach(id=>$(id).onchange=()=>{applyTypeUI();page=1;render();});
+// 方案类型=仅直达时，隐藏与换乘无关的换乘时间/换乘站/换乘类型输入框
+function applyTypeUI(){
+  const direct=$('s-type').value==='direct';
+  document.querySelectorAll('.transfer-only').forEach(el=>el.style.display=direct?'none':'');
+  if(direct){$('s-wmin').value='';$('s-wmax').value='';$('s-tst').value='';$('s-same').value='';}
+}
+applyTypeUI();
 ['s-filter','s-prefix','s-dep1','s-dep2','s-arr1','s-arr2','s-wmin','s-wmax','s-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();});
 
 function legKey(l){return [l.train_no,l.from_telecode||l.from,l.to_telecode||l.to,l.depart.slice(0,10)].join('|');}
@@ -478,6 +500,25 @@ async function crawlTTPlan(k,i){
 }
 
 // ---------- 爬取 ----------
+async function loadRate(){
+  try{
+    const r=await api('/api/rate');
+    $('c-rate-mode').value=r.mode;
+    $('c-rate-interval').value=r.manual_interval!=null?r.manual_interval:r.interval;
+    $('c-rate-status').textContent=r.mode==='manual'
+      ?`当前：手动 ${r.manual_interval}s/次`
+      :`当前：智能自适应 ${r.interval}s/次（连续成功 ${r.ok_streak}/3）`;
+  }catch(e){$('c-rate-status').textContent='读取失败';}
+}
+$('c-rate-save').onclick=async()=>{
+  try{
+    const body={mode:$('c-rate-mode').value,interval:+$('c-rate-interval').value||null};
+    const r=await post('/api/rate',body);
+    $('c-rate-status').textContent=r.mode==='manual'
+      ?`已应用：手动 ${r.manual_interval}s/次`
+      :`已应用：智能自适应（当前 ${r.interval}s/次）`;
+  }catch(e){alert(e.message);}
+};
 $('c-stations').onclick=async()=>{
   try{const r=await post('/api/crawl/stations',{});msg('c-st-msg',`站名表更新成功：${r.saved} 个车站`);}
   catch(e){msg('c-st-msg',e.message,false);}
@@ -532,6 +573,7 @@ async function pollJob(id,body){
     try{
       const j=await api('/api/jobs/'+id);
       msg('c-t-msg',`票价爬取 ${j.done}/${j.total}`+(j.errors.length?`，失败 ${j.errors.length}`:''));
+      loadRate();
       if(j.status==='done'){clearInterval(timer);msg('c-t-msg',`票价爬取完成 ${j.done}/${j.total}`+(j.errors.length?`，失败：\n${j.errors.join('\n')}`:''));}
     }catch(e){clearInterval(timer);}
   },2000);

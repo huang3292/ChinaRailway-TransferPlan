@@ -15,7 +15,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 KYFW = "https://kyfw.12306.cn"
 MOBILE = "https://mobile.12306.cn"
-MIN_INTERVAL = 1.2  # 秒，全局请求间隔
+MIN_INTERVAL = 1.0    # 初始/默认请求间隔（秒）
+MIN_FLOOR = 0.4       # 智能模式最快间隔
+MAX_CEIL = 12.0       # 智能模式最慢间隔（触发风控后）
 
 
 class CrawlError(Exception):
@@ -30,10 +32,56 @@ class Crawler:
         self._last = 0.0
         self._left_ticket_url = None
         self._inited = False
+        self._interval = MIN_INTERVAL
+        self._ok_streak = 0
+        self._manual = None
+        self._load_rate()
+
+    def _load_rate(self):
+        try:
+            if db.get_setting("rate_mode") == "manual":
+                v = db.get_setting("rate_interval")
+                if v:
+                    self._manual = max(MIN_FLOOR, min(MAX_CEIL, float(v)))
+        except Exception:
+            self._manual = None
+
+    # ---- 自适应限速 ----
+    def status(self) -> dict:
+        return {
+            "mode": "manual" if self._manual is not None else "auto",
+            "interval": round(self._interval, 2),
+            "manual_interval": round(self._manual, 2) if self._manual is not None else None,
+            "ok_streak": self._ok_streak,
+            "floor": MIN_FLOOR,
+            "ceiling": MAX_CEIL,
+        }
+
+    def set_rate(self, mode: str, interval: float | None = None) -> dict:
+        if mode == "manual":
+            val = float(interval if interval is not None else MIN_INTERVAL)
+            self._manual = max(MIN_FLOOR, min(MAX_CEIL, val))
+        else:
+            self._manual = None
+        db.set_setting("rate_mode", "manual" if self._manual is not None else "auto")
+        if self._manual is not None:
+            db.set_setting("rate_interval", self._manual)
+        return self.status()
+
+    def _note_ok(self):
+        self._ok_streak += 1
+        if self._ok_streak >= 3:
+            self._interval = max(MIN_FLOOR, self._interval * 0.8)
+            self._ok_streak = 0
+
+    def _note_throttled(self):
+        self._ok_streak = 0
+        self._interval = min(MAX_CEIL, self._interval * 2.0 + 0.3)
 
     def _throttle(self):
         with self._lock:
-            wait = MIN_INTERVAL - (time.monotonic() - self._last)
+            target = self._manual if self._manual is not None else self._interval
+            wait = target - (time.monotonic() - self._last)
             if wait > 0:
                 time.sleep(wait)
             self._last = time.monotonic()
@@ -47,9 +95,11 @@ class Crawler:
                 resp = self.session.request(method, url, params=params, data=data,
                                             headers=headers, timeout=20)
                 resp.raise_for_status()
+                self._note_ok()
                 return resp
             except requests.RequestException as e:
                 last_err = e
+                self._note_throttled()
                 time.sleep(2 * (attempt + 1))
         raise CrawlError(f"请求失败 {url}: {last_err}")
 
@@ -58,6 +108,7 @@ class Crawler:
         try:
             return resp.json()
         except ValueError:
+            self._note_throttled()
             raise CrawlError(f"{url} 返回非 JSON（可能被风控，稍后再试）")
 
     def ensure_init(self):
@@ -79,6 +130,7 @@ class Crawler:
             "POST", f"{MOBILE}/wxxcx/wechat/bigScreen/queryTrainByStation",
             data={"train_start_date": date.replace("-", ""), "train_station_code": telecode})
         if not isinstance(payload.get("data"), list):
+            self._note_throttled()
             raise CrawlError(f"车站大屏返回异常: {str(payload)[:200]}")
         return importer.ingest(json.dumps(payload, ensure_ascii=False), "station_screen",
                                ctx={"station": telecode, "date": date}, source="crawl")
@@ -118,6 +170,7 @@ class Crawler:
             payload = self._json("GET", f"{KYFW}/otn/{self._left_ticket_url}",
                                  params=params, referer=f"{KYFW}/otn/leftTicket/init")
         if not isinstance((payload.get("data") or {}).get("result"), list):
+            self._note_throttled()
             raise CrawlError(f"余票查询返回异常: {str(payload)[:200]}")
         return importer.ingest(json.dumps(payload, ensure_ascii=False), "left_ticket",
                                ctx={"from": from_telecode, "to": to_telecode, "date": date},
@@ -134,6 +187,7 @@ class Crawler:
                     "train_date": date},
             referer=f"{KYFW}/otn/leftTicket/init")
         if not isinstance(payload.get("data"), dict) or "train_no" not in payload["data"]:
+            self._note_throttled()
             raise CrawlError(f"票价查询返回异常: {str(payload)[:200]}")
         return importer.ingest(json.dumps(payload, ensure_ascii=False), "price",
                                ctx={"train_no": train_no, "date": date,

@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS prices(
   raw_id INTEGER,
   UNIQUE(train_no, train_date, from_station_no, to_station_no, seat_type)
 );
+
+CREATE TABLE IF NOT EXISTS settings(
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
 """
 
 
@@ -184,3 +189,17 @@ def resolve_station(q: str) -> dict | None:
     r = rows("SELECT * FROM stations WHERE telecode=? OR name=? OR name=? LIMIT 1",
              (q.upper(), q, q.removesuffix("站")))
     return r[0] if r else None
+
+
+def get_setting(key: str, default=None):
+    r = rows("SELECT value FROM settings WHERE key=?", (key,))
+    return r[0]["value"] if r else default
+
+
+def set_setting(key: str, value):
+    with tx() as conn:
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )

@@ -64,6 +64,24 @@ def stations(q: str = "", limit: int = 30):
     return db.rows("SELECT * FROM stations LIMIT ?", (limit,))
 
 
+# ---------- 请求速率 ----------
+@app.get("/api/rate")
+def get_rate():
+    return crawler.status()
+
+
+class RateBody(BaseModel):
+    mode: str
+    interval: float | None = None
+
+
+@app.post("/api/rate")
+def set_rate(body: RateBody):
+    if body.mode not in ("auto", "manual"):
+        raise HTTPException(400, "mode 必须为 auto 或 manual")
+    return crawler.set_rate(body.mode, body.interval)
+
+
 # ---------- 导入 ----------
 class ImportBody(BaseModel):
     payload: str

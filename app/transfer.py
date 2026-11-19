@@ -408,6 +408,12 @@ def search(from_q: str, to_q: str, date: str,
     base = datetime.strptime(date, "%Y-%m-%d")
     day_min = base.toordinal() * 1440
     prices, seats = _price_map(), _seat_map()
+    n2c = db.station_lookup()
+    # 当日已爬取到权威余票的 OD：用于校验“按每日开行推算”方案是否与实际余票冲突
+    real_tk = {}
+    for r in db.rows("SELECT from_telecode,to_telecode,train_date,train_no FROM tickets"):
+        if r["from_telecode"] and r["to_telecode"]:
+            real_tk.setdefault((r["from_telecode"], r["to_telecode"], r["train_date"]), set()).add(r["train_no"])
     cal = fare.load_calibration()
     sno = {(r["train_no"], r["telecode"]): r["station_no"]
            for r in db.rows("SELECT train_no,telecode,station_no FROM train_stops WHERE telecode IS NOT NULL")}
@@ -465,12 +471,30 @@ def search(from_q: str, to_q: str, date: str,
             r["from_telecode"], r["to_telecode"], date, prices, seats,
             code=r["station_train_code"], duration_min=dur, cal=cal, sno=sno)]})
 
+    def _assumed_conflict(p) -> bool:
+        """推算方案（无当日真实数据平移而来）若与实际余票冲突，则以实际余票为准剔除。"""
+        if not p.get("date_assumed"):
+            return False
+        for l in p["legs"]:
+            ftc = l.get("from_telecode") or n2c.get(l.get("from"))
+            ttc = l.get("to_telecode") or n2c.get(l.get("to"))
+            key = (ftc, ttc, l["depart"][:10])
+            if None in key:
+                continue
+            if key in real_tk and l["train_no"] not in real_tk[key]:
+                return True
+        return False
+
+    direct = [p for p in direct if not _assumed_conflict(p)]
+    transfers = [p for p in transfers if not _assumed_conflict(p)]
+
     direct.sort(key=lambda x: x["total_min"])
     transfers.sort(key=lambda x: x["total_min"])
     return {
         "from": fs["name"], "to": ts["name"], "date": date,
         "screen_trains": len(screen), "timetable_trains": len(tt),
         "note": "大屏数据优先按真实开行日期，无当日数据时按最近爬取日期每日开行假设平移；"
+                "推算方案若与当日实际余票冲突（该车次当日不开行）则自动剔除；"
                 "异站换乘为同城车站，额外预留30分钟；已剔除折返/绕回出发站的无意义方案",
         "direct": direct[:limit] if limit > 0 else direct,
         "transfers": transfers[:limit] if limit > 0 else transfers,
