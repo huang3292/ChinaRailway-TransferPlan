@@ -105,6 +105,8 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
         </select></div>
       <div style="flex:0 0 120px"><label>方案类型</label>
         <select id="s-type"><option value="">全部</option><option value="direct">仅直达</option><option value="transfer">仅换乘</option></select></div>
+      <div style="flex:0 0 130px"><label>最多程数</label>
+        <select id="s-legs"><option value="2" selected>2程(1次换乘)</option><option value="3">3程(2次换乘)</option><option value="4">4程(3次换乘)</option><option value="5">5程(4次换乘)</option></select></div>
       <div style="flex:0 0 100px"><label>每页方案数</label>
         <select id="s-size"><option>20</option><option selected>50</option><option>100</option><option>200</option></select></div>
       <div style="flex:2"><label>&nbsp;</label>
@@ -301,7 +303,7 @@ $('s-go').onclick=async()=>{
   const btn=$('s-go');btn.disabled=true;$('s-result').innerHTML='';
   try{
     const p=new URLSearchParams({from_station:$('s-from').value,to_station:$('s-to').value,date:$('s-date').value,
-      min_wait:$('s-min').value||30,max_wait:$('s-max').value||360});
+      min_wait:$('s-min').value||30,max_wait:$('s-max').value||360,max_legs:$('s-legs').value});
     R=await api('/api/transfers?'+p);page=1;
     R.direct.forEach((x,i)=>{x._k='d'+i;x._type='direct';});
     R.transfers.forEach((x,i)=>{x._k='t'+i;x._type='transfer';});
@@ -374,9 +376,10 @@ function filterPlans(list){
     if(a1&&arr<a1)return false;
     if(a2&&arr>a2)return false;
     if(p._type==='transfer'){
-      if(p.wait_min<wmin||p.wait_min>wmax)return false;
-      if(tst&&!(p.transfer_station||'').includes(tst))return false;
-      if(same!==''&&String(p.same_station?1:0)!==same)return false;
+      const ts=p.transfers||[];
+      if(ts.some(t=>(t.wait_min||0)<wmin||(t.wait_min||0)>wmax))return false;
+      if(tst&&!ts.some(t=>(t.station||'').includes(tst)))return false;
+      if(same!==''&&!ts.some(t=>String(t.same?1:0)===same))return false;
     }
     return true;
   });
@@ -416,16 +419,24 @@ function planHtml(p){
     <span>${pricesHtml(l.prices)||estText(l.price_est)}</span>
     <button class="mini" onclick="toggleTT('${p._k}',${i})">时刻表</button>
   </div><div id="tt-${p._k}-${i}" class="ttbox"></div>`;});
-  const tags=`<span class="tag">${p._type==='direct'?'直达':'换乘'}</span>`+
-    (p._type==='transfer'?`<span class="tag">${p.same_station?'同站换乘':'异站换乘·同城'}</span>`:'')+
+  const trs=p._type==='transfer'?(p.transfers||[]):[];
+  const tag_transfer=trs.length?(trs.every(t=>t.same)?'全程同站换乘':(trs.every(t=>!t.same)?'全程异站换乘':'含异站换乘')):'';
+  const tags=`<span class="tag">${p._type==='direct'?'直达':`换乘${trs.length}次`}</span>`+
+    (tag_transfer?`<span class="tag">${tag_transfer}</span>`:'')+
     (p.date_assumed?'<span class="tag est" title="无当日数据，按最近爬取日期每日开行假设推算">按每日开行推算</span>':'')+
     (gone?'<span class="tag" style="color:#dc2626">已发车</span>':'');
-  const sum=p.wait_min!=null
-    ?`<b>${fmtMin(p.total_min)}</b> ${tags} ${esc(p.transfer_station)}${p.same_station?'':'→'+esc(p.legs[1].from)}换乘 · 等待 ${fmtMin(p.wait_min)}`
+  const sum=p._type==='transfer'
+    ?`<b>${fmtMin(p.total_min)}</b> ${tags} ${trs.map(t=>esc(t.station||'')).join('→')} 换乘 · 总等待 ${fmtMin(trs.reduce((a,t)=>a+(t.wait_min||0),0))}`
     :`<b>${fmtMin(p.total_min)}</b> ${tags}`;
   const btn=gone?'':`<button class="mini" onclick="queryPlan('${p._k}')">查票价余票</button>`;
-  let html=`<div class="plan"><div class="sum"><span>${sum}</span>${totalPrice(p)}${btn}</div>${legs[0]}`;
-  if(legs[1])html+=`<div class="wait">⏱ ${esc(p.transfer_station)}${p.same_station?'':'→'+esc(p.legs[1].from)+' 异站换乘（含跨站交通）'} 换乘，预留 ${fmtMin(p.wait_min)}</div>${legs[1]}`;
+  let html=`<div class="plan"><div class="sum"><span>${sum}</span>${totalPrice(p)}${btn}</div>`;
+  for(let i=0;i<p.legs.length;i++){
+    html+=legs[i];
+    if(i<p.legs.length-1){
+      const tr=trs[i]||{station:'',same:true,wait_min:0};
+      html+=`<div class="wait">⏱ ${esc(tr.station||'')}${tr.same?'':'→'+esc(p.legs[i+1].from)+' 异站换乘（含跨站交通）'} 换乘，预留 ${fmtMin(tr.wait_min||0)}</div>`;
+    }
+  }
   return html+'</div>';
 }
 function findPlan(k){return (k[0]==='d'?R.direct:R.transfers)[+k.slice(1)];}

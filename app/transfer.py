@@ -50,6 +50,10 @@ def _fmt_epoch(m: int) -> str:
     return (datetime.fromordinal(m // 1440) + timedelta(minutes=m % 1440)).strftime("%Y-%m-%d %H:%M")
 
 
+def _epoch(s: str) -> int:
+    return _date_min(s[:10]) + _minutes(s[11:16])
+
+
 def _fmt(base: datetime, minutes: int) -> str:
     return (base + timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M")
 
@@ -398,8 +402,162 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
     return direct, transfers
 
 
+# ---------- 多程换乘（3 程及以上，每日开行假设） ----------
+MAX_TOTAL_MIN = 2880   # 总行程上限（分钟，48 小时），防止组合爆炸
+FRONTIER_K = 4         # 每个站每层保留的最早到达状态数（剪枝）
+
+
+def _load_services(screen: dict, tt: list) -> list[dict]:
+    """把大屏与时刻表数据统一成“车次服务”，停站为相对始发的分钟数。"""
+    services, seen = [], set()
+    for t in tt:
+        if t.train_no in seen:
+            continue
+        seen.add(t.train_no)
+        stops = [{"key": s["key"], "name": s["station_name"], "telecode": s["telecode"],
+                  "no": s["station_no"], "dep": s["dep"], "arr": s["arr"],
+                  "enabled": s.get("enabled", 1)} for s in t.stops]
+        if len(stops) >= 2:
+            services.append({"train_no": t.train_no, "code": t.code, "stops": stops})
+    for run, t in screen.items():
+        tn = run[0]
+        if tn in seen:
+            continue
+        obs = [o for o in t["obs"].values()
+               if o.get("no") is not None and (o.get("dep") is not None or o.get("arr") is not None)]
+        if len(obs) < 2:
+            continue
+        obs.sort(key=lambda o: o["no"])
+        origin = next((o["dep"] for o in obs if o.get("dep") is not None), None)
+        if origin is None:
+            continue
+        stops = []
+        for o in obs:
+            dep = o["dep"] - origin if o.get("dep") is not None else None
+            arr = o["arr"] - origin if o.get("arr") is not None else None
+            if dep is None:
+                dep = arr
+            if arr is None:
+                arr = dep
+            if dep is None:
+                continue
+            stops.append({"key": o.get("telecode") or o.get("name"), "name": o.get("name"),
+                          "telecode": o.get("telecode"), "no": o.get("no"),
+                          "dep": dep, "arr": arr, "enabled": 1})
+        if len(stops) >= 2:
+            services.append({"train_no": tn, "code": t.get("code") or obs[0].get("code"), "stops": stops})
+    return services
+
+
+def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs,
+                  prices, seats, cal, sno, cities) -> list[dict]:
+    """BFS 多程换乘，返回 3..max_legs 程的换乘方案（含换乘段明细）。"""
+    if max_legs < 3:
+        return []
+    by_station = {}
+    for si, sv in enumerate(services):
+        for i, st in enumerate(sv["stops"]):
+            if st["enabled"]:
+                by_station.setdefault(st["key"], []).append((si, i))
+    available = set(by_station)
+    tele_of = cities[2]
+
+    def make_leg(sv, i, j, n):
+        a, b = sv["stops"][i], sv["stops"][j]
+        dep = base_min + a["dep"] + n * 1440
+        arr = base_min + b["arr"] + n * 1440
+        return _enrich({
+            "train": sv["code"], "train_no": sv["train_no"],
+            "from": a["name"], "to": b["name"],
+            "from_telecode": a["telecode"], "to_telecode": b["telecode"],
+            "depart": _fmt_epoch(dep), "arrive": _fmt_epoch(arr),
+            "duration_min": b["arr"] - a["dep"],
+        }, sv["train_no"], a["no"], b["no"], a["telecode"], b["telecode"],
+            _fmt_epoch(dep)[:10], prices, seats, code=sv["code"],
+            duration_min=b["arr"] - a["dep"], cal=cal, sno=sno)
+
+    # 初始状态：从出发站坐首程，出发日 = 查询日
+    init = []
+    for fk in fkeys:
+        for si, i in by_station.get(fk, ()):
+            sv = services[si]
+            st = sv["stops"][i]
+            if st["key"] not in fkeys:
+                continue
+            n0 = -(st["dep"] // 1440)
+            for j in range(i + 1, len(sv["stops"])):
+                b = sv["stops"][j]
+                if not b["enabled"]:
+                    continue
+                leg = make_leg(sv, i, j, n0)
+                passed = frozenset(sv["stops"][k]["key"] for k in range(i, j + 1))
+                init.append({"arr": _epoch(leg["arrive"]), "station": b["key"], "name": b["name"],
+                             "passed": passed, "legs": [leg], "transfers": [],
+                             "start": _epoch(leg["depart"])})
+
+    results, frontier = [], init
+    for _depth in range(2, max_legs + 1):
+        nxt = {}
+        for state in frontier:
+            t = state["arr"]
+            if t - state["start"] > MAX_TOTAL_MIN:
+                continue
+            exclude = frozenset(tele_of.get(x, x) for x in state["passed"])
+            for dk in _dep_keys(state["station"], state["name"], available, cities, exclude=exclude):
+                same = dk == state["station"]
+                eff_min = min_wait if same else min_wait + 30
+                for si, i in by_station.get(dk, ()):
+                    sv = services[si]
+                    if sv["train_no"] == state["legs"][-1]["train_no"]:
+                        continue
+                    st_i = sv["stops"][i]
+                    n = math.ceil((t + eff_min - (base_min + st_i["dep"])) / 1440)
+                    if n < 0:
+                        n = 0
+                    dep = base_min + st_i["dep"] + n * 1440
+                    wait = dep - t
+                    if wait > max_wait:
+                        continue
+                    for j in range(i + 1, len(sv["stops"])):
+                        b = sv["stops"][j]
+                        if not b["enabled"] or b["key"] in state["passed"]:
+                            continue
+                        if any(sv["stops"][k]["key"] in state["passed"] for k in range(i + 1, j)):
+                            continue
+                        leg = make_leg(sv, i, j, n)
+                        new_passed = state["passed"] | frozenset(sv["stops"][k]["key"] for k in range(i, j + 1))
+                        new_legs = state["legs"] + [leg]
+                        new_transfers = state["transfers"] + [{"station": state["name"],
+                                                                "same": same, "wait_min": wait}]
+                        total = _epoch(leg["arrive"]) - state["start"]
+                        if total > MAX_TOTAL_MIN:
+                            continue
+                        if b["key"] in tkeys and len(new_legs) >= 3:
+                            results.append({"total_min": total, "date_assumed": True,
+                                            "legs": new_legs, "transfers": new_transfers})
+                        else:
+                            nxt.setdefault(b["key"], []).append(
+                                {"arr": _epoch(leg["arrive"]), "station": b["key"], "name": b["name"],
+                                 "passed": new_passed, "legs": new_legs, "transfers": new_transfers,
+                                 "start": state["start"]})
+        frontier = []
+        for bucket in nxt.values():
+            bucket.sort(key=lambda s: s["arr"])
+            frontier.extend(bucket[:FRONTIER_K])
+        if not frontier:
+            break
+
+    dedup = {}
+    for p in results:
+        key = (tuple(l["train_no"] for l in p["legs"]), p["legs"][0]["depart"])
+        if key not in dedup or p["total_min"] < dedup[key]["total_min"]:
+            dedup[key] = p
+    return list(dedup.values())
+
+
 def search(from_q: str, to_q: str, date: str,
-           min_wait: int = 30, max_wait: int = 360, limit: int = 0) -> dict:
+           min_wait: int = 30, max_wait: int = 360, limit: int = 0,
+           max_legs: int = 2) -> dict:
     fs, ts = db.resolve_station(from_q), db.resolve_station(to_q)
     if not fs or not ts:
         raise ValueError("车站不存在，请先在“爬取数据”页更新车站站名表")
@@ -447,7 +605,19 @@ def search(from_q: str, to_q: str, date: str,
                p["transfer_station"], p["legs"][1]["from"], p["legs"][0]["depart"])
         if key not in merged_t or rank(p) < rank(merged_t[key]):
             merged_t[key] = p
-    transfers = list(merged_t.values())
+    transfers = []
+    for p in merged_t.values():
+        if "transfers" not in p:
+            p["transfers"] = [{"station": p.get("transfer_station"),
+                               "same": bool(p.get("same_station", True)),
+                               "wait_min": p.get("wait_min", 0)}]
+        transfers.append(p)
+
+    # 引擎 D：多程换乘（3 程及以上，每日开行假设）
+    if max_legs >= 3:
+        services = _load_services(screen, tt)
+        transfers.extend(_search_multi(services, fkeys, tkeys, day_min, min_wait, max_wait,
+                                       max_legs, prices, seats, cal, sno, cities))
 
     # 引擎 C：仅有余票数据的直达
     have = {p["legs"][0]["train_no"] for p in direct}

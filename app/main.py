@@ -244,8 +244,12 @@ def prices(train_no: str):
 # ---------- 换乘搜索 ----------
 @app.get("/api/transfers")
 def transfers(from_station: str, to_station: str, date: str,
-              min_wait: int = 30, max_wait: int = 360, limit: int = 0):
-    return _run(transfer.search, from_station, to_station, date, min_wait, max_wait, limit)
+              min_wait: int = 30, max_wait: int = 360, limit: int = 0,
+              max_legs: int = 2):
+    if max_legs < 1 or max_legs > 6:
+        raise HTTPException(400, "max_legs 必须在 1-6 之间")
+    return _run(transfer.search, from_station, to_station, date,
+                min_wait, max_wait, limit, max_legs)
 
 
 # ---------- 方案票价/余票实时查询 ----------
