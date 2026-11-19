@@ -123,8 +123,6 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
         <div style="display:flex;gap:4px"><input id="s-arr1" type="time"><input id="s-arr2" type="time"></div></div>
     </div>
     <div class="row transfer-only" style="margin-top:10px">
-      <div style="flex:0 0 210px"><label>换乘等待(分)</label>
-        <div style="display:flex;gap:4px"><input id="s-wmin" type="number" placeholder="最小"><input id="s-wmax" type="number" placeholder="最大"></div></div>
       <div><label>换乘站</label><input id="s-tst" placeholder="如 福州"></div>
       <div style="flex:0 0 150px"><label>换乘类型</label>
         <select id="s-same"><option value="">不限</option><option value="1">同站换乘</option><option value="0">异站换乘(同城)</option></select></div>
@@ -318,10 +316,10 @@ $('s-go').onclick=async()=>{
 function applyTypeUI(){
   const direct=$('s-type').value==='direct';
   document.querySelectorAll('.transfer-only').forEach(el=>el.style.display=direct?'none':'');
-  if(direct){$('s-wmin').value='';$('s-wmax').value='';$('s-tst').value='';$('s-same').value='';}
+  if(direct){$('s-tst').value='';$('s-same').value='';}
 }
 applyTypeUI();
-['s-filter','s-prefix','s-dep1','s-dep2','s-arr1','s-arr2','s-wmin','s-wmax','s-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();});
+['s-filter','s-prefix','s-dep1','s-dep2','s-arr1','s-arr2','s-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();});
 
 function legKey(l){return [l.train_no,l.from_telecode||l.from,l.to_telecode||l.to,l.depart.slice(0,10)].join('|');}
 function priceKey(p){
@@ -361,9 +359,8 @@ function filterPlans(list){
   const prefixes=$('s-prefix').value.toUpperCase().split(/[,，\s]+/).filter(Boolean);
   const seat=$('s-seat').value,type=$('s-type').value,same=$('s-same').value;
   const d1=$('s-dep1').value,d2=$('s-dep2').value,a1=$('s-arr1').value,a2=$('s-arr2').value;
-  const wmin=+$('s-wmin').value||0,wmax=+$('s-wmax').value||Infinity;
   const tst=$('s-tst').value.trim();
-  const transferOnly=same!==''||tst!==''||wmin>0||wmax<Infinity;
+  const transferOnly=same!==''||tst!=='';
   return list.filter(p=>{
     if(type&&p._type!==type)return false;
     if(transferOnly&&p._type!=='transfer')return false;
@@ -377,7 +374,6 @@ function filterPlans(list){
     if(a2&&arr>a2)return false;
     if(p._type==='transfer'){
       const ts=p.transfers||[];
-      if(ts.some(t=>(t.wait_min||0)<wmin||(t.wait_min||0)>wmax))return false;
       if(tst&&!ts.some(t=>(t.station||'').includes(tst)))return false;
       if(same!==''&&!ts.some(t=>String(t.same?1:0)===same))return false;
     }
