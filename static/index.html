@@ -45,6 +45,18 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
 .wait{font-size:12px;color:#b45309;background:#fffbeb;border-radius:4px;padding:2px 8px;display:inline-block;margin:2px 0 2px 70px}
 .tag{display:inline-block;background:#f1f5f9;border-radius:4px;padding:1px 6px;font-size:12px;margin-right:4px}
 .est{color:#b45309}
+.tcode{display:inline-block;min-width:56px;padding:3px 8px;border-radius:6px;color:#fff;font-size:14px;font-weight:bold;text-align:center;line-height:1.25}
+.tcode.blue{background:#3f89ec}
+.tcode.green{background:#58a832}
+.seats{display:inline-flex;flex-wrap:wrap;gap:4px}
+.seat{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;min-width:38px;padding:3px 6px;border-radius:6px;border:1px solid var(--border);background:#fff}
+.seat .sn{font-size:11px;color:var(--muted);line-height:1.1}
+.seat .sv{font-size:13px;font-weight:bold;line-height:1.3;margin-top:2px}
+.seat.full .sv{color:#16a34a}
+.seat.num .sv{color:#3f89ec}
+.seat.none .sv{color:#c8ccd4}
+.price{color:#f0412d;font-weight:bold;font-size:15px;white-space:nowrap}
+.price small{font-size:11px;font-weight:normal;color:var(--muted);margin-left:1px}
 .ac{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid var(--border);border-radius:6px;max-height:260px;overflow:auto;z-index:20;display:none;box-shadow:0 4px 12px rgba(0,0,0,.12)}
 .ac .it{padding:6px 10px;cursor:pointer;font-size:14px}
 .ac .it:hover,.ac .it.sel{background:#eff6ff}
@@ -229,8 +241,9 @@ async function api(url,opt){
 }
 function post(url,body){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}
 function fmtMin(m){const h=Math.floor(m/60),x=m%60;return h?`${h}小时${x?x+'分':''}`:`${x}分`;}
-function seatsText(s){if(!s)return'';return Object.entries(s).map(([k,v])=>`${SEAT[k]||k}:${v}`).join(' ');}
-function pricesText(p){if(!p||!p.length)return'';return p.map(x=>`${x.seat} ¥${x.price}`).join('　');}
+function trainBadge(code){const c=(String(code||'').match(/^[A-Za-z]/)||[''])[0].toUpperCase();const blue=['G','C','D','Z','T'];return `<span class="tcode ${blue.includes(c)?'blue':'green'}">${esc(code)}</span>`;}
+function seatsHtml(s){if(!s)return'';const arr=Object.entries(s);if(!arr.length)return'';return `<span class="seats">${arr.map(([k,v])=>{const name=SEAT[k]||k;let cls='none',label=v;if(v==='有')cls='full';else if(v==null||v===''||v==='无'||v==='--'||v==='*'){cls='none';}else cls='num';if(v==null||v==='')label='--';return `<span class="seat ${cls}"><span class="sn">${esc(name)}</span><span class="sv">${esc(label)}</span></span>`;}).join('')}</span>`;}
+function pricesHtml(p){if(!p||!p.length)return'';const min=Math.min(...p.map(x=>+x.price));const detail=p.map(x=>`${x.seat} ¥${x.price}`).join('　');return `<span class="price" title="${esc(detail)}">¥${yuan(min)}<small>起</small></span>`;}
 function estText(e){if(!e)return'';const s=Object.values(e.seats).slice(0,3).map(x=>`${x.name} ¥${x.min}–${x.max}`).join('　');return `<span class="est" title="${esc(e.basis)}">估 ${s}</span>`;}
 
 // 车站自动补全：中文站名为主，附电报码与城市，支持拼音/电报码检索
@@ -308,7 +321,7 @@ function totalPrice(p){
     else miss=true;
   }
   if(!has)return '';
-  const txt=est?(min===max?`合计 估 ¥${yuan(min)}`:`合计 估 ¥${yuan(min)}–${yuan(max)}`):`合计 ¥${yuan(min)}`;
+  const txt=est?(min===max?`合计 估 ¥${yuan(min)}`:`合计 估 ¥${yuan(min)}–${yuan(max)}`):`合计 <span class="price">¥${yuan(min)}</span>`;
   return `<span class="${est?'est':''}" style="font-weight:bold">${txt}${miss?'（部分程无价）':''}</span>`;
 }
 function sortPlans(list){
@@ -369,16 +382,16 @@ function render(){
 function planHtml(p){
   const gone=departed(p);
   const legs=p.legs.map((l,i)=>{
-    let extra=seatsText(l.seats);
+    let extra=seatsHtml(l.seats);
     if(l.can_web_buy==='N')extra+=' <span style="color:#dc2626">不可购</span>';
     if(l.ticket_error)extra+=` <span style="color:#dc2626">${esc(l.ticket_error)}</span>`;
     return `<div class="leg">
-    <span class="code">${esc(l.train)}</span>
+    ${trainBadge(l.train)}
     <span><span class="time">${l.depart.slice(11)}</span> <span class="st">${esc(l.from)} ${l.depart.slice(5,10)}</span></span>
     <span class="st">→ ${fmtMin(l.duration_min)} →</span>
     <span><span class="time">${l.arrive.slice(11)}</span> <span class="st">${esc(l.to)} ${l.arrive.slice(5,10)}</span></span>
     <span class="extra">${extra}</span>
-    <span class="extra">${pricesText(l.prices)||estText(l.price_est)}</span>
+    <span>${pricesHtml(l.prices)||estText(l.price_est)}</span>
     <button class="mini" onclick="toggleTT('${p._k}',${i})">时刻表</button>
   </div><div id="tt-${p._k}-${i}" class="ttbox"></div>`;});
   const tags=`<span class="tag">${p._type==='direct'?'直达':'换乘'}</span>`+
@@ -477,7 +490,7 @@ $('c-st-go').onclick=async()=>{
     msg('c-stn-msg',`爬取成功：${r.saved} 个经由车次（原始返回已留档 raw_id=${r.raw_id}）`);
     const list=await api(`/api/station_trains?station=${encodeURIComponent(body.station)}&date=${body.date}`);
     $('c-stn-table').innerHTML=`<table><tr><th>车次</th><th>类型</th><th>始发→终到</th><th>到达</th><th>出发</th><th>跨天</th><th>操作</th></tr>`+
-      list.map(t=>`<tr><td><b>${esc(t.station_train_code)}</b></td><td>${esc(t.train_class_name||'')}</td>
+      list.map(t=>`<tr><td>${trainBadge(t.station_train_code)}</td><td>${esc(t.train_class_name||'')}</td>
         <td>${esc(t.start_station_name)}→${esc(t.end_station_name)}</td>
         <td>${esc(t.arrive_time)}</td><td>${esc(t.start_time)}</td><td>${t.start_day_diff??0}</td>
         <td><button class="mini" onclick="crawlTT('${esc(t.train_no)}','${esc(t.station_train_code)}')">抓时刻表</button></td></tr>`).join('')+'</table>';
@@ -511,8 +524,8 @@ $('c-t-go').onclick=async()=>{
 async function renderTickets(body){
   const list=await api(`/api/tickets?from_station=${encodeURIComponent(body.from_station)}&to_station=${encodeURIComponent(body.to_station)}&date=${body.date}`);
   $('c-t-table').innerHTML=`<table><tr><th>车次</th><th>出发</th><th>到达</th><th>历时</th><th>余票</th><th>可购</th></tr>`+
-    list.map(t=>`<tr><td><b>${esc(t.station_train_code)}</b></td><td>${esc(t.start_time)}</td><td>${esc(t.arrive_time)}</td>
-      <td>${esc(t.duration)}</td><td>${esc(seatsText(JSON.parse(t.seats||'{}')))}</td><td>${esc(t.can_web_buy)}</td></tr>`).join('')+'</table>';
+    list.map(t=>`<tr><td>${trainBadge(t.station_train_code)}</td><td>${esc(t.start_time)}</td><td>${esc(t.arrive_time)}</td>
+      <td>${esc(t.duration)}</td><td>${seatsHtml(JSON.parse(t.seats||'{}'))}</td><td>${esc(t.can_web_buy)}</td></tr>`).join('')+'</table>';
 }
 async function pollJob(id,body){
   const timer=setInterval(async()=>{
@@ -556,7 +569,7 @@ $('b-go').onclick=async()=>{
   try{
     const list=await api('/api/trains?q='+encodeURIComponent($('b-q').value));
     $('b-trains').innerHTML=`<table><tr><th>车次</th><th>车次编号</th><th>时刻表日期</th><th>停站数</th><th></th></tr>`+
-      list.map(t=>`<tr><td><b>${esc(t.station_train_code)}</b></td><td>${esc(t.train_no)}</td><td>${esc(t.train_date)}</td>
+      list.map(t=>`<tr><td>${trainBadge(t.station_train_code)}</td><td>${esc(t.train_no)}</td><td>${esc(t.train_date)}</td>
         <td>${t.stop_count}</td><td><button class="mini" onclick="showTimetable('${esc(t.train_no)}','${esc(t.station_train_code)} 时刻表')">查看</button></td></tr>`).join('')+'</table>';
   }catch(e){alert(e.message);}
 };
