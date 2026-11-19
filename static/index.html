@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12306 智能中转</title>
+<style>
+:root{--blue:#2563eb;--bg:#f5f7fa;--card:#fff;--border:#e2e8f0;--text:#1e293b;--muted:#64748b}
+*{box-sizing:border-box}
+body{margin:0;font-family:"Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text)}
+header{background:var(--blue);color:#fff;padding:14px 24px;display:flex;align-items:center;gap:24px;flex-wrap:wrap}
+header h1{font-size:18px;margin:0}
+nav{display:flex;gap:4px}
+nav button{background:transparent;border:none;color:#dbeafe;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:14px}
+nav button.active{background:rgba(255,255,255,.2);color:#fff;font-weight:bold}
+main{max-width:1100px;margin:20px auto;padding:0 16px}
+.tab{display:none}.tab.active{display:block}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
+.card h3{margin:0 0 12px;font-size:15px}
+label{font-size:13px;color:var(--muted);display:block;margin-bottom:4px}
+input,select,textarea{border:1px solid var(--border);border-radius:6px;padding:7px 10px;font-size:14px;width:100%;font-family:inherit}
+textarea{min-height:140px;font-family:Consolas,monospace;font-size:12px}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.row>div{flex:1;min-width:130px}
+.row>div.narrow{flex:0 0 110px;min-width:90px}
+button.btn{background:var(--blue);color:#fff;border:none;border-radius:6px;padding:8px 18px;font-size:14px;cursor:pointer;white-space:nowrap}
+button.btn:disabled{opacity:.5;cursor:wait}
+button.btn.sec{background:#e2e8f0;color:var(--text)}
+button.mini{background:#eff6ff;color:var(--blue);border:1px solid #bfdbfe;border-radius:4px;padding:2px 8px;font-size:12px;cursor:pointer}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:6px 8px;border-bottom:1px solid var(--border);text-align:left;white-space:nowrap}
+th{color:var(--muted);font-weight:normal;background:#f8fafc}
+.scroll{overflow-x:auto}
+.msg{padding:10px 14px;border-radius:6px;font-size:13px;margin:10px 0;display:none;white-space:pre-wrap}
+.msg.ok{display:block;background:#f0fdf4;color:#166534;border:1px solid #bbf7d0}
+.msg.err{display:block;background:#fef2f2;color:#991b1b;border:1px solid #fecaca}
+.plan{border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;background:#fff}
+.plan .sum{font-size:13px;color:var(--muted);margin-bottom:8px}
+.plan .sum b{color:var(--text);font-size:15px}
+.leg{display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:4px 0;font-size:14px}
+.leg .code{font-weight:bold;color:var(--blue);min-width:56px}
+.leg .time{font-size:16px;font-weight:bold}
+.leg .st{color:var(--muted);font-size:12px}
+.leg .extra{font-size:12px;color:var(--muted)}
+.wait{font-size:12px;color:#b45309;background:#fffbeb;border-radius:4px;padding:2px 8px;display:inline-block;margin:2px 0 2px 70px}
+.tag{display:inline-block;background:#f1f5f9;border-radius:4px;padding:1px 6px;font-size:12px;margin-right:4px}
+.est{color:#b45309}
+.ac{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid var(--border);border-radius:6px;max-height:260px;overflow:auto;z-index:20;display:none;box-shadow:0 4px 12px rgba(0,0,0,.12)}
+.ac .it{padding:6px 10px;cursor:pointer;font-size:14px}
+.ac .it:hover,.ac .it.sel{background:#eff6ff}
+.ac small{color:var(--muted);margin-left:8px;font-size:12px}
+.plan .sum{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.ttbox{margin:2px 0 6px 70px}
+.ttbox table{font-size:12px}
+.pager{display:flex;gap:10px;align-items:center;margin:10px 0}
+.stats{display:flex;gap:10px;flex-wrap:wrap}
+.stats .s{background:#f8fafc;border:1px solid var(--border);border-radius:8px;padding:8px 16px;font-size:13px}
+.stats .s b{display:block;font-size:18px;color:var(--blue)}
+.hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.7}
+#modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:10}
+#modal .inner{background:#fff;max-width:640px;margin:60px auto;border-radius:10px;padding:20px;max-height:75vh;overflow:auto}
+</style>
+</head>
+<body>
+<header>
+  <h1>12306 智能中转</h1>
+  <nav>
+    <button data-tab="search" class="active">换乘搜索</button>
+    <button data-tab="crawl">爬取数据</button>
+    <button data-tab="import">导入数据</button>
+    <button data-tab="browse">数据浏览</button>
+  </nav>
+</header>
+<main>
+
+<!-- ============ 换乘搜索 ============ -->
+<section class="tab active" id="tab-search">
+  <div class="card">
+    <div class="row">
+      <div><label>出发站</label><input id="s-from" class="station-ac" placeholder="输入站名/拼音/电报码，如：厦门"></div>
+      <div><label>到达站</label><input id="s-to" class="station-ac" placeholder="如：南平市"></div>
+      <div><label>日期</label><input id="s-date" type="date"></div>
+      <div class="narrow"><label>最短换乘(分)</label><input id="s-min" type="number" value="30"></div>
+      <div class="narrow"><label>最长换乘(分)</label><input id="s-max" type="number" value="360"></div>
+      <div style="flex:0"><button class="btn" id="s-go">搜索</button></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div style="flex:0 0 140px"><label>排序</label>
+        <select id="s-sort">
+          <option value="duration">耗时最短</option>
+          <option value="depart">发车最早</option>
+          <option value="price">价格最低</option>
+        </select></div>
+      <div style="flex:0 0 120px"><label>方案类型</label>
+        <select id="s-type"><option value="">全部</option><option value="direct">仅直达</option><option value="transfer">仅换乘</option></select></div>
+      <div style="flex:0 0 100px"><label>每页方案数</label>
+        <select id="s-size"><option>20</option><option selected>50</option><option>100</option><option>200</option></select></div>
+      <div style="flex:2"><label>&nbsp;</label>
+        <label style="display:inline;color:var(--text)"><input type="checkbox" id="s-live" style="width:auto"> 搜索后自动查询票价/余票（前50个未发车方案，含换乘各程）</label></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div><label>车次包含</label><input id="s-filter" placeholder="如 Z126"></div>
+      <div><label>车次头</label><input id="s-prefix" placeholder="如 G,D 逗号分隔"></div>
+      <div style="flex:0 0 150px"><label>席位（按已查余票）</label>
+        <select id="s-seat"><option value="">不限</option><option value="swz">商务</option><option value="tz">特等</option><option value="zy">一等</option><option value="ze">二等</option><option value="rw">软卧</option><option value="yw">硬卧</option><option value="rz">软座</option><option value="yz">硬座</option><option value="wz">无座</option><option value="srrb">动卧</option></select></div>
+      <div style="flex:0 0 210px"><label>出发时间</label>
+        <div style="display:flex;gap:4px"><input id="s-dep1" type="time"><input id="s-dep2" type="time"></div></div>
+      <div style="flex:0 0 210px"><label>到达时间</label>
+        <div style="display:flex;gap:4px"><input id="s-arr1" type="time"><input id="s-arr2" type="time"></div></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div style="flex:0 0 210px"><label>换乘等待(分)</label>
+        <div style="display:flex;gap:4px"><input id="s-wmin" type="number" placeholder="最小"><input id="s-wmax" type="number" placeholder="最大"></div></div>
+      <div><label>换乘站</label><input id="s-tst" placeholder="如 福州"></div>
+      <div style="flex:0 0 150px"><label>换乘类型</label>
+        <select id="s-same"><option value="">不限</option><option value="1">同站换乘</option><option value="0">异站换乘(同城)</option></select></div>
+    </div>
+    <div class="hint">直达与换乘方案混合展示，可排序/筛选/分页。异站换乘为同城车站（如福州/福州南），额外预留30分钟；已发车方案不提供实时查询；无当日数据时自动回退最近爬取数据按每日开行推算。数据越全方案越全 —— 先在“爬取数据”页抓取<b>出发站和到达站</b>的经由车次。</div>
+    <div class="msg" id="s-msg"></div>
+  </div>
+  <div id="s-result"></div>
+</section>
+
+<!-- ============ 爬取 ============ -->
+<section class="tab" id="tab-crawl">
+  <div class="card">
+    <h3>车站站名表（电报码）</h3>
+    <button class="btn sec" id="c-stations">更新车站站名表</button>
+    <span class="hint" style="display:inline;margin-left:10px">首次使用请先更新，来自官方 station_name.js</span>
+    <div class="msg" id="c-st-msg"></div>
+  </div>
+  <div class="card">
+    <h3>车站经由的所有车次（车站大屏）</h3>
+    <div class="row">
+      <div><label>车站</label><input id="c-station" class="station-ac" placeholder="如：北京"></div>
+      <div><label>日期</label><input id="c-date" type="date"></div>
+      <div style="flex:0"><button class="btn" id="c-st-go">爬取经由车次</button></div>
+    </div>
+    <div class="msg" id="c-stn-msg"></div>
+    <div class="hint">搜索直达/换乘需要<b>出发站和到达站都爬取</b>经由车次；大屏含真实开行日期，无需逐车抓时刻表。</div>
+    <div class="scroll" id="c-stn-table"></div>
+  </div>
+  <div class="card">
+    <h3>站间余票 + 票价</h3>
+    <div class="row">
+      <div><label>出发站</label><input id="c-from" class="station-ac"></div>
+      <div><label>到达站</label><input id="c-to" class="station-ac"></div>
+      <div><label>日期</label><input id="c-t-date" type="date"></div>
+      <div style="flex:0 0 150px"><label><input type="checkbox" id="c-prices" style="width:auto" checked> 同时爬取全部票价</label></div>
+      <div style="flex:0"><button class="btn" id="c-t-go">爬取余票</button></div>
+    </div>
+    <div class="msg" id="c-t-msg"></div>
+    <div class="scroll" id="c-t-table"></div>
+  </div>
+</section>
+
+<!-- ============ 导入 ============ -->
+<section class="tab" id="tab-import">
+  <div class="card">
+    <h3>导入 12306 原始 API 返回</h3>
+    <div class="hint" style="margin:0 0 10px">
+      支持格式（与12306返回完全一致，自动识别）：<br>
+      ① 余票查询 leftTicket/query（data.result 竖线分隔）② 票价 queryTicketPrice ③ 时刻表 czxx/queryByTrainNo ④ 车站大屏 queryTrainByStation ⑤ 站名表 station_name.js<br>
+      票价/时刻表返回中不含日期等上下文时，请在下方补充。samples/ 目录有真实返回样例可测试。
+    </div>
+    <div class="row">
+      <div><label>数据类型</label>
+        <select id="i-type">
+          <option value="">自动识别</option>
+          <option value="left_ticket">余票 leftTicket</option>
+          <option value="price">票价 queryTicketPrice</option>
+          <option value="train_stops">时刻表 queryByTrainNo</option>
+          <option value="station_screen">车站大屏 queryTrainByStation</option>
+          <option value="stations">站名表 station_name.js</option>
+        </select></div>
+      <div><label>车次编号 train_no（时刻表/票价需要）</label><input id="i-trainno" placeholder="如 240000G53106"></div>
+      <div><label>日期（票价/时刻表上下文）</label><input id="i-date" type="date"></div>
+      <div class="narrow"><label>发站序号</label><input id="i-fno" placeholder="01"></div>
+      <div class="narrow"><label>到站序号</label><input id="i-tno" placeholder="13"></div>
+    </div>
+    <div style="margin-top:12px"><label>粘贴 JSON / JS 内容</label><textarea id="i-text" placeholder='{"httpstatus":200,"data":...}'></textarea></div>
+    <div class="row" style="margin-top:10px">
+      <div style="flex:2"><label>或选择文件</label><input type="file" id="i-file" accept=".json,.js,.txt"></div>
+      <div style="flex:0"><button class="btn" id="i-go">导入</button></div>
+    </div>
+    <div class="msg" id="i-msg"></div>
+  </div>
+</section>
+
+<!-- ============ 浏览 ============ -->
+<section class="tab" id="tab-browse">
+  <div class="card"><h3>数据库概况</h3><div class="stats" id="b-stats"></div></div>
+  <div class="card">
+    <h3>车次时刻表</h3>
+    <div class="row">
+      <div><label>车次号 / 车次编号</label><input id="b-q" placeholder="如 G531"></div>
+      <div style="flex:0"><button class="btn sec" id="b-go">查找车次</button></div>
+    </div>
+    <div class="scroll" id="b-trains"></div>
+    <div class="scroll" id="b-timetable"></div>
+  </div>
+</section>
+</main>
+
+<div id="modal"><div class="inner"><div id="modal-body"></div>
+<div style="text-align:right;margin-top:10px"><button class="btn sec" onclick="document.getElementById('modal').style.display='none'">关闭</button></div>
+</div></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const SEAT={swz:'商务',tz:'特等',zy:'一等',ze:'二等',gr:'高软',rw:'软卧',yw:'硬卧',rz:'软座',yz:'硬座',wz:'无座',srrb:'动卧',qt:'其他',yb:'预留'};
+const today=new Date(Date.now()+8*3600e3).toISOString().slice(0,10);
+['s-date','c-date','c-t-date'].forEach(id=>$(id).value=today);
+
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active');$('tab-'+b.dataset.tab).classList.add('active');
+  if(b.dataset.tab==='browse')loadStats();
+});
+
+function msg(id,text,ok=true){const el=$(id);el.textContent=text;el.className='msg '+(ok?'ok':'err');}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function api(url,opt){
+  const r=await fetch(url,opt);
+  const j=await r.json().catch(()=>({detail:'返回非JSON'}));
+  if(!r.ok)throw new Error(j.detail||r.status);
+  return j;
+}
+function post(url,body){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}
+function fmtMin(m){const h=Math.floor(m/60),x=m%60;return h?`${h}小时${x?x+'分':''}`:`${x}分`;}
+function seatsText(s){if(!s)return'';return Object.entries(s).map(([k,v])=>`${SEAT[k]||k}:${v}`).join(' ');}
+function pricesText(p){if(!p||!p.length)return'';return p.map(x=>`${x.seat} ¥${x.price}`).join('　');}
+function estText(e){if(!e)return'';const s=Object.values(e.seats).slice(0,3).map(x=>`${x.name} ¥${x.min}–${x.max}`).join('　');return `<span class="est" title="${esc(e.basis)}">估 ${s}</span>`;}
+
+// 车站自动补全：中文站名为主，附电报码与城市，支持拼音/电报码检索
+function attachAC(inp){
+  const wrap=inp.parentElement;wrap.style.position='relative';
+  const box=document.createElement('div');box.className='ac';wrap.appendChild(box);
+  let items=[],sel=-1,timer;
+  const hide=()=>{box.style.display='none';sel=-1;};
+  const show=()=>{
+    if(!items.length){hide();return;}
+    box.innerHTML=items.map((s,i)=>`<div class="it${i===sel?' sel':''}" data-i="${i}"><b>${esc(s.name)}</b><small>${esc(s.telecode)}${s.city?' · '+esc(s.city):''}</small></div>`).join('');
+    box.style.display='block';
+    box.querySelectorAll('.it').forEach(el=>el.onmousedown=e=>{e.preventDefault();inp.value=items[+el.dataset.i].name;hide();});
+  };
+  inp.addEventListener('input',()=>{
+    clearTimeout(timer);
+    const q=inp.value.trim();
+    if(!q){items=[];hide();return;}
+    timer=setTimeout(async()=>{
+      try{items=await api('/api/stations?q='+encodeURIComponent(q));sel=-1;show();}catch(e){}
+    },150);
+  });
+  inp.addEventListener('keydown',e=>{
+    if(box.style.display!=='block')return;
+    if(e.key==='ArrowDown'){sel=Math.min(sel+1,items.length-1);show();e.preventDefault();}
+    else if(e.key==='ArrowUp'){sel=Math.max(sel-1,0);show();e.preventDefault();}
+    else if(e.key==='Enter'){if(sel>=0){inp.value=items[sel].name;hide();e.preventDefault();}}
+    else if(e.key==='Escape')hide();
+  });
+  inp.addEventListener('blur',()=>setTimeout(hide,150));
+}
+document.querySelectorAll('input.station-ac').forEach(attachAC);
+
+// ---------- 换乘搜索 ----------
+let R=null,page=1,planPoll=null;
+function nowStr(){const d=new Date(),p=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;}
+function departed(p){const n=nowStr();return p.legs.some(l=>l.depart<=n);}
+$('s-go').onclick=async()=>{
+  const btn=$('s-go');btn.disabled=true;$('s-result').innerHTML='';
+  try{
+    const p=new URLSearchParams({from_station:$('s-from').value,to_station:$('s-to').value,date:$('s-date').value,
+      min_wait:$('s-min').value||30,max_wait:$('s-max').value||360});
+    R=await api('/api/transfers?'+p);page=1;
+    R.direct.forEach((x,i)=>{x._k='d'+i;x._type='direct';});
+    R.transfers.forEach((x,i)=>{x._k='t'+i;x._type='transfer';});
+    msg('s-msg',`大屏车次 ${R.screen_trains} 个，时刻表 ${R.timetable_trains} 个。直达 ${R.direct.length} 个，换乘 ${R.transfers.length} 个（全部返回，可排序/筛选/分页）。${R.note}`);
+    render();
+    if($('s-live').checked)autoQuery();
+  }catch(e){msg('s-msg',e.message,false);}
+  btn.disabled=false;
+};
+['s-sort','s-type','s-size','s-seat','s-same'].forEach(id=>$(id).onchange=()=>{page=1;render();});
+['s-filter','s-prefix','s-dep1','s-dep2','s-arr1','s-arr2','s-wmin','s-wmax','s-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();});
+
+function legKey(l){return [l.train_no,l.from_telecode||l.from,l.to_telecode||l.to,l.depart.slice(0,10)].join('|');}
+function priceKey(p){
+  let sum=0,est=false,miss=false;
+  for(const l of p.legs){
+    if(l.prices&&l.prices.length)sum+=Math.min(...l.prices.map(x=>+x.price));
+    else if(l.price_est&&Object.keys(l.price_est.seats).length){sum+=Math.min(...Object.values(l.price_est.seats).map(x=>x.min));est=true;}
+    else miss=true;
+  }
+  return [miss?1:0,sum,est?1:0];
+}
+const yuan=v=>String(Math.round(v*10)/10);
+function totalPrice(p){
+  let min=0,max=0,est=false,miss=false,has=false;
+  for(const l of p.legs){
+    if(l.prices&&l.prices.length){const v=Math.min(...l.prices.map(x=>+x.price));min+=v;max+=v;has=true;}
+    else if(l.price_est&&Object.keys(l.price_est.seats).length){
+      // 取最便宜席别的价格区间，与“价格最低”排序口径一致
+      const cheap=Object.values(l.price_est.seats).reduce((a,b)=>b.min<a.min?b:a);
+      min+=cheap.min;max+=cheap.max;est=true;has=true;}
+    else miss=true;
+  }
+  if(!has)return '';
+  const txt=est?(min===max?`合计 估 ¥${yuan(min)}`:`合计 估 ¥${yuan(min)}–${yuan(max)}`):`合计 ¥${yuan(min)}`;
+  return `<span class="${est?'est':''}" style="font-weight:bold">${txt}${miss?'（部分程无价）':''}</span>`;
+}
+function sortPlans(list){
+  const mode=$('s-sort').value,a=[...list];
+  if(mode==='depart')a.sort((x,y)=>x.legs[0].depart.localeCompare(y.legs[0].depart)||x.total_min-y.total_min);
+  else if(mode==='price')a.sort((x,y)=>{const u=priceKey(x),v=priceKey(y);return u[0]-v[0]||u[1]-v[1]||u[2]-v[2]||x.total_min-y.total_min;});
+  else a.sort((x,y)=>x.total_min-y.total_min);
+  return a;
+}
+function avail(v){return v!=null&&v!==''&&v!=='无'&&v!=='--'&&v!=='0'&&v!=='*';}
+function filterPlans(list){
+  const q=$('s-filter').value.trim().toUpperCase();
+  const prefixes=$('s-prefix').value.toUpperCase().split(/[,，\s]+/).filter(Boolean);
+  const seat=$('s-seat').value,type=$('s-type').value,same=$('s-same').value;
+  const d1=$('s-dep1').value,d2=$('s-dep2').value,a1=$('s-arr1').value,a2=$('s-arr2').value;
+  const wmin=+$('s-wmin').value||0,wmax=+$('s-wmax').value||Infinity;
+  const tst=$('s-tst').value.trim();
+  const transferOnly=same!==''||tst!==''||wmin>0||wmax<Infinity;
+  return list.filter(p=>{
+    if(type&&p._type!==type)return false;
+    if(transferOnly&&p._type!=='transfer')return false;
+    if(q&&!p.legs.some(l=>(l.train||'').toUpperCase().includes(q)))return false;
+    if(prefixes.length&&!p.legs.some(l=>prefixes.some(x=>(l.train||'').toUpperCase().startsWith(x))))return false;
+    if(seat&&!p.legs.every(l=>l.seats&&avail(l.seats[seat])))return false;
+    const dep=p.legs[0].depart.slice(11,16),arr=p.legs[p.legs.length-1].arrive.slice(11,16);
+    if(d1&&dep<d1)return false;
+    if(d2&&dep>d2)return false;
+    if(a1&&arr<a1)return false;
+    if(a2&&arr>a2)return false;
+    if(p._type==='transfer'){
+      if(p.wait_min<wmin||p.wait_min>wmax)return false;
+      if(tst&&!(p.transfer_station||'').includes(tst))return false;
+      if(same!==''&&String(p.same_station?1:0)!==same)return false;
+    }
+    return true;
+  });
+}
+function pagerHtml(pages){
+  return `<div class="pager"><button class="btn sec" ${page<=1?'disabled':''} onclick="page--;render()">上一页</button>
+    <span style="font-size:13px">第 ${page} / ${pages} 页</span>
+    <button class="btn sec" ${page>=pages?'disabled':''} onclick="page++;render()">下一页</button></div>`;
+}
+function render(){
+  if(!R)return;
+  const list=sortPlans(filterPlans([...R.direct,...R.transfers]));
+  const size=+$('s-size').value||50;
+  const pages=Math.max(1,Math.ceil(list.length/size));
+  page=Math.min(Math.max(1,page),pages);
+  const sortName={duration:'总耗时',depart:'发车时间',price:'价格（实际价优先）'}[$('s-sort').value];
+  const nd=list.filter(p=>p._type==='direct').length;
+  if(!list.length){
+    $('s-result').innerHTML='<div class="card">无匹配方案。可放宽筛选条件；或在“爬取数据”页爬取<b>出发站和到达站</b>两者的经由车次（车站大屏）。</div>';
+    return;
+  }
+  const head=`<div class="card" style="padding:12px 16px"><b>共 ${list.length} 个方案</b>（直达 ${nd} / 换乘 ${list.length-nd}），按${sortName}排序${pagerHtml(pages)}</div>`;
+  $('s-result').innerHTML=head+list.slice((page-1)*size,page*size).map(planHtml).join('')+pagerHtml(pages);
+}
+function planHtml(p){
+  const gone=departed(p);
+  const legs=p.legs.map((l,i)=>{
+    let extra=seatsText(l.seats);
+    if(l.can_web_buy==='N')extra+=' <span style="color:#dc2626">不可购</span>';
+    if(l.ticket_error)extra+=` <span style="color:#dc2626">${esc(l.ticket_error)}</span>`;
+    return `<div class="leg">
+    <span class="code">${esc(l.train)}</span>
+    <span><span class="time">${l.depart.slice(11)}</span> <span class="st">${esc(l.from)} ${l.depart.slice(5,10)}</span></span>
+    <span class="st">→ ${fmtMin(l.duration_min)} →</span>
+    <span><span class="time">${l.arrive.slice(11)}</span> <span class="st">${esc(l.to)} ${l.arrive.slice(5,10)}</span></span>
+    <span class="extra">${extra}</span>
+    <span class="extra">${pricesText(l.prices)||estText(l.price_est)}</span>
+    <button class="mini" onclick="toggleTT('${p._k}',${i})">时刻表</button>
+  </div><div id="tt-${p._k}-${i}" class="ttbox"></div>`;});
+  const tags=`<span class="tag">${p._type==='direct'?'直达':'换乘'}</span>`+
+    (p._type==='transfer'?`<span class="tag">${p.same_station?'同站换乘':'异站换乘·同城'}</span>`:'')+
+    (p.date_assumed?'<span class="tag est" title="无当日数据，按最近爬取日期每日开行假设推算">按每日开行推算</span>':'')+
+    (gone?'<span class="tag" style="color:#dc2626">已发车</span>':'');
+  const sum=p.wait_min!=null
+    ?`<b>${fmtMin(p.total_min)}</b> ${tags} ${esc(p.transfer_station)}${p.same_station?'':'→'+esc(p.legs[1].from)}换乘 · 等待 ${fmtMin(p.wait_min)}`
+    :`<b>${fmtMin(p.total_min)}</b> ${tags}`;
+  const btn=gone?'':`<button class="mini" onclick="queryPlan('${p._k}')">查票价余票</button>`;
+  let html=`<div class="plan"><div class="sum"><span>${sum}</span>${totalPrice(p)}${btn}</div>${legs[0]}`;
+  if(legs[1])html+=`<div class="wait">⏱ ${esc(p.transfer_station)}${p.same_station?'':'→'+esc(p.legs[1].from)+' 异站换乘（含跨站交通）'} 换乘，预留 ${fmtMin(p.wait_min)}</div>${legs[1]}`;
+  return html+'</div>';
+}
+function findPlan(k){return (k[0]==='d'?R.direct:R.transfers)[+k.slice(1)];}
+function planLegs(p){return p.legs.map(l=>({train_no:l.train_no,date:l.depart.slice(0,10),
+  from_telecode:l.from_telecode,to_telecode:l.to_telecode,from_name:l.from,to_name:l.to}));}
+async function queryPlan(k){
+  const p=findPlan(k);
+  if(departed(p)){msg('s-msg','该方案已有车次发车，不再提供实时查询',false);return;}
+  try{
+    const r=await post('/api/plan_tickets',{legs:planLegs(p)});
+    msg('s-msg',`正在查询该方案票价/余票（${r.legs} 个行程段）…`);
+    pollPlanJob(r.job_id);
+  }catch(e){msg('s-msg',e.message,false);}
+}
+async function autoQuery(){
+  const all=sortPlans(filterPlans([...R.direct,...R.transfers])).filter(p=>!departed(p)).slice(0,50);
+  const legs=all.flatMap(planLegs);
+  if(!legs.length)return;
+  try{
+    const r=await post('/api/plan_tickets',{legs});
+    msg('s-msg',`自动查询票价/余票：去重后 ${r.legs} 个行程段，预计 ${Math.max(1,Math.ceil(r.legs*1.2/60))} 分钟…`);
+    pollPlanJob(r.job_id);
+  }catch(e){msg('s-msg',e.message,false);}
+}
+function pollPlanJob(id){
+  if(planPoll)clearInterval(planPoll);
+  planPoll=setInterval(async()=>{
+    try{
+      const j=await api('/api/jobs/'+id);
+      if(j.status!=='done'){msg('s-msg',`票价/余票查询 ${j.done}/${j.total}`+(j.errors.length?`，失败 ${j.errors.length}`:''));return;}
+      clearInterval(planPoll);planPoll=null;
+      applyTickets(j.result);render();
+      msg('s-msg','票价/余票查询完成'+(j.errors.length?`，失败 ${j.errors.length} 项：\n${j.errors.join('\n')}`:''));
+    }catch(e){clearInterval(planPoll);planPoll=null;}
+  },1500);
+}
+function applyTickets(result){
+  for(const p of [...R.direct,...R.transfers])for(const l of p.legs){
+    const r=result[legKey(l)];
+    if(!r)continue;
+    if(r.seats){l.seats=r.seats;l.can_web_buy=r.can_web_buy;}
+    if(r.prices)l.prices=r.prices;
+    if(r.error&&!r.seats)l.ticket_error=r.error;
+  }
+}
+// 时刻表展开
+async function toggleTT(k,i){
+  const el=$('tt-'+k+'-'+i);
+  if(el.dataset.open){el.innerHTML='';delete el.dataset.open;return;}
+  const l=findPlan(k).legs[i];
+  el.dataset.open='1';el.innerHTML='<div class="hint">时刻表加载中…</div>';
+  try{
+    const list=await api('/api/timetable?train_no='+encodeURIComponent(l.train_no));
+    el.innerHTML=ttTable(list,l);
+  }catch(e){
+    el.innerHTML=`<div class="hint">该车次时刻表未入库。<button class="mini" onclick="crawlTTPlan('${k}',${i})">抓取时刻表</button></div>`;
+  }
+}
+function ttTable(list,l){
+  return '<div class="scroll"><table><tr><th>#</th><th>车站</th><th>到达</th><th>出发</th><th>停留</th></tr>'+
+    list.map(s=>{const hl=s.station_name===l.from||s.station_name===l.to;
+      return `<tr${hl?' style="background:#eff6ff;font-weight:bold"':''}><td>${s.station_no}</td><td>${esc(s.station_name)}</td><td>${esc(s.arrive_time)}</td><td>${esc(s.start_time)}</td><td>${esc(s.stopover_time)}</td></tr>`;}).join('')+'</table></div>';
+}
+async function crawlTTPlan(k,i){
+  const l=findPlan(k).legs[i],el=$('tt-'+k+'-'+i);
+  el.innerHTML='<div class="hint">正在抓取时刻表…</div>';
+  try{
+    await post('/api/crawl/timetable',{train_no:l.train_no});
+    const list=await api('/api/timetable?train_no='+encodeURIComponent(l.train_no));
+    el.innerHTML=ttTable(list,l);
+  }catch(e){el.innerHTML=`<div class="hint" style="color:#dc2626">${esc(e.message)}</div>`;}
+}
+
+// ---------- 爬取 ----------
+$('c-stations').onclick=async()=>{
+  try{const r=await post('/api/crawl/stations',{});msg('c-st-msg',`站名表更新成功：${r.saved} 个车站`);}
+  catch(e){msg('c-st-msg',e.message,false);}
+};
+$('c-st-go').onclick=async()=>{
+  const btn=$('c-st-go');btn.disabled=true;
+  try{
+    const body={station:$('c-station').value,date:$('c-date').value};
+    const r=await post('/api/crawl/station_trains',body);
+    msg('c-stn-msg',`爬取成功：${r.saved} 个经由车次（原始返回已留档 raw_id=${r.raw_id}）`);
+    const list=await api(`/api/station_trains?station=${encodeURIComponent(body.station)}&date=${body.date}`);
+    $('c-stn-table').innerHTML=`<table><tr><th>车次</th><th>类型</th><th>始发→终到</th><th>到达</th><th>出发</th><th>跨天</th><th>操作</th></tr>`+
+      list.map(t=>`<tr><td><b>${esc(t.station_train_code)}</b></td><td>${esc(t.train_class_name||'')}</td>
+        <td>${esc(t.start_station_name)}→${esc(t.end_station_name)}</td>
+        <td>${esc(t.arrive_time)}</td><td>${esc(t.start_time)}</td><td>${t.start_day_diff??0}</td>
+        <td><button class="mini" onclick="crawlTT('${esc(t.train_no)}','${esc(t.station_train_code)}')">抓时刻表</button></td></tr>`).join('')+'</table>';
+  }catch(e){msg('c-stn-msg',e.message,false);}
+  btn.disabled=false;
+};
+async function crawlTT(trainNo,code){
+  try{
+    const r=await post('/api/crawl/timetable',{train_no:trainNo});
+    await showTimetable(trainNo,`${code} 时刻表（新抓取 ${r.saved} 站）`);
+  }catch(e){alert(e.message);}
+}
+async function showTimetable(trainNo,title){
+  const list=await api('/api/timetable?train_no='+encodeURIComponent(trainNo));
+  $('modal-body').innerHTML=`<h3>${esc(title||trainNo)}</h3><table><tr><th>#</th><th>车站</th><th>到达</th><th>出发</th><th>停留</th><th>客运</th></tr>`+
+    list.map(s=>`<tr><td>${s.station_no}</td><td>${esc(s.station_name)}</td><td>${esc(s.arrive_time)}</td>
+      <td>${esc(s.start_time)}</td><td>${esc(s.stopover_time)}</td><td>${s.enabled?'✓':'✗'}</td></tr>`).join('')+'</table>';
+  $('modal').style.display='block';
+}
+$('c-t-go').onclick=async()=>{
+  const btn=$('c-t-go');btn.disabled=true;
+  try{
+    const body={from_station:$('c-from').value,to_station:$('c-to').value,date:$('c-t-date').value,with_prices:$('c-prices').checked};
+    const r=await post('/api/crawl/tickets',body);
+    msg('c-t-msg',`余票爬取成功：${r.saved} 个车次`+(r.price_job?'，票价后台爬取中…':''));
+    await renderTickets(body);
+    if(r.price_job)pollJob(r.price_job,body);
+  }catch(e){msg('c-t-msg',e.message,false);}
+  btn.disabled=false;
+};
+async function renderTickets(body){
+  const list=await api(`/api/tickets?from_station=${encodeURIComponent(body.from_station)}&to_station=${encodeURIComponent(body.to_station)}&date=${body.date}`);
+  $('c-t-table').innerHTML=`<table><tr><th>车次</th><th>出发</th><th>到达</th><th>历时</th><th>余票</th><th>可购</th></tr>`+
+    list.map(t=>`<tr><td><b>${esc(t.station_train_code)}</b></td><td>${esc(t.start_time)}</td><td>${esc(t.arrive_time)}</td>
+      <td>${esc(t.duration)}</td><td>${esc(seatsText(JSON.parse(t.seats||'{}')))}</td><td>${esc(t.can_web_buy)}</td></tr>`).join('')+'</table>';
+}
+async function pollJob(id,body){
+  const timer=setInterval(async()=>{
+    try{
+      const j=await api('/api/jobs/'+id);
+      msg('c-t-msg',`票价爬取 ${j.done}/${j.total}`+(j.errors.length?`，失败 ${j.errors.length}`:''));
+      if(j.status==='done'){clearInterval(timer);msg('c-t-msg',`票价爬取完成 ${j.done}/${j.total}`+(j.errors.length?`，失败：\n${j.errors.join('\n')}`:''));}
+    }catch(e){clearInterval(timer);}
+  },2000);
+}
+
+// ---------- 导入 ----------
+$('i-go').onclick=async()=>{
+  const btn=$('i-go');btn.disabled=true;
+  const ctx={api_type:$('i-type').value||null,train_no:$('i-trainno').value||null,date:$('i-date').value||null,
+    from_station_no:$('i-fno').value||null,to_station_no:$('i-tno').value||null};
+  try{
+    let r;
+    const file=$('i-file').files[0];
+    if(file){
+      const fd=new FormData();fd.append('file',file);
+      const p=new URLSearchParams(Object.entries(ctx).filter(([k,v])=>v));
+      r=await api('/api/import/file?'+p,{method:'POST',body:fd});
+    }else{
+      const text=$('i-text').value.trim();
+      if(!text)throw new Error('请粘贴内容或选择文件');
+      r=await post('/api/import',{payload:text,...ctx});
+    }
+    msg('i-msg',`导入成功：类型 ${r.api_type}，解析 ${r.parsed} 条，入库 ${r.saved} 条（原始留档 raw_id=${r.raw_id}）`);
+  }catch(e){msg('i-msg',e.message,false);}
+  btn.disabled=false;
+};
+
+// ---------- 浏览 ----------
+async function loadStats(){
+  const s=await api('/api/stats');
+  const names={stations:'车站',station_trains:'经由车次记录',train_stops:'时刻表停站',tickets:'余票记录',prices:'票价记录',raw_payloads:'原始返回留档'};
+  $('b-stats').innerHTML=Object.entries(s).map(([k,v])=>`<div class="s"><b>${v}</b>${names[k]||k}</div>`).join('');
+}
+$('b-go').onclick=async()=>{
+  try{
+    const list=await api('/api/trains?q='+encodeURIComponent($('b-q').value));
+    $('b-trains').innerHTML=`<table><tr><th>车次</th><th>车次编号</th><th>时刻表日期</th><th>停站数</th><th></th></tr>`+
+      list.map(t=>`<tr><td><b>${esc(t.station_train_code)}</b></td><td>${esc(t.train_no)}</td><td>${esc(t.train_date)}</td>
+        <td>${t.stop_count}</td><td><button class="mini" onclick="showTimetable('${esc(t.train_no)}','${esc(t.station_train_code)} 时刻表')">查看</button></td></tr>`).join('')+'</table>';
+  }catch(e){alert(e.message);}
+};
+</script>
+</body>
+</html>
