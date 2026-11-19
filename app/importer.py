@@ -18,7 +18,7 @@ def ingest(text: str, api_type: str | None = None, ctx: dict | None = None,
     else:
         payload = json.loads(text)
         if api_type == "left_ticket":
-            records = parsers.parse_left_ticket(payload)
+            records = parsers.parse_left_ticket(payload, ctx)
         elif api_type == "price":
             records = parsers.parse_price(payload, ctx)
         elif api_type == "train_stops":

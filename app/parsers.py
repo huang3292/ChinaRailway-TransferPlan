@@ -58,7 +58,8 @@ def parse_stations(text: str) -> list[dict]:
     return out
 
 
-def parse_left_ticket(payload: dict) -> list[dict]:
+def parse_left_ticket(payload: dict, ctx: dict | None = None) -> list[dict]:
+    ctx = ctx or {}
     data = payload.get("data") or {}
     result = data.get("result") or []
     out = []
@@ -72,7 +73,8 @@ def parse_left_ticket(payload: dict) -> list[dict]:
         out.append({
             "train_no": f[LT["train_no"]],
             "station_train_code": f[LT["station_train_code"]],
-            "train_date": norm_date(f[LT["start_train_date"]]),
+            # 乘车日期以查询日期为准；start_train_date 是始发站发车日，长途车会早一两天
+            "train_date": norm_date(ctx.get("date") or f[LT["start_train_date"]]),
             "from_telecode": f[LT["from_station_telecode"]],
             "to_telecode": f[LT["to_station_telecode"]],
             "from_station_no": f[LT["from_station_no"]],
