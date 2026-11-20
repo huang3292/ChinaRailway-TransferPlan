@@ -627,8 +627,12 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                             continue
                         new_passed = state["passed"] | frozenset(sv["stops"][k]["key"] for k in range(i, j + 1))
                         new_legs = state["legs"] + [leg]
-                        new_transfers = state["transfers"] + [{"station": state["name"],
-                                                                "same": same, "wait_min": wait}]
+                        new_transfers = state["transfers"] + [{
+                            "station": state["name"],
+                            "telecode": state["legs"][-1].get("to_telecode"),
+                            "same": same,
+                            "wait_min": wait,
+                        }]
                         total = _epoch(leg["arrive"]) - state["start"]
                         if total > MAX_TOTAL_MIN:
                             continue
@@ -708,7 +712,8 @@ def search(from_q: str, to_q: str, date: str,
     fstations = db.resolve_stations(from_q, expand_city)
     tstations = db.resolve_stations(to_q, expand_city)
     if not fstations or not tstations:
-        raise ValueError("车站/城市不存在，请先在“爬取数据”页更新车站站名表")
+        missing = from_q if not fstations else to_q
+        raise ValueError(f"车站/城市“{missing}”不存在，请先在「爬取数据」页更新车站站名表")
     fkeys = {s["telecode"] for s in fstations} | {s["name"] for s in fstations}
     tkeys = {s["telecode"] for s in tstations} | {s["name"] for s in tstations}
     base = datetime.strptime(date, "%Y-%m-%d")
@@ -760,6 +765,7 @@ def search(from_q: str, to_q: str, date: str,
     for p in merged_t.values():
         if "transfers" not in p:
             p["transfers"] = [{"station": p.get("transfer_station"),
+                               "telecode": p["legs"][0].get("to_telecode"),
                                "same": bool(p.get("same_station", True)),
                                "wait_min": p.get("wait_min", 0)}]
         transfers.append(p)
@@ -828,9 +834,10 @@ def search(from_q: str, to_q: str, date: str,
         "server_now": cn_now_str,
         "from_stations": [s["name"] for s in fstations],
         "to_stations": [s["name"] for s in tstations],
+        "from_station_labels": [f"{s['name']}({s['telecode']})" for s in fstations],
+        "to_station_labels": [f"{s['name']}({s['telecode']})" for s in tstations],
         "screen_trains": len(screen), "timetable_trains": len(tt),
-        "note": f"大屏优先真实日期，无当日数据时按最近日期+running_fig校验推算；"
-                f"异站换乘额外预留{cross_extra}分钟；时间基准为北京时间(UTC+8)",
+        "note": f"时间基准：北京时间(UTC+8) · 异站换乘默认额外预留{cross_extra}分钟 · 无当日数据时按最近日期与 running_fig 校验推算并剔除余票冲突车次",
         "direct": direct[:limit] if limit > 0 else direct,
         "transfers": transfers[:limit] if limit > 0 else transfers,
     }

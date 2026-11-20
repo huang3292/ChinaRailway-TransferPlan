@@ -264,7 +264,7 @@ class TestTransferFixes(TempDBTestCase):
 class TestCrawlerAndMainStubbed(TempDBTestCase):
     @classmethod
     def setUpClass(cls):
-        # Lightweight stubs for third-party modules absent in container so crawler & main logic can be unit tested.
+        # 为容器内缺失的三方库注入轻量桩模块，以便离线测试爬虫与主流程逻辑
         if "requests" not in sys.modules:
             req_mod = types.ModuleType("requests")
 
@@ -347,7 +347,7 @@ class TestCrawlerAndMainStubbed(TempDBTestCase):
             c._sleep(5.0)
         c.set_cancel_event(None)
 
-        # Business message ("预售") should not double interval
+        # 业务提示（如“预售”）不应触发请求间隔翻倍
         c._interval = 1.0
         with mock.patch.object(c, "ensure_init"), mock.patch.object(
             c, "_json", return_value={"status": False, "messages": ["不在预售期内"]}
@@ -370,7 +370,7 @@ class TestCrawlerAndMainStubbed(TempDBTestCase):
         self.assertEqual(res["status"], "cancelled")
         self.assertTrue(ev.is_set())
 
-        # Verify _plan_tickets_job uses Beijing today and checks train_date in prices cache
+        # 校验 _plan_tickets_job 使用北京时间今日并按 train_date 命中票价缓存
         future_date = "2099-01-01"
         with db.tx() as conn:
             conn.execute(
@@ -383,7 +383,7 @@ class TestCrawlerAndMainStubbed(TempDBTestCase):
                 "VALUES('T9','G9',?,'01','05','ze','二等座',555.0)",
                 (future_date,),
             )
-            # An older price row shouldn't block crawling if date differed, whereas exact future_date price should satisfy cache!
+            # 仅存在精确 future_date 的票价缓存时才会跳过实时抓价
         jid2, ev2 = main_mod._create_job({"status": "running", "done": 0, "total": 0, "errors": [], "result": {}})
         with mock.patch.object(main_mod.crawler, "crawl_tickets") as m_tk, mock.patch.object(
             main_mod.crawler, "crawl_price"
@@ -402,6 +402,52 @@ class TestCrawlerAndMainStubbed(TempDBTestCase):
         self.assertEqual(leg_res["prices"][0]["seat_type"], "ze")
         self.assertEqual(leg_res["price_date"], future_date)
         self.assertNotIn("price_stale", leg_res)
+
+    def test_unified_timetable_and_route_job_labels(self):
+        from app import main as main_mod
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [("BJP", "北京", "bj", "bj", "北京"), ("SHH", "上海", "sh", "sh", "上海")],
+            )
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("5u000D645402", "D6454", "2026-11-20", 1, "北京", None, "----", "08:00"),
+                    ("5u000D645402", "D6454", "2026-11-20", 2, "上海", "SHH", "14:00", "14:00"),
+                ],
+            )
+            conn.execute(
+                """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                     station_train_date,start_train_date,station_no,start_station_name,start_station_telecode,
+                     end_station_name,end_station_telecode)
+                   VALUES('BJP','北京','2026-11-20','D6454','5u000D645402','2026-11-20','2026-11-20',1,'北京','BJP','上海','SHH')"""
+            )
+
+        # 时刻表接口同时返回代号与车次号，并自动兜底补齐站点电报码
+        tt = main_mod.timetable("5u000D645402")
+        self.assertEqual(tt["train_no"], "5u000D645402")
+        self.assertEqual(tt["station_train_code"], "D6454")
+        self.assertEqual(tt["stops"][0]["telecode"], "BJP")
+        self.assertEqual(tt["stops"][1]["telecode"], "SHH")
+
+        # 搜索返回值包含带电报码的车站标签
+        sr = transfer.search("北京", "上海", "2026-11-20", expand_city=False)
+        self.assertEqual(sr["from_station_labels"], ["北京(BJP)"])
+        self.assertEqual(sr["to_station_labels"], ["上海(SHH)"])
+
+        # 一键导入任务日志同时记录 站名(电报码) 与 车次(代号)
+        jid, ev = main_mod._create_job({"status": "running", "done": 0, "total": 0, "phase": "init", "current": "", "log": [], "errors": [], "result": {}})
+        with mock.patch.object(main_mod.crawler, "crawl_station_trains"), \
+             mock.patch.object(main_mod.crawler, "crawl_timetable"), \
+             mock.patch.object(main_mod.crawler, "crawl_tickets"):
+            main_mod._route_job(jid, ev, "北京", "上海", "2026-11-20", True)
+        st = main_mod.job_status(jid)
+        self.assertEqual(st["status"], "done")
+        self.assertIn("车站大屏 北京(BJP)", st["log"])
+        self.assertIn("时刻表 D6454(5u000D645402)", st["log"])
+        self.assertIn("余票 北京(BJP)→上海(SHH)", st["log"])
 
 
 if __name__ == "__main__":

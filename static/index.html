@@ -282,6 +282,8 @@ async function api(url,opt){
 }
 function post(url,body){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}
 function fmtMin(m){const h=Math.floor(m/60),x=m%60;return h?`${h}小时${x?x+'分':''}`:`${x}分`;}
+function fmtStation(name,tc){return name&&tc?`${name}(${tc})`:(name||tc||'--');}
+function fmtTrain(code,no){return code&&no?`${code}(${no})`:(code||no||'--');}
 function trainBadge(code){const c=(String(code||'').match(/^[A-Za-z]/)||[''])[0].toUpperCase();const blue=['G','C','D','Z','T'];return `<span class="tcode ${blue.includes(c)?'blue':'green'}">${esc(code)}</span>`;}
 function seatsHtml(s){if(!s)return'';const arr=Object.entries(s);if(!arr.length)return'';return `<span class="seats">${arr.map(([k,v])=>{const name=SEAT[k]||k;let cls='none',label=v;if(v==='有')cls='full';else if(v==null||v===''||v==='无'||v==='--'||v==='*'){cls='none';}else cls='num';if(v==null||v==='')label='--';return `<span class="seat ${cls}"><span class="sn">${esc(name)}</span><span class="sv">${esc(label)}</span></span>`;}).join('')}</span>`;}
 function legAvailPrices(l){
@@ -363,8 +365,9 @@ $('s-go').onclick=async()=>{
     R=await api('/api/transfers?'+p);page=1;
     R.direct.forEach((x,i)=>{x._k='d'+i;x._type='direct';});
     R.transfers.forEach((x,i)=>{x._k='t'+i;x._type='transfer';});
-    const scope=(R.from_stations.length>1||R.to_stations.length>1)?`出发 ${R.from_stations.join('/')} → 到达 ${R.to_stations.join('/')}。`:'';
-    msg('s-msg',`${scope}大屏车次 ${R.screen_trains} 个，时刻表 ${R.timetable_trains} 个。直达 ${R.direct.length} 个，换乘 ${R.transfers.length} 个。${R.note}`);
+    const fl=R.from_station_labels||R.from_stations,tl=R.to_station_labels||R.to_stations;
+    const scope=(fl.length>1||tl.length>1)?`出发 ${fl.join('/')} → 到达 ${tl.join('/')} · `:'';
+    msg('s-msg',`${scope}大屏车次 ${R.screen_trains} 个，时刻表 ${R.timetable_trains} 个 · 直达 ${R.direct.length} 个，换乘 ${R.transfers.length} 个 · ${R.note}`);
     render();
     if($('s-live').checked)autoQuery();
   }catch(e){msg('s-msg',e.message,false);}
@@ -485,9 +488,9 @@ function planHtml(p){
     const meta=`${esc(l.train_no||'')}${l.from_station_no&&l.to_station_no?' #'+esc(l.from_station_no)+'→'+esc(l.to_station_no):''}`;
     return `<div class="leg">
     ${trainBadge(l.train)}
-    <span><span class="time">${l.depart.slice(11)}</span> <span class="st">${esc(l.from)} ${l.depart.slice(5,10)}</span></span>
+    <span><span class="time">${l.depart.slice(11)}</span> <span class="st">${esc(fmtStation(l.from,l.from_telecode))} ${l.depart.slice(5,10)}</span></span>
     <span class="st">→ ${fmtMin(l.duration_min)} →</span>
-    <span><span class="time">${l.arrive.slice(11)}</span> <span class="st">${esc(l.to)} ${l.arrive.slice(5,10)}</span></span>
+    <span><span class="time">${l.arrive.slice(11)}</span> <span class="st">${esc(fmtStation(l.to,l.to_telecode))} ${l.arrive.slice(5,10)}</span></span>
     <span class="st" style="font-family:Consolas,monospace;font-size:11px">${meta}</span>
     <span class="extra">${extra}</span>
     <span>${pricesHtml(l)||estText(l.price_est)}</span>
@@ -500,7 +503,7 @@ function planHtml(p){
     (p.date_assumed?`<span class="tag est" title="源日期: ${esc(p.source_date||'时刻表')}">推算${p.source_date?'('+esc(p.source_date)+')':''}</span>`:'<span class="tag" style="color:#16a34a">实测日期</span>')+
     (gone?'<span class="tag" style="color:#dc2626">已发车</span>':'');
   const sum=p._type==='transfer'
-    ?`<b>${fmtMin(p.total_min)}</b> ${tags} ${trs.map(t=>esc(t.station||'')).join('→')} 换乘 · 总等待 ${fmtMin(trs.reduce((a,t)=>a+(t.wait_min||0),0))}`
+    ?`<b>${fmtMin(p.total_min)}</b> ${tags} ${trs.map(t=>esc(fmtStation(t.station,t.telecode))).join('→')} 换乘 · 总等待 ${fmtMin(trs.reduce((a,t)=>a+(t.wait_min||0),0))}`
     :`<b>${fmtMin(p.total_min)}</b> ${tags}`;
   const btn=gone?'':`<button class="mini" onclick="queryPlan('${esc(p._k)}')">查票价余票</button>`;
   let html=`<div class="plan"><div class="sum"><span>${sum}</span>${totalPrice(p)}${btn}</div>`;
@@ -508,20 +511,21 @@ function planHtml(p){
     html+=legs[i];
     if(i<p.legs.length-1){
       const tr=trs[i]||{station:'',same:true,wait_min:0};
-      html+=`<div class="wait">⏱ ${esc(tr.station||'')}${tr.same?'':'→'+esc(p.legs[i+1].from)+' 异站换乘（含跨站交通）'} 换乘，预留 ${fmtMin(tr.wait_min||0)}</div>`;
+      const fromLabel=fmtStation(tr.station,tr.telecode),toLabel=fmtStation(p.legs[i+1].from,p.legs[i+1].from_telecode);
+      html+=`<div class="wait">⏱ ${esc(fromLabel)}${tr.same?'':'→'+esc(toLabel)+' 异站换乘（含跨站交通）'} 换乘，预留 ${fmtMin(tr.wait_min||0)}</div>`;
     }
   }
   return html+'</div>';
 }
 function findPlan(k){return (k[0]==='d'?R.direct:R.transfers)[+k.slice(1)];}
-function planLegs(p){return p.legs.map(l=>({train_no:l.train_no,date:l.depart.slice(0,10),
+function planLegs(p){return p.legs.map(l=>({train_no:l.train_no,train:l.train,date:l.depart.slice(0,10),
   from_telecode:l.from_telecode,to_telecode:l.to_telecode,from_name:l.from,to_name:l.to}));}
 async function queryPlan(k){
   const p=findPlan(k);
   if(departed(p)){msg('s-msg','该方案已有车次发车，不再提供实时查询',false);return;}
   try{
     const r=await post('/api/plan_tickets',{legs:planLegs(p)});
-    msg('s-msg',`正在查询该方案票价/余票（${r.legs} 个行程段）…`);
+    msg('s-msg',`【票价/余票】正在查询方案 ${p.legs.map(l=>fmtTrain(l.train,l.train_no)).join(' + ')}（${r.legs} 个行程段）…`);
     pollPlanJob(r.job_id);
   }catch(e){msg('s-msg',e.message,false);}
 }
@@ -533,22 +537,22 @@ async function autoQuery(){
   if(!legs.length)return;
   try{
     const r=await post('/api/plan_tickets',{legs});
-    msg('s-msg',`自动查询第 ${page} 页票价/余票：去重后 ${r.legs} 个行程段…`);
+    msg('s-msg',`【票价/余票】正在查询第 ${page} 页（去重后 ${r.legs} 个行程段）…`);
     pollPlanJob(r.job_id);
   }catch(e){msg('s-msg',e.message,false);}
 }
 function pollPlanJob(id){
   if(planPoll)clearInterval(planPoll);
   activePlanJob=id;
-  setCancelBtn('s-cancel',id,()=>{clearInterval(planPoll);planPoll=null;activePlanJob=null;msg('s-msg','票价/余票查询已取消',false);});
+  setCancelBtn('s-cancel',id,()=>{clearInterval(planPoll);planPoll=null;activePlanJob=null;msg('s-msg','【票价/余票】任务已取消',false);});
   planPoll=setInterval(async()=>{
     try{
       const j=await api('/api/jobs/'+id);
-      if(j.status==='running'){msg('s-msg',`票价/余票查询 ${j.done}/${j.total}`+(j.errors.length?`，失败 ${j.errors.length}`:''));return;}
+      if(j.status==='running'){msg('s-msg',`【票价/余票】${j.done}/${j.total}${j.errors.length?`，失败 ${j.errors.length}`:''}`);return;}
       clearInterval(planPoll);planPoll=null;activePlanJob=null;setCancelBtn('s-cancel',null);
-      if(j.status==='cancelled'){msg('s-msg',`票价/余票查询已取消（已完成 ${j.done}/${j.total}）`,false);return;}
+      if(j.status==='cancelled'){msg('s-msg',`【票价/余票】任务已取消（已完成 ${j.done}/${j.total}）`,false);return;}
       applyTickets(j.result);render();
-      msg('s-msg','票价/余票查询完成'+(j.errors.length?`，失败 ${j.errors.length} 项：\n${j.errors.join('\n')}`:''));
+      msg('s-msg',`【票价/余票】查询完成 ${j.done}/${j.total}`+(j.errors.length?`，失败 ${j.errors.length} 项：\n${j.errors.join('\n')}`:''));
     }catch(e){clearInterval(planPoll);planPoll=null;activePlanJob=null;setCancelBtn('s-cancel',null);}
   },1500);
 }
@@ -566,29 +570,29 @@ async function toggleTT(k,i){
   const el=$('tt-'+k+'-'+i);
   if(el.dataset.open){el.innerHTML='';delete el.dataset.open;return;}
   const l=findPlan(k).legs[i];
-  el.dataset.open='1';el.innerHTML='<div class="hint">时刻表加载中…</div>';
+  el.dataset.open='1';el.innerHTML=`<div class="hint">正在加载 ${esc(fmtTrain(l.train,l.train_no))} 时刻表…</div>`;
   try{
     const r=await api('/api/timetable?train_no='+encodeURIComponent(l.train_no));
     el.innerHTML=renderTT(r,l,k,i);
   }catch(e){
-    el.innerHTML=`<div class="hint">该车次时刻表未入库。<button class="mini" onclick="crawlTTPlan('${k}',${i})">抓取时刻表</button></div>`;
+    el.innerHTML=`<div class="hint">车次 ${esc(fmtTrain(l.train,l.train_no))} 时刻表未入库。<button class="mini" onclick="crawlTTPlan('${esc(k)}',${i})">抓取完整时刻表</button></div>`;
   }
 }
 function renderTT(r,l,k,i){
-  let html=ttTable(r.stops,l);
-  if(!r.complete){
-    html+=`<div class="hint">以上为车站大屏已抓取的经停站，可能不完整。<button class="mini" onclick="crawlTTPlan('${k}',${i})">抓取完整时刻表</button></div>`;
-  }
-  return html;
+  const tLabel=fmtTrain(r.station_train_code||(l&&l.train),r.train_no||(l&&l.train_no));
+  const srcText=r.complete?'完整时刻表(train_stops)':'车站大屏(station_trains，可能不完整)';
+  const btn=(!r.complete&&k!=null)?` <button class="mini" onclick="crawlTTPlan('${esc(k)}',${i})">抓取完整时刻表</button>`:'';
+  const head=`<div class="hint" style="margin:4px 0">车次：<b>${esc(tLabel)}</b> · 来源：${srcText} · 共 ${r.stops.length} 站${btn}</div>`;
+  return head+ttTable(r.stops,l);
 }
 function ttTable(list,l){
-  return '<div class="scroll"><table><tr><th>#</th><th>车站</th><th>到达</th><th>出发</th><th>停留</th></tr>'+
-    list.map(s=>{const hl=s.station_name===l.from||s.station_name===l.to;
-      return `<tr${hl?' style="background:#eff6ff;font-weight:bold"':''}><td>${s.station_no}</td><td>${esc(s.station_name)}</td><td>${esc(s.arrive_time)}</td><td>${esc(s.start_time)}</td><td>${esc(s.stopover_time)}</td></tr>`;}).join('')+'</table></div>';
+  return '<div class="scroll"><table><tr><th>#</th><th>站名</th><th>电报码</th><th>到达</th><th>出发</th><th>停留</th><th>客运</th></tr>'+
+    list.map(s=>{const hl=l&&(s.station_name===l.from||s.station_name===l.to||(l.from_telecode&&s.telecode===l.from_telecode)||(l.to_telecode&&s.telecode===l.to_telecode));
+      return `<tr${hl?' style="background:#eff6ff;font-weight:bold"':''}><td>${s.station_no}</td><td>${esc(s.station_name)}</td><td style="font-family:Consolas,monospace">${esc(s.telecode||'--')}</td><td>${esc(s.arrive_time)}</td><td>${esc(s.start_time)}</td><td>${esc(s.stopover_time)}</td><td>${(s.enabled??1)?'✓':'✗'}</td></tr>`;}).join('')+'</table></div>';
 }
 async function crawlTTPlan(k,i){
   const l=findPlan(k).legs[i],el=$('tt-'+k+'-'+i);
-  el.innerHTML='<div class="hint">正在抓取时刻表…</div>';
+  el.innerHTML=`<div class="hint">正在抓取 ${esc(fmtTrain(l.train,l.train_no))} 时刻表…</div>`;
   try{
     await post('/api/crawl/timetable',{train_no:l.train_no});
     const r=await api('/api/timetable?train_no='+encodeURIComponent(l.train_no));
@@ -601,19 +605,20 @@ const PHASE={init:'准备中',screen:'抓取车站大屏',timetable:'抓取车�
 async function runRouteImport(from,to,date,deep,msgElId,cancelBtnId){
   const r=await post('/api/import/route',{from_city:from,to_city:to,date:date,deep:!!deep});
   activeRouteJob=r.job_id;
-  msg(msgElId,`已开始：出发 ${r.from_stations.join('/')} → 到达 ${r.to_stations.join('/')}（${deep?'完整':'快速'}导入）…`);
+  const fl=r.from_station_labels||r.from_stations,tl=r.to_station_labels||r.to_stations;
+  msg(msgElId,`【一键导入】已开始：出发 ${fl.join('/')} → 到达 ${tl.join('/')}（${deep?'完整':'快速'}导入）…`);
   await new Promise((resolve,reject)=>{
     let timer=null;
     const stop=()=>{if(timer){clearInterval(timer);timer=null;}activeRouteJob=null;setCancelBtn(cancelBtnId,null);};
-    setCancelBtn(cancelBtnId,r.job_id,()=>{stop();reject(new Error('导入任务已取消'));});
+    setCancelBtn(cancelBtnId,r.job_id,()=>{stop();reject(new Error('【一键导入】任务已取消'));});
     timer=setInterval(async()=>{
       try{
         const j=await api('/api/jobs/'+r.job_id);
         const ph=PHASE[j.phase]||j.phase;
         const tail=j.errors.length?`，失败 ${j.errors.length}`:'';
-        msg(msgElId,`${ph}：${j.done}/${j.total}${j.current?` — ${j.current}`:''}${tail}`);
-        if(j.status==='done'){stop();msg(msgElId,`导入完成：${j.done} 步${j.errors.length?`，失败 ${j.errors.length} 项：\n${j.errors.slice(0,6).join('\n')}`:''}`);resolve(j);}
-        else if(j.status==='cancelled'){stop();msg(msgElId,'导入任务已取消',false);reject(new Error('导入任务已取消'));}
+        msg(msgElId,`【${ph}】${j.done}/${j.total}${j.current?` — ${j.current}`:''}${tail}`);
+        if(j.status==='done'){stop();msg(msgElId,`【导入完成】共 ${j.done} 步${j.errors.length?`，失败 ${j.errors.length} 项：\n${j.errors.slice(0,6).join('\n')}`:''}`);resolve(j);}
+        else if(j.status==='cancelled'){stop();msg(msgElId,`【一键导入】任务已取消（已完成 ${j.done}/${j.total}）`,false);reject(new Error('【一键导入】任务已取消'));}
         else if(j.status==='error'){stop();msg(msgElId,j.error||'导入失败',false);reject(new Error(j.error));}
       }catch(e){stop();reject(e);}
     },1500);
@@ -643,11 +648,11 @@ $('c-rate-save').onclick=async()=>{
     $('c-rate-status').textContent=r.mode==='manual'
       ?`已应用：手动 ${r.manual_interval}s/次`
       :`已应用：智能自适应（当前 ${r.interval}s/次）`;
-    msg('c-rate-msg','限速设置已保存');
+    msg('c-rate-msg','【请求速率】设置已保存');
   }catch(e){msg('c-rate-msg',e.message,false);}
 };
 $('c-stations').onclick=async()=>{
-  try{const r=await post('/api/crawl/stations',{});msg('c-st-msg',`站名表更新成功：${r.saved} 个车站`);}
+  try{const r=await post('/api/crawl/stations',{});msg('c-st-msg',`【站名表】更新完成：入库 ${r.saved} 个车站`);}
   catch(e){msg('c-st-msg',e.message,false);}
 };
 $('c-st-go').onclick=async()=>{
@@ -655,11 +660,12 @@ $('c-st-go').onclick=async()=>{
   try{
     const body={station:$('c-station').value,date:$('c-date').value};
     const r=await post('/api/crawl/station_trains',body);
-    msg('c-stn-msg',`爬取成功：${r.saved} 个经由车次（原始返回已留档 raw_id=${r.raw_id}）`);
     const list=await api(`/api/station_trains?station=${encodeURIComponent(body.station)}&date=${body.date}`);
-    $('c-stn-table').innerHTML=`<table><tr><th>车次</th><th>类型</th><th>始发→终到</th><th>到达</th><th>出发</th><th>跨天</th><th>操作</th></tr>`+
-      list.map(t=>`<tr><td>${trainBadge(t.station_train_code)}</td><td>${esc(t.train_class_name||'')}</td>
-        <td>${esc(t.start_station_name)}→${esc(t.end_station_name)}</td>
+    const stLabel=list[0]?fmtStation(list[0].station_name||body.station,list[0].station_telecode):body.station;
+    msg('c-stn-msg',`【车站大屏】${stLabel}（${body.date}）爬取完成：入库 ${r.saved} 个经由车次（留档 raw_id=${r.raw_id}）`);
+    $('c-stn-table').innerHTML=`<table><tr><th>车次 / 代号</th><th>类型</th><th>始发→终到</th><th>到达</th><th>出发</th><th>跨天</th><th>操作</th></tr>`+
+      list.map(t=>`<tr><td>${trainBadge(t.station_train_code)} <span class="st" style="font-family:Consolas,monospace">${esc(t.train_no||'--')}</span></td><td>${esc(t.train_class_name||'')}</td>
+        <td>${esc(fmtStation(t.start_station_name,t.start_station_telecode))} → ${esc(fmtStation(t.end_station_name,t.end_station_telecode))}</td>
         <td>${esc(t.arrive_time)}</td><td>${esc(t.start_time)}</td><td>${t.start_day_diff??0}</td>
         <td><button class="mini" onclick="crawlTT('${esc(t.train_no)}','${esc(t.station_train_code)}')">抓时刻表</button></td></tr>`).join('')+'</table>';
   }catch(e){msg('c-stn-msg',e.message,false);}
@@ -668,16 +674,13 @@ $('c-st-go').onclick=async()=>{
 async function crawlTT(trainNo,code){
   try{
     const r=await post('/api/crawl/timetable',{train_no:trainNo});
-    await showTimetable(trainNo,`${code} 时刻表（新抓取 ${r.saved} 站）`);
+    await showTimetable(trainNo,code,`新抓取 ${r.saved} 站`);
   }catch(e){msg('c-stn-msg',e.message,false);}
 }
-async function showTimetable(trainNo,title){
+async function showTimetable(trainNo,code,extraNote=''){
   const r=await api('/api/timetable?train_no='+encodeURIComponent(trainNo));
-  const list=r.stops;
-  const note=r.complete?'':'<div class="hint">来自车站大屏，仅含已抓取经停站，可能不完整。</div>';
-  $('modal-body').innerHTML=`<h3>${esc(title||trainNo)}</h3>${note}<table><tr><th>#</th><th>车站</th><th>到达</th><th>出发</th><th>停留</th><th>客运</th></tr>`+
-    list.map(s=>`<tr><td>${s.station_no}</td><td>${esc(s.station_name)}</td><td>${esc(s.arrive_time)}</td>
-      <td>${esc(s.start_time)}</td><td>${esc(s.stopover_time)}</td><td>${s.enabled?'✓':'✗'}</td></tr>`).join('')+'</table>';
+  const title=fmtTrain(r.station_train_code||code,r.train_no||trainNo);
+  $('modal-body').innerHTML=`<h3>${esc(title)} 时刻表${extraNote?`（${esc(extraNote)}）`:''}</h3>`+renderTT(r,null,null,null);
   $('modal').style.display='block';
 }
 $('c-t-go').onclick=async()=>{
@@ -685,7 +688,7 @@ $('c-t-go').onclick=async()=>{
   try{
     const body={from_station:$('c-from').value,to_station:$('c-to').value,date:$('c-t-date').value,with_prices:$('c-prices').checked};
     const r=await post('/api/crawl/tickets',body);
-    msg('c-t-msg',`余票爬取成功：${r.saved} 个车次`+(r.price_job?'，票价后台爬取中…':''));
+    msg('c-t-msg',`【站间余票】${body.from_station}→${body.to_station}（${body.date}）爬取完成：入库 ${r.saved} 个车次`+(r.price_job?'，票价后台爬取中…':''));
     await renderTickets(body);
     if(r.price_job)pollJob(r.price_job,body);
   }catch(e){msg('c-t-msg',e.message,false);}
@@ -693,25 +696,25 @@ $('c-t-go').onclick=async()=>{
 };
 async function renderTickets(body){
   const list=await api(`/api/tickets?from_station=${encodeURIComponent(body.from_station)}&to_station=${encodeURIComponent(body.to_station)}&date=${body.date}`);
-  $('c-t-table').innerHTML=`<table><tr><th>车次</th><th>出发</th><th>到达</th><th>历时</th><th>余票</th><th>可购</th></tr>`+
-    list.map(t=>`<tr><td>${trainBadge(t.station_train_code)}</td><td>${esc(t.start_time)}</td><td>${esc(t.arrive_time)}</td>
+  $('c-t-table').innerHTML=`<table><tr><th>车次 / 代号</th><th>出发</th><th>到达</th><th>历时</th><th>余票</th><th>可购</th></tr>`+
+    list.map(t=>`<tr><td>${trainBadge(t.station_train_code)} <span class="st" style="font-family:Consolas,monospace">${esc(t.train_no||'--')}</span></td><td>${esc(t.start_time)}</td><td>${esc(t.arrive_time)}</td>
       <td>${esc(t.duration)}</td><td>${seatsHtml(JSON.parse(t.seats||'{}'))}</td><td>${esc(t.can_web_buy)}</td></tr>`).join('')+'</table>';
 }
 async function pollJob(id,body){
   if(ticketPoll)clearInterval(ticketPoll);
   activeTicketJob=id;
-  setCancelBtn('c-t-cancel',id,()=>{clearInterval(ticketPoll);ticketPoll=null;activeTicketJob=null;msg('c-t-msg','票价爬取已取消',false);});
+  setCancelBtn('c-t-cancel',id,()=>{clearInterval(ticketPoll);ticketPoll=null;activeTicketJob=null;msg('c-t-msg','【余票抓价】任务已取消',false);});
   ticketPoll=setInterval(async()=>{
     try{
       const j=await api('/api/jobs/'+id);
       if(j.status==='running'){
-        msg('c-t-msg',`票价爬取 ${j.done}/${j.total}`+(j.errors.length?`，失败 ${j.errors.length}`:''));
+        msg('c-t-msg',`【余票抓价】${j.done}/${j.total}${j.current?` — ${j.current}`:''}`+(j.errors.length?`，失败 ${j.errors.length}`:''));
         loadRate();
         return;
       }
       clearInterval(ticketPoll);ticketPoll=null;activeTicketJob=null;setCancelBtn('c-t-cancel',null);
-      if(j.status==='cancelled'){msg('c-t-msg',`票价爬取已取消（${j.done}/${j.total}）`,false);return;}
-      msg('c-t-msg',`票价爬取完成 ${j.done}/${j.total}`+(j.errors.length?`，失败：\n${j.errors.join('\n')}`:''));
+      if(j.status==='cancelled'){msg('c-t-msg',`【余票抓价】任务已取消（已完成 ${j.done}/${j.total}）`,false);return;}
+      msg('c-t-msg',`【余票抓价】爬取完成 ${j.done}/${j.total}`+(j.errors.length?`，失败 ${j.errors.length} 项：\n${j.errors.join('\n')}`:''));
     }catch(e){clearInterval(ticketPoll);ticketPoll=null;activeTicketJob=null;setCancelBtn('c-t-cancel',null);}
   },2000);
 }
@@ -733,7 +736,7 @@ $('i-go').onclick=async()=>{
       if(!text)throw new Error('请粘贴内容或选择文件');
       r=await post('/api/import',{payload:text,...ctx});
     }
-    msg('i-msg',`导入成功：类型 ${r.api_type}，解析 ${r.parsed} 条，入库 ${r.saved} 条（原始留档 raw_id=${r.raw_id}）`);
+    msg('i-msg',`【数据导入】完成：类型 ${r.api_type}，解析 ${r.parsed} 条，入库 ${r.saved} 条（留档 raw_id=${r.raw_id}）`);
   }catch(e){msg('i-msg',e.message,false);}
   btn.disabled=false;
 };
@@ -749,16 +752,17 @@ $('b-clean-go').onclick=async()=>{
     const d=$('b-clean-date').value,raw=$('b-clean-raw').checked;
     const p=new URLSearchParams();if(d)p.set('before_date',d);if(raw)p.set('include_raw','true');
     const r=await api('/api/cache?'+p,{method:'DELETE'});
-    msg('b-msg','清理完成：'+JSON.stringify(r.deleted));
+    const del=r.deleted||{};
+    msg('b-msg',`【缓存清理】完成：大屏 ${del.station_trains||0} · 时刻表 ${del.train_stops||0} · 余票 ${del.tickets||0} · 票价 ${del.prices||0}`+(raw?` · 留档 ${del.raw_payloads||0}`:''));
     loadStats();
   }catch(e){msg('b-msg',e.message,false);}
 };
 $('b-go').onclick=async()=>{
   try{
     const list=await api('/api/trains?q='+encodeURIComponent($('b-q').value));
-    $('b-trains').innerHTML=`<table><tr><th>车次</th><th>车次编号</th><th>时刻表日期</th><th>停站数</th><th></th></tr>`+
-      list.map(t=>`<tr><td>${trainBadge(t.station_train_code)}</td><td>${esc(t.train_no)}</td><td>${esc(t.train_date)}</td>
-        <td>${t.stop_count}</td><td><button class="mini" onclick="showTimetable('${esc(t.train_no)}','${esc(t.station_train_code)} 时刻表')">查看</button></td></tr>`).join('')+'</table>';
+    $('b-trains').innerHTML=`<table><tr><th>车次 / 代号</th><th>时刻表日期</th><th>停站数</th><th>操作</th></tr>`+
+      list.map(t=>`<tr><td>${trainBadge(t.station_train_code)} <span class="st" style="font-family:Consolas,monospace">${esc(t.train_no)}</span></td><td>${esc(t.train_date)}</td>
+        <td>${t.stop_count}</td><td><button class="mini" onclick="showTimetable('${esc(t.train_no)}','${esc(t.station_train_code||'')}')">查看</button></td></tr>`).join('')+'</table>';
   }catch(e){msg('b-msg',e.message,false);}
 };
 </script>

@@ -60,10 +60,48 @@ def startup():
     db.init_db()
 
 
+def _fmt_station(name: str | None, telecode: str | None) -> str:
+    """统一格式化车站为「站名(电报码)」。"""
+    if name and telecode:
+        return f"{name}({telecode})"
+    return name or telecode or "--"
+
+
+def _fmt_train(code: str | None, train_no: str | None) -> str:
+    """统一格式化车次为「车次(代号)」。"""
+    if code and train_no:
+        return f"{code}({train_no})"
+    return code or train_no or "--"
+
+
+def _station_name_map(telecodes: set[str] | list[str]) -> dict[str, str]:
+    tcs = [x for x in set(telecodes) if x]
+    if not tcs:
+        return {}
+    ph = ",".join("?" * len(tcs))
+    return {r["telecode"]: r["name"]
+            for r in db.rows(f"SELECT telecode, name FROM stations WHERE telecode IN ({ph})", tuple(tcs))}
+
+
+def _train_code_map(train_nos: set[str] | list[str]) -> dict[str, str]:
+    tns = [x for x in set(train_nos) if x]
+    if not tns:
+        return {}
+    out = {}
+    ph = ",".join("?" * len(tns))
+    for tbl in ("station_trains", "train_stops", "tickets"):
+        for r in db.rows(
+            f"SELECT train_no, station_train_code FROM {tbl} WHERE train_no IN ({ph}) AND station_train_code IS NOT NULL",
+            tuple(tns),
+        ):
+            out.setdefault(r["train_no"], r["station_train_code"])
+    return out
+
+
 def _station_or_400(q: str) -> dict:
     s = db.resolve_station(q)
     if not s:
-        raise HTTPException(400, f"车站“{q}”不存在，请先更新车站站名表")
+        raise HTTPException(400, f"车站“{q}”不存在，请先在「爬取数据」页更新车站站名表")
     return s
 
 
@@ -203,13 +241,15 @@ def crawl_tickets(body: TicketReq):
 def _price_job(job_id, ev: threading.Event, f_tc, t_tc, date):
     crawler.set_cancel_event(ev)
     try:
-        tk = db.rows("""SELECT train_no,from_station_no,to_station_no,seat_types FROM tickets
+        tk = db.rows("""SELECT train_no,station_train_code,from_station_no,to_station_no,seat_types FROM tickets
                         WHERE from_telecode=? AND to_telecode=? AND train_date=?""", (f_tc, t_tc, date))
         _job_update(job_id, total=len(tk))
         for r in tk:
             if ev.is_set():
                 _job_update(job_id, status="cancelled")
                 return
+            t_label = _fmt_train(r["station_train_code"], r["train_no"])
+            _job_update(job_id, current=f"票价 {t_label}")
             try:
                 crawler.crawl_price(r["train_no"], r["from_station_no"], r["to_station_no"],
                                     r["seat_types"] or "", date)
@@ -217,7 +257,7 @@ def _price_job(job_id, ev: threading.Event, f_tc, t_tc, date):
                 _job_update(job_id, status="cancelled")
                 return
             except Exception as e:
-                _job_append(job_id, "errors", f"{r['train_no']}: {e}")
+                _job_append(job_id, "errors", f"票价 {t_label}: {e}")
             _job_inc(job_id, "done")
         _job_update(job_id, status="done")
     finally:
@@ -292,20 +332,21 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
         fstations = db.resolve_stations(from_q, True)
         tstations = db.resolve_stations(to_q, True)
         if not fstations or not tstations:
-            _job_update(job_id, status="error", error="车站/城市不存在，请先在“爬取数据”页更新车站站名表")
+            _job_update(job_id, status="error", error="车站/城市不存在，请先在「爬取数据」页更新车站站名表")
             return
+        tc_name = {s["telecode"]: s["name"] for s in fstations + tstations}
         ftcs = [s["telecode"] for s in fstations]
         ttcs = [s["telecode"] for s in tstations]
         all_tcs = list(dict.fromkeys(ftcs + ttcs))
 
         _job_update(job_id, phase="screen", total=len(all_tcs))
         for tc in all_tcs:
-            run(f"车站大屏 {tc}", crawler.crawl_station_trains, tc, date)
+            run(f"车站大屏 {_fmt_station(tc_name.get(tc), tc)}", crawler.crawl_station_trains, tc, date)
 
         if deep:
             ph = ",".join("?" * len(all_tcs))
             rows = db.rows(
-                f"""SELECT DISTINCT train_no,start_station_telecode,end_station_telecode,start_train_date
+                f"""SELECT DISTINCT train_no,station_train_code,start_station_telecode,end_station_telecode,start_train_date
                     FROM station_trains WHERE station_telecode IN ({ph}) AND station_train_date=?""",
                 (*all_tcs, date))
             uniq = {}
@@ -318,6 +359,7 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
             _job_update(job_id, phase="timetable", total=cur_total + len(items))
             for r in items:
                 tn = r["train_no"]
+                t_label = _fmt_train(r["station_train_code"], tn)
                 f = r["start_station_telecode"]
                 t = r["end_station_telecode"]
                 d = r["start_train_date"] or date
@@ -325,21 +367,22 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
                     ctx = station_timetable_context(tn) or {}
                     f, t, d = ctx.get("from"), ctx.get("to"), ctx.get("date") or date
                 if not f or not t:
-                    run(f"时刻表 {tn} 跳过（缺始发/终到）", lambda: None)
+                    run(f"时刻表 {t_label} 跳过（缺始发/终到站）", lambda: None)
                     continue
-                run(f"时刻表 {tn}", crawler.crawl_timetable, tn, d, f, t)
+                run(f"时刻表 {t_label}", crawler.crawl_timetable, tn, d, f, t)
 
         pairs = [(f, t) for f in ftcs for t in ttcs if f != t]
         with _jobs_lock:
             cur_total = jobs[job_id]["total"]
         _job_update(job_id, phase="tickets", total=cur_total + len(pairs))
         for f, t in pairs:
-            run(f"余票 {f}→{t}", crawler.crawl_tickets, f, t, date)
+            run(f"余票 {_fmt_station(tc_name.get(f), f)}→{_fmt_station(tc_name.get(t), t)}",
+                crawler.crawl_tickets, f, t, date)
 
         if deep:
             phf, pht = ",".join("?" * len(ftcs)), ",".join("?" * len(ttcs))
             tk = db.rows(
-                f"""SELECT t.train_no,t.from_station_no,t.to_station_no,t.seat_types
+                f"""SELECT t.train_no,t.station_train_code,t.from_station_no,t.to_station_no,t.seat_types
                     FROM tickets t
                     WHERE t.from_telecode IN ({phf}) AND t.to_telecode IN ({pht}) AND t.train_date=?
                       AND NOT EXISTS (
@@ -353,7 +396,7 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
                 cur_total = jobs[job_id]["total"]
             _job_update(job_id, phase="price", total=cur_total + len(tk))
             for r in tk:
-                run(f"票价 {r['train_no']}",
+                run(f"票价 {_fmt_train(r['station_train_code'], r['train_no'])}",
                     crawler.crawl_price, r["train_no"], r["from_station_no"] or "",
                     r["to_station_no"] or "", r["seat_types"] or "", date)
 
@@ -372,7 +415,7 @@ def import_route(body: RouteImportReq):
     fstations = db.resolve_stations(body.from_city, True)
     tstations = db.resolve_stations(body.to_city, True)
     if not fstations or not tstations:
-        raise HTTPException(400, "车站/城市不存在，请先在“爬取数据”页更新车站站名表")
+        raise HTTPException(400, "车站/城市不存在，请先在「爬取数据」页更新车站站名表")
     job_id, ev = _create_job({"status": "running", "done": 0, "total": 0, "phase": "init",
                                "current": "", "log": [], "errors": [], "result": {}})
     threading.Thread(target=_route_job, args=(job_id, ev, body.from_city, body.to_city,
@@ -380,6 +423,8 @@ def import_route(body: RouteImportReq):
     return {"job_id": job_id,
             "from_stations": [s["name"] for s in fstations],
             "to_stations": [s["name"] for s in tstations],
+            "from_station_labels": [_fmt_station(s["name"], s["telecode"]) for s in fstations],
+            "to_station_labels": [_fmt_station(s["name"], s["telecode"]) for s in tstations],
             "date": body.date, "deep": body.deep}
 
 
@@ -396,28 +441,39 @@ def station_trains(station: str, date: str | None = None):
 
 @app.get("/api/timetable")
 def timetable(train_no: str):
+    n2c = db.station_lookup()
     r = db.rows("SELECT DISTINCT train_date FROM train_stops WHERE train_no=? ORDER BY train_date DESC LIMIT 1",
                 (train_no,))
     if r:
         stops = db.rows("""SELECT * FROM train_stops WHERE train_no=? AND train_date=? ORDER BY station_no""",
                         (train_no, r[0]["train_date"]))
-        return {"stops": stops, "complete": True, "source": "train_stops"}
+        for s in stops:
+            if not s.get("telecode"):
+                s["telecode"] = n2c.get(s.get("station_name"))
+        code = next((s.get("station_train_code") for s in stops if s.get("station_train_code")), None)
+        if not code:
+            code = _train_code_map([train_no]).get(train_no)
+        return {"train_no": train_no, "station_train_code": code,
+                "stops": stops, "complete": True, "source": "train_stops"}
     # 退回车站大屏：把已抓取各站的经停拼成（可能不完整的）时刻表
-    scr = db.rows("""SELECT station_no, station_name, station_telecode, arrive_time, start_time,
+    scr = db.rows("""SELECT station_train_code, station_no, station_name, station_telecode, arrive_time, start_time,
                             stopover_time, station_train_date
                      FROM station_trains WHERE train_no=? AND station_no IS NOT NULL
                      ORDER BY station_no, station_train_date DESC""", (train_no,))
-    seen, stops = set(), []
+    seen, stops, code = set(), [], None
     for s in scr:
+        code = code or s.get("station_train_code")
         if s["station_no"] in seen:
             continue
         seen.add(s["station_no"])
         stops.append({"station_no": s["station_no"], "station_name": s["station_name"],
-                      "telecode": s["station_telecode"], "arrive_time": s["arrive_time"],
-                      "start_time": s["start_time"], "stopover_time": s["stopover_time"], "enabled": 1})
+                      "telecode": s["station_telecode"] or n2c.get(s.get("station_name")),
+                      "arrive_time": s["arrive_time"], "start_time": s["start_time"],
+                      "stopover_time": s["stopover_time"], "enabled": 1})
     if stops:
-        return {"stops": stops, "complete": False, "source": "station_screen"}
-    raise HTTPException(404, "该车次暂无时刻表数据")
+        return {"train_no": train_no, "station_train_code": code,
+                "stops": stops, "complete": False, "source": "station_screen"}
+    raise HTTPException(404, f"车次({train_no})暂无时刻表数据")
 
 
 @app.get("/api/trains")
@@ -465,6 +521,7 @@ def transfers(from_station: str, to_station: str, date: str,
 # ---------- 方案票价/余票实时查询 ----------
 class PlanLeg(BaseModel):
     train_no: str
+    train: str | None = None
     date: str
     from_telecode: str | None = None
     to_telecode: str | None = None
@@ -484,15 +541,23 @@ def _leg_ident(l: PlanLeg) -> tuple:
 def plan_tickets(body: PlanTicketsReq):
     legs, seen = [], set()
     for l in body.legs:
-        f = l.from_telecode or (db.resolve_station(l.from_name) or {}).get("telecode")
-        t = l.to_telecode or (db.resolve_station(l.to_name) or {}).get("telecode")
+        fs = db.resolve_station(l.from_telecode) if l.from_telecode else db.resolve_station(l.from_name)
+        ts = db.resolve_station(l.to_telecode) if l.to_telecode else db.resolve_station(l.to_name)
+        f = l.from_telecode or (fs or {}).get("telecode")
+        t = l.to_telecode or (ts or {}).get("telecode")
         if not f or not t:
             raise HTTPException(400, f"无法识别车站：{l.from_name or l.from_telecode} / {l.to_name or l.to_telecode}")
         key = _leg_ident(l)
         if key in seen:
             continue
         seen.add(key)
-        legs.append({"key": "|".join(key), "train_no": l.train_no, "from": f, "to": t, "date": l.date})
+        legs.append({
+            "key": "|".join(key), "train_no": l.train_no, "train": l.train or "",
+            "from": f, "to": t,
+            "from_name": l.from_name or (fs or {}).get("name") or "",
+            "to_name": l.to_name or (ts or {}).get("name") or "",
+            "date": l.date,
+        })
     if not legs:
         raise HTTPException(400, "没有可查询的行程段")
     job_id, ev = _create_job({"status": "running", "done": 0, "total": 0, "errors": [], "result": {}})
@@ -504,6 +569,17 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
     crawler.set_cancel_event(ev)
     try:
         today = db.cn_today().isoformat()
+        tc_name = _station_name_map({l["from"] for l in legs} | {l["to"] for l in legs})
+        for l in legs:
+            if l.get("from_name"):
+                tc_name.setdefault(l["from"], l["from_name"])
+            if l.get("to_name"):
+                tc_name.setdefault(l["to"], l["to_name"])
+        train_codes = _train_code_map({l["train_no"] for l in legs})
+        for l in legs:
+            if l.get("train"):
+                train_codes.setdefault(l["train_no"], l["train"])
+
         pairs = list(dict.fromkeys((l["from"], l["to"], l["date"]) for l in legs))
         _job_update(job_id, total=len(pairs))
         for f, t, d in pairs:
@@ -518,7 +594,8 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
                     _job_update(job_id, status="cancelled")
                     return
                 except Exception as e:
-                    _job_append(job_id, "errors", f"{f}→{t} {d}: {e}")
+                    _job_append(job_id, "errors",
+                                f"余票 {_fmt_station(tc_name.get(f), f)}→{_fmt_station(tc_name.get(t), t)} {d}: {e}")
             _job_inc(job_id, "done")
 
         tk = {}
@@ -526,6 +603,8 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
             for r in db.rows("""SELECT * FROM tickets WHERE from_telecode=? AND to_telecode=? AND train_date=?""",
                              (f, t, d)):
                 tk[(r["train_no"], f, t, d)] = r
+                if r["station_train_code"]:
+                    train_codes.setdefault(r["train_no"], r["station_train_code"])
 
         sno = transfer._load_sno()
         need = {}
@@ -554,7 +633,7 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
                 _job_update(job_id, status="cancelled")
                 return
             except Exception as e:
-                _job_append(job_id, "errors", f"票价 {tn} {fno}→{tno}: {e}")
+                _job_append(job_id, "errors", f"票价 {_fmt_train(train_codes.get(tn), tn)} {fno}→{tno}: {e}")
             _job_inc(job_id, "done")
 
         out = {}
