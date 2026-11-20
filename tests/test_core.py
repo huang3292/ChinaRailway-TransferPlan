@@ -624,6 +624,133 @@ class TestCrawlerAndMainStubbed(TempDBTestCase):
         )
         self.assertGreater(imp_res["saved"], 0)
 
+    def test_search_progress_cancel_and_plan_tickets_partial_preserve(self):
+        from app import main as main_mod
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [
+                    ("BJP", "北京", "bj", "bj", "北京"),
+                    ("SHH", "上海", "sh", "sh", "上海"),
+                    ("TJP", "天津", "tj", "tj", "天津"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("TN1", "G1", "2026-11-20", 1, "北京", "BJP", "----", "08:00"),
+                    ("TN1", "G1", "2026-11-20", 2, "上海", "SHH", "12:00", "12:00"),
+                    ("TN2", "G2", "2026-11-20", 1, "北京", "BJP", "----", "09:00"),
+                    ("TN2", "G2", "2026-11-20", 2, "天津", "TJP", "09:35", "09:35"),
+                ],
+            )
+            # 为第一段预先写入已有的余票与票价缓存，第二段不写，模拟“查完第1段后取消”
+            conn.execute(
+                "INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,from_station_no,to_station_no,seat_types,seats,can_web_buy) "
+                "VALUES('TN1','G1','2099-02-01','BJP','SHH','01','02','O','{\"ze\":\"无\"}','Y')"
+            )
+            conn.execute(
+                "INSERT INTO prices(train_no,station_train_code,train_date,from_station_no,to_station_no,seat_type,seat_name,price) "
+                "VALUES('TN1','G1','2099-02-01','01','02','ze','二等座',553.0)"
+            )
+
+        # 1) 验证 transfer.search 的 progress_cb 回调与 cancel_event 打断
+        prog_steps = []
+        sr = transfer.search(
+            "北京", "上海", "2026-11-20",
+            expand_city=False,
+            progress_cb=lambda done, total, msg: prog_steps.append((done, total, msg)),
+        )
+        self.assertEqual(len(sr["direct"]), 1)
+        self.assertGreaterEqual(len(prog_steps), 4)
+        self.assertEqual(prog_steps[-1][0], prog_steps[-1][1])
+
+        ev_stop = threading.Event()
+        ev_stop.set()
+        with self.assertRaises(transfer.SearchCancelled):
+            transfer.search("北京", "上海", "2026-11-20", expand_city=False, cancel_event=ev_stop)
+
+        # 2) 验证 _transfer_search_job 正常完成与取消状态流转
+        req = main_mod.TransferSearchReq(from_station="北京", to_station="上海", date="2026-11-20", expand_city=False)
+        jid_ok, ev_ok = main_mod._create_job({"status": "running", "phase": "search", "done": 0, "total": 6, "current": "", "errors": [], "result": {}})
+        main_mod._transfer_search_job(jid_ok, ev_ok, req)
+        st_ok = main_mod.job_status(jid_ok)
+        self.assertEqual(st_ok["status"], "done")
+        self.assertEqual(len(st_ok["result"]["direct"]), 1)
+
+        jid_can, ev_can = main_mod._create_job({"status": "running", "phase": "search", "done": 0, "total": 6, "current": "", "errors": [], "result": {}})
+        ev_can.set()
+        main_mod._transfer_search_job(jid_can, ev_can, req)
+        self.assertEqual(main_mod.job_status(jid_can)["status"], "cancelled")
+
+        # 3) 验证 _plan_tickets_job 更新 current，并在第 2 段中途取消时保留第 1 段已查结果
+        jid_pt, ev_pt = main_mod._create_job({"status": "running", "phase": "tickets", "done": 0, "total": 0, "current": "", "errors": [], "result": {}})
+        seen_currents = []
+
+        def fake_crawl_tickets(f, t, d):
+            seen_currents.append(main_mod.job_status(jid_pt)["current"])
+            if f == "BJP" and t == "TJP":
+                ev_pt.set()
+                raise main_mod.CrawlCancelled("用户取消")
+
+        with mock.patch.object(main_mod.crawler, "crawl_tickets", side_effect=fake_crawl_tickets):
+            main_mod._plan_tickets_job(
+                jid_pt,
+                ev_pt,
+                [
+                    {"key": "TN1|BJP|SHH|2099-02-01", "train_no": "TN1", "train": "G1", "from": "BJP", "to": "SHH", "date": "2099-02-01"},
+                    {"key": "TN2|BJP|TJP|2099-02-01", "train_no": "TN2", "train": "G2", "from": "BJP", "to": "TJP", "date": "2099-02-01"},
+                ],
+            )
+
+        st_pt = main_mod.job_status(jid_pt)
+        self.assertEqual(st_pt["status"], "cancelled")
+        self.assertEqual(st_pt["done"], 1)
+        self.assertTrue(any("北京(BJP)→上海(SHH)" in c for c in seen_currents))
+        # 第 1 段已入库的余票与票价必须保留，不能因第 2 段取消而清空
+        self.assertIn("TN1|BJP|SHH|2099-02-01", st_pt["result"])
+        self.assertEqual(st_pt["result"]["TN1|BJP|SHH|2099-02-01"]["seats"], {"ze": "无"})
+        self.assertEqual(st_pt["result"]["TN1|BJP|SHH|2099-02-01"]["prices"][0]["price"], 553.0)
+        self.assertNotIn("TN2|BJP|TJP|2099-02-01", st_pt["result"])
+
+        # 4) 验证：已有当日 tickets + raw_payloads 时，search 会将原本来自时刻表的方案转为“实测日期”并附带 ticket_updated
+        with db.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO raw_payloads(api_type,params,source,fetched_at,payload) VALUES('left_ticket','{}','crawl','2099-02-01T10:30:00','{}')"
+            )
+            rid = cur.lastrowid
+            conn.execute(
+                "UPDATE tickets SET raw_id=? WHERE train_no='TN1' AND train_date='2099-02-01'",
+                (rid,),
+            )
+        sr_verified = transfer.search("北京", "上海", "2099-02-01", expand_city=False)
+        self.assertEqual(len(sr_verified["direct"]), 1)
+        self.assertFalse(sr_verified["direct"][0]["date_assumed"])
+        self.assertEqual(sr_verified["direct"][0]["source_date"], "2099-02-01")
+        self.assertEqual(sr_verified["direct"][0]["ticket_updated"], "2099-02-01 10:30")
+
+        # 5) 验证 _plan_tickets_job 区分“余票请求失败”与“当日无此车次”并正确透传 ticket_updated
+        jid_err, ev_err = main_mod._create_job({"status": "running", "phase": "tickets", "done": 0, "total": 0, "current": "", "errors": [], "result": {}})
+
+        def fake_crawl_err(f, t, d):
+            if f == "BJP" and t == "TJP":
+                raise RuntimeError("网络超时")
+
+        with mock.patch.object(main_mod.crawler, "crawl_tickets", side_effect=fake_crawl_err):
+            main_mod._plan_tickets_job(
+                jid_err,
+                ev_err,
+                [
+                    {"key": "TN1|BJP|SHH|2099-02-01", "train_no": "TN1", "train": "G1", "from": "BJP", "to": "SHH", "date": "2099-02-01"},
+                    {"key": "TN2|BJP|TJP|2099-02-01", "train_no": "TN2", "train": "G2", "from": "BJP", "to": "TJP", "date": "2099-02-01"},
+                ],
+            )
+        st_err = main_mod.job_status(jid_err)
+        self.assertEqual(st_err["status"], "done")
+        self.assertEqual(st_err["result"]["TN1|BJP|SHH|2099-02-01"]["ticket_updated"], "2099-02-01 10:30")
+        self.assertIn("余票请求失败：网络超时", st_err["result"]["TN2|BJP|TJP|2099-02-01"]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

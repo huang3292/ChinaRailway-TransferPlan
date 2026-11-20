@@ -578,6 +578,67 @@ def transfers(from_station: str, to_station: str, date: str,
                 min_wait, max_wait, limit, max_legs, expand_city, cross_extra, frontier_k)
 
 
+class TransferSearchReq(BaseModel):
+    from_station: str
+    to_station: str
+    date: str
+    min_wait: int = 30
+    max_wait: int = 360
+    limit: int = 0
+    max_legs: int = 2
+    expand_city: bool = True
+    cross_extra: int = 60
+    frontier_k: int = 8
+
+
+def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchReq):
+    def on_prog(done: int, total: int, cur: str):
+        _job_update(job_id, done=done, total=total, current=cur)
+
+    try:
+        res = transfer.search(
+            body.from_station, body.to_station, body.date,
+            min_wait=body.min_wait, max_wait=body.max_wait, limit=body.limit,
+            max_legs=body.max_legs, expand_city=body.expand_city,
+            cross_extra=body.cross_extra, frontier_k=body.frontier_k,
+            progress_cb=on_prog, cancel_event=ev,
+        )
+        if ev.is_set():
+            _job_update(job_id, status="cancelled")
+        else:
+            _job_update(job_id, status="done", phase="done", result=res)
+    except transfer.SearchCancelled:
+        _job_update(job_id, status="cancelled")
+    except Exception as e:
+        _job_update(job_id, status="error", error=str(e))
+    finally:
+        db.close_conn()
+
+
+@app.post("/api/transfers/start")
+def start_transfers(body: TransferSearchReq):
+    """启动可实时查询进度与中途打断的换乘搜索任务。"""
+    _check_date(body.date)
+    if body.max_legs < 1 or body.max_legs > 6:
+        raise HTTPException(400, "max_legs 必须在 1-6 之间")
+    if body.cross_extra < 0 or body.cross_extra > 360:
+        raise HTTPException(400, "cross_extra 必须在 0-360 之间")
+    if body.frontier_k < 1 or body.frontier_k > 32:
+        raise HTTPException(400, "frontier_k 必须在 1-32 之间")
+    fstations = db.resolve_stations(body.from_station, body.expand_city)
+    tstations = db.resolve_stations(body.to_station, body.expand_city)
+    if not fstations or not tstations:
+        missing = body.from_station if not fstations else body.to_station
+        raise HTTPException(400, f"车站/城市“{missing}”不存在，请先在「爬取数据」页更新车站站名表")
+    total_steps = 6 if body.max_legs < 3 else 5 + (body.max_legs - 1)
+    job_id, ev = _create_job({
+        "status": "running", "phase": "search", "done": 0, "total": total_steps,
+        "current": "正在准备换乘搜索...", "errors": [], "result": {},
+    })
+    threading.Thread(target=_transfer_search_job, args=(job_id, ev, body), daemon=True).start()
+    return {"job_id": job_id}
+
+
 # ---------- 方案票价/余票实时查询 ----------
 class PlanLeg(BaseModel):
     train_no: str
@@ -621,7 +682,8 @@ def plan_tickets(body: PlanTicketsReq):
         })
     if not legs:
         raise HTTPException(400, "没有可查询的行程段")
-    job_id, ev = _create_job({"status": "running", "done": 0, "total": 0, "errors": [], "result": {}})
+    job_id, ev = _create_job({"status": "running", "phase": "tickets", "done": 0, "total": 0,
+                               "current": "正在准备查询余票...", "errors": [], "result": {}})
     threading.Thread(target=_plan_tickets_job, args=(job_id, ev, legs), daemon=True).start()
     return {"job_id": job_id, "legs": len(legs)}
 
@@ -642,32 +704,85 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
                 train_codes.setdefault(l["train_no"], l["train"])
 
         pairs = list(dict.fromkeys((l["from"], l["to"], l["date"]) for l in legs))
-        _job_update(job_id, total=len(pairs))
+        sno = transfer._load_sno()
+        done_pairs: set[tuple] = set()
+        failed_pairs: dict[tuple, str] = {}
+
+        def build_out(tk_map: dict, allow_missing_error: bool) -> dict:
+            out = {}
+            for l in legs:
+                pair = (l["from"], l["to"], l["date"])
+                res = {}
+                r = tk_map.get((l["train_no"], l["from"], l["to"], l["date"]))
+                if r:
+                    res["seats"] = json.loads(r["seats"] or "{}")
+                    res["can_web_buy"] = r["can_web_buy"]
+                    ts = r.get("fetched_at") or db.cn_now().isoformat(timespec="seconds")
+                    res["ticket_updated"] = ts.replace("T", " ")[:16]
+                elif allow_missing_error and pair in failed_pairs:
+                    res["error"] = f"余票请求失败：{failed_pairs[pair]}"
+                elif allow_missing_error and pair in done_pairs:
+                    res["error"] = "当日该区间余票查询中无此车次"
+                fno = l.get("fno") or (r["from_station_no"] if r else None) or sno.get((l["train_no"], l["from"]))
+                tno = l.get("tno") or (r["to_station_no"] if r else None) or sno.get((l["train_no"], l["to"]))
+                if fno and tno:
+                    fno_s, tno_s = str(fno).zfill(2), str(tno).zfill(2)
+                    pr = db.rows("""SELECT seat_type,seat_name,price,train_date FROM prices
+                                    WHERE train_no=? AND from_station_no=? AND to_station_no=? AND train_date=?
+                                    ORDER BY price""",
+                                 (l["train_no"], fno_s, tno_s, l["date"]))
+                    if not pr:
+                        pr = db.rows("""SELECT seat_type,seat_name,price,train_date FROM prices
+                                        WHERE train_no=? AND from_station_no=? AND to_station_no=?
+                                        AND train_date=(SELECT MAX(train_date) FROM prices WHERE train_no=? AND from_station_no=? AND to_station_no=?)
+                                        ORDER BY price""",
+                                     (l["train_no"], fno_s, tno_s, l["train_no"], fno_s, tno_s))
+                    if pr:
+                        res["prices"] = [{"seat_type": x["seat_type"], "seat": x["seat_name"], "price": x["price"]} for x in pr]
+                        if pr[0]["train_date"]:
+                            res["price_date"] = pr[0]["train_date"]
+                            if pr[0]["train_date"] != l["date"]:
+                                res["price_stale"] = True
+                if res:
+                    out[l["key"]] = res
+            return out
+
+        def load_tk(target_pairs) -> dict:
+            tk_map = {}
+            for f, t, d in target_pairs:
+                for r in db.rows("""SELECT t.*, r.fetched_at FROM tickets t
+                                    LEFT JOIN raw_payloads r ON r.id=t.raw_id
+                                    WHERE t.from_telecode=? AND t.to_telecode=? AND t.train_date=?""",
+                                 (f, t, d)):
+                    tk_map[(r["train_no"], f, t, d)] = r
+                    if r["station_train_code"]:
+                        train_codes.setdefault(r["train_no"], r["station_train_code"])
+            return tk_map
+
+        _job_update(job_id, phase="tickets", total=len(pairs))
         for f, t, d in pairs:
             if ev.is_set():
-                _job_update(job_id, status="cancelled")
+                _job_update(job_id, result=build_out(load_tk(done_pairs), False), status="cancelled")
                 return
+            _job_update(job_id, current=f"余票 {_fmt_station(tc_name.get(f), f)}→{_fmt_station(tc_name.get(t), t)} ({d})")
             # 已过去的日期不再实时查询，仅用已入库缓存
+            ok = True
             if d >= today:
                 try:
                     crawler.crawl_tickets(f, t, d)
                 except CrawlCancelled:
-                    _job_update(job_id, status="cancelled")
+                    _job_update(job_id, result=build_out(load_tk(done_pairs), False), status="cancelled")
                     return
                 except Exception as e:
+                    ok = False
+                    failed_pairs[(f, t, d)] = str(e)
                     _job_append(job_id, "errors",
                                 f"余票 {_fmt_station(tc_name.get(f), f)}→{_fmt_station(tc_name.get(t), t)} {d}: {e}")
+            if ok:
+                done_pairs.add((f, t, d))
             _job_inc(job_id, "done")
 
-        tk = {}
-        for f, t, d in pairs:
-            for r in db.rows("""SELECT * FROM tickets WHERE from_telecode=? AND to_telecode=? AND train_date=?""",
-                             (f, t, d)):
-                tk[(r["train_no"], f, t, d)] = r
-                if r["station_train_code"]:
-                    train_codes.setdefault(r["train_no"], r["station_train_code"])
-
-        sno = transfer._load_sno()
+        tk = load_tk(pairs)
         need = {}
         for l in legs:
             r = tk.get((l["train_no"], l["from"], l["to"], l["date"]))
@@ -681,51 +796,30 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
                        (l["train_no"], fno, tno, l["date"])):
                 continue
             need.setdefault((l["train_no"], fno, tno, l["date"]), (r["seat_types"] if r else "") or "")
+
+        # 余票阶段结束先回传一次结果，界面可立即展示席别余票与内嵌票价
+        _job_update(job_id, result=build_out(tk, True))
+
         with _jobs_lock:
             cur_total = jobs[job_id]["total"]
-        _job_update(job_id, total=cur_total + len(need))
+        _job_update(job_id, phase="price", total=cur_total + len(need))
         for (tn, fno, tno, d), st in need.items():
             if ev.is_set():
-                _job_update(job_id, status="cancelled")
+                _job_update(job_id, result=build_out(tk, True), status="cancelled")
                 return
+            t_label = _fmt_train(train_codes.get(tn), tn)
+            _job_update(job_id, current=f"票价 {t_label} {fno}→{tno}")
             try:
                 crawler.crawl_price(tn, fno, tno, st, d)
             except CrawlCancelled:
-                _job_update(job_id, status="cancelled")
+                _job_update(job_id, result=build_out(tk, True), status="cancelled")
                 return
             except Exception as e:
-                _job_append(job_id, "errors", f"票价 {_fmt_train(train_codes.get(tn), tn)} {fno}→{tno}: {e}")
+                _job_append(job_id, "errors", f"票价 {t_label} {fno}→{tno}: {e}")
             _job_inc(job_id, "done")
+            _job_update(job_id, result=build_out(tk, True))
 
-        out = {}
-        for l in legs:
-            res = {}
-            r = tk.get((l["train_no"], l["from"], l["to"], l["date"]))
-            if r:
-                res["seats"] = json.loads(r["seats"] or "{}")
-                res["can_web_buy"] = r["can_web_buy"]
-            else:
-                res["error"] = "当日该区间余票查询中无此车次"
-            if l.get("fno") and l.get("tno"):
-                fno_s, tno_s = str(l["fno"]).zfill(2), str(l["tno"]).zfill(2)
-                pr = db.rows("""SELECT seat_type,seat_name,price,train_date FROM prices
-                                WHERE train_no=? AND from_station_no=? AND to_station_no=? AND train_date=?
-                                ORDER BY price""",
-                             (l["train_no"], fno_s, tno_s, l["date"]))
-                if not pr:
-                    pr = db.rows("""SELECT seat_type,seat_name,price,train_date FROM prices
-                                    WHERE train_no=? AND from_station_no=? AND to_station_no=?
-                                    AND train_date=(SELECT MAX(train_date) FROM prices WHERE train_no=? AND from_station_no=? AND to_station_no=?)
-                                    ORDER BY price""",
-                                 (l["train_no"], fno_s, tno_s, l["train_no"], fno_s, tno_s))
-                if pr:
-                    res["prices"] = [{"seat_type": x["seat_type"], "seat": x["seat_name"], "price": x["price"]} for x in pr]
-                    if pr[0]["train_date"]:
-                        res["price_date"] = pr[0]["train_date"]
-                        if pr[0]["train_date"] != l["date"]:
-                            res["price_stale"] = True
-            out[l["key"]] = res
-        _job_update(job_id, result=out, status="done")
+        _job_update(job_id, result=build_out(tk, True), phase="done", status="done")
     finally:
         crawler.set_cancel_event(None)
         db.close_conn()
