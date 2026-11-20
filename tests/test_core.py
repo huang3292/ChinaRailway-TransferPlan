@@ -910,10 +910,11 @@ class TestStdlibHTTPServer(TempDBTestCase):
             self.assertEqual(st, 200, raw.decode("utf-8", errors="replace"))
             self.assertGreaterEqual(json.loads(raw)["saved"], 2)
 
-            # 3) 异步换乘搜索与参数校验（400 / 422）
+            # 3) 异步换乘搜索与参数校验（含 0 分钟参数不回退默认值 + 400 错误校验）
             st, raw = req("POST", "/api/transfers/start", {
                 "from_station": "北京", "to_station": "上海", "date": "2026-11-20",
-                "max_legs": 2, "expand_city": False, "prune_level": "balanced",
+                "min_wait": 0, "cross_extra": 0,
+                "max_legs": 2, "expand_city": False, "prune_level": "strict",
             })
             self.assertEqual(st, 200)
             jid = json.loads(raw)["job_id"]
@@ -925,6 +926,7 @@ class TestStdlibHTTPServer(TempDBTestCase):
                     break
                 time.sleep(0.05)
             self.assertEqual(jobj["status"], "done")
+            self.assertEqual(jobj["result"]["max_legs"], 2)
 
             st_bad, _ = req("POST", "/api/transfers/start", {
                 "from_station": "北京", "to_station": "上海", "date": "2026-11-20", "prune_level": "invalid"
@@ -946,6 +948,106 @@ class TestStdlibHTTPServer(TempDBTestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class TestStrictPruningEnhancements(TempDBTestCase):
+    def test_8h_detour_floor_price_safety_dominance_and_dual_frontier(self):
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [
+                    ("XKS", "厦门北", "xmb", "xmb", "厦门"),
+                    ("FZS", "福州", "fz", "fz", "福州"),
+                    ("SHS", "三明北", "smb", "smb", "三明"),
+                    ("YPS", "延平", "yp", "yp", "南平"),
+                    ("NOS", "南平市", "nps", "nps", "南平"),
+                ],
+            )
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    # 最快高铁（福州中转）：G3756 07:18 -> 08:40 + G1698 08:44 -> 09:46（148分钟，仅4分钟极短换乘）
+                    ("T_G3756", "G3756", "2026-11-21", 1, "厦门北", "XKS", "----", "07:18"),
+                    ("T_G3756", "G3756", "2026-11-21", 2, "福州", "FZS", "08:40", "08:40"),
+                    ("T_G1698", "G1698", "2026-11-21", 1, "福州", "FZS", "----", "08:44"),
+                    ("T_G1698", "G1698", "2026-11-21", 2, "南平市", "NOS", "09:46", "09:46"),
+                    # 同福州中转的稳妥方案：G3750 07:10 -> 08:30 + G1700 09:15 -> 10:20（会被更晚发车的 G3756+G1700 35分钟稳妥方案合法支配）
+                    ("T_G3750", "G3750", "2026-11-21", 1, "厦门北", "XKS", "----", "07:10"),
+                    ("T_G3750", "G3750", "2026-11-21", 2, "福州", "FZS", "08:30", "08:30"),
+                    ("T_G1700", "G1700", "2026-11-21", 1, "福州", "FZS", "----", "09:15"),
+                    ("T_G1700", "G1700", "2026-11-21", 2, "南平市", "NOS", "10:20", "10:20"),
+                    # 同福州中转的低价动车方案（早发晚到但便宜一半，绝不能被 G3756+G1700 支配）
+                    ("T_D375", "D375", "2026-11-21", 1, "厦门北", "XKS", "----", "07:12"),
+                    ("T_D375", "D375", "2026-11-21", 2, "福州", "FZS", "08:32", "08:32"),
+                    ("T_D170", "D170", "2026-11-21", 1, "福州", "FZS", "----", "09:15"),
+                    ("T_D170", "D170", "2026-11-21", 2, "南平市", "NOS", "10:30", "10:30"),
+                    # 同福州中转既更慢又更贵的冗余高铁：G3748 07:05 -> 08:30 + G1702 09:15 -> 10:35（应被 G3756+G1700 支配）
+                    ("T_G3748", "G3748", "2026-11-21", 1, "厦门北", "XKS", "----", "07:05"),
+                    ("T_G3748", "G3748", "2026-11-21", 2, "福州", "FZS", "08:30", "08:30"),
+                    ("T_G1702", "G1702", "2026-11-21", 1, "福州", "FZS", "----", "09:15"),
+                    ("T_G1702", "G1702", "2026-11-21", 2, "南平市", "NOS", "10:35", "10:35"),
+                    # 3 程高价高速快线占满三明北早到达槽位（验证 frontier_k=2 时不会把 Z126 挤出）
+                    ("T_GF1", "G101", "2026-11-21", 1, "厦门北", "XKS", "----", "07:30"),
+                    ("T_GF1", "G101", "2026-11-21", 2, "三明北", "SHS", "09:00", "09:00"),
+                    ("T_GF2", "G102", "2026-11-21", 1, "厦门北", "XKS", "----", "07:40"),
+                    ("T_GF2", "G102", "2026-11-21", 2, "三明北", "SHS", "09:10", "09:10"),
+                    ("T_GF3", "G103", "2026-11-21", 1, "厦门北", "XKS", "----", "07:50"),
+                    ("T_GF3", "G103", "2026-11-21", 2, "三明北", "SHS", "09:20", "09:20"),
+                    # 用户案例同款 3 程低价普速接动车（6小时56分=416分 <= 480分8小时保底，且到达三明北最晚但最便宜）：
+                    ("T_Z126", "Z126", "2026-11-21", 1, "厦门北", "XKS", "----", "07:25"),
+                    ("T_Z126", "Z126", "2026-11-21", 2, "三明北", "SHS", "10:08", "10:08"),
+                    ("T_D6318", "D6318", "2026-11-21", 1, "三明北", "SHS", "----", "12:22"),
+                    ("T_D6318", "D6318", "2026-11-21", 2, "延平", "YPS", "12:51", "12:51"),
+                    ("T_D2352", "D2352", "2026-11-21", 1, "延平", "YPS", "----", "13:39"),
+                    ("T_D2352", "D2352", "2026-11-21", 2, "南平市", "NOS", "14:21", "14:21"),
+                    # 超出 8 小时保底上限（9小时30分=570分 > 480分）的超慢绕行，应记入 detour 剪枝
+                    ("T_SLOW1", "K901", "2026-11-21", 1, "厦门北", "XKS", "----", "06:00"),
+                    ("T_SLOW1", "K901", "2026-11-21", 2, "福州", "FZS", "11:00", "11:00"),
+                    ("T_SLOW2", "K902", "2026-11-21", 1, "福州", "FZS", "----", "11:30"),
+                    ("T_SLOW2", "K902", "2026-11-21", 2, "南平市", "NOS", "15:30", "15:30"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO prices(train_no,station_train_code,train_date,from_station_no,to_station_no,seat_type,seat_name,price) VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    ("T_G3756", "G3756", "2026-11-21", "01", "02", "ze", "二等座", 140.0),
+                    ("T_G1698", "G1698", "2026-11-21", "01", "02", "ze", "二等座", 110.0),
+                    ("T_G3750", "G3750", "2026-11-21", "01", "02", "ze", "二等座", 140.0),
+                    ("T_G1700", "G1700", "2026-11-21", "01", "02", "ze", "二等座", 110.0),
+                    ("T_D375", "D375", "2026-11-21", "01", "02", "ze", "二等座", 70.0),
+                    ("T_D170", "D170", "2026-11-21", "01", "02", "ze", "二等座", 55.0),
+                    ("T_G3748", "G3748", "2026-11-21", "01", "02", "ze", "二等座", 150.0),
+                    ("T_G1702", "G1702", "2026-11-21", "01", "02", "ze", "二等座", 120.0),
+                    ("T_GF1", "G101", "2026-11-21", "01", "02", "ze", "二等座", 160.0),
+                    ("T_GF2", "G102", "2026-11-21", "01", "02", "ze", "二等座", 160.0),
+                    ("T_GF3", "G103", "2026-11-21", "01", "02", "ze", "二等座", 160.0),
+                    ("T_Z126", "Z126", "2026-11-21", "01", "02", "yz", "硬座", 50.5),
+                    ("T_D6318", "D6318", "2026-11-21", "01", "02", "ze", "二等座", 22.0),
+                    ("T_D2352", "D2352", "2026-11-21", "01", "02", "ze", "二等座", 32.0),
+                ],
+            )
+
+        res = transfer.search(
+            "厦门北", "南平市", "2026-11-21",
+            min_wait=0, max_wait=180, max_legs=3,
+            frontier_k=2, prune_level="strict",
+            max_total_min=1440, detour_ratio=2.0, prune_dominated=True,
+        )
+        chains = [tuple(l["train"] for l in p["legs"]) for p in res["transfers"]]
+        # 1) 8小时保底生效（148*2=296 -> 保底 480 分）且 570分慢车被计入 detour 统计
+        self.assertEqual(res["prune_config"]["detour_limit_min"], 480)
+        self.assertGreater(res["prune_stats"]["detour"], 0)
+        self.assertNotIn(("K901", "K902"), chains)
+        # 2) 多程束宽=2 同时保留最便宜支线 Z126，416分的 Z126+D6318+D2352 在严格模式下成功保留
+        self.assertIn(("Z126", "D6318", "D2352"), chains)
+        # 3) 4分钟高风险换乘(G3756+G1698)不支配35分钟稳妥换乘(G3756+G1700)，高价快车也不支配同站低价动车(D375+D170)；
+        #    而更贵且更慢的冗余同站方案(G3748+G1702)仍被支配剪除
+        self.assertIn(("G3756", "G1698"), chains)
+        self.assertIn(("G3756", "G1700"), chains)
+        self.assertIn(("D375", "D170"), chains)
+        self.assertNotIn(("G3748", "G1702"), chains)
+        self.assertGreater(res["prune_stats"]["dominated"], 0)
 
 
 if __name__ == "__main__":
