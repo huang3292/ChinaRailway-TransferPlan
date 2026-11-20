@@ -330,7 +330,8 @@ $('s-go').onclick=async()=>{
   }catch(e){msg('s-msg',e.message,false);}
   btn.disabled=false;
 };
-['s-sort','s-type','s-size','s-seat','s-same'].forEach(id=>$(id).onchange=()=>{applyTypeUI();page=1;render();});
+['s-sort','s-type','s-seat','s-same'].forEach(id=>$(id).onchange=()=>{applyTypeUI();page=1;render();refreshAutoQuery();});
+$('s-size').onchange=()=>{page=1;render();};
 // 方案类型=仅直达时，隐藏与换乘无关的换乘时间/换乘站/换乘类型输入框
 function applyTypeUI(){
   const direct=$('s-type').value==='direct';
@@ -338,7 +339,14 @@ function applyTypeUI(){
   if(direct){$('s-tst').value='';$('s-same').value='';}
 }
 applyTypeUI();
-['s-filter','s-prefix','s-dep1','s-dep2','s-arr1','s-arr2','s-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();});
+['s-filter','s-prefix','s-dep1','s-dep2','s-arr1','s-arr2','s-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();refreshAutoQuery();});
+
+let autoTimer=null;
+function refreshAutoQuery(){
+  if(!$('s-live').checked||!R)return;
+  clearTimeout(autoTimer);
+  autoTimer=setTimeout(autoQuery,900);
+}
 
 function legKey(l){return [l.train_no,l.from_telecode||l.from,l.to_telecode||l.to,l.depart.slice(0,10)].join('|');}
 function priceKey(p){
@@ -348,7 +356,8 @@ function priceKey(p){
     else if(l.price_est&&Object.keys(l.price_est.seats).length){sum+=Math.min(...Object.values(l.price_est.seats).map(x=>x.min));est=true;}
     else miss=true;
   }
-  return [miss?1:0,sum,est?1:0];
+  // 实际价优先：有真实票价的方案排在前（按实际价升序），其次才是有估价的方案
+  return [miss?1:0,est?1:0,sum];
 }
 const yuan=v=>String(Math.round(v*10)/10);
 function totalPrice(p){
