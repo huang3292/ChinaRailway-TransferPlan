@@ -53,7 +53,8 @@ def _save(api_type: str, records: list[dict], raw_id: int) -> int:
                        VALUES(:train_no,:station_train_code,:train_date,:from_telecode,:to_telecode,
                          :from_station_no,:to_station_no,:start_time,:arrive_time,:duration,:can_web_buy,:seat_types,:seats,:raw_id)
                        ON CONFLICT(train_no,train_date,from_telecode,to_telecode) DO UPDATE SET
-                         station_train_code=:station_train_code,start_time=:start_time,arrive_time=:arrive_time,
+                         station_train_code=:station_train_code,from_station_no=:from_station_no,
+                         to_station_no=:to_station_no,start_time=:start_time,arrive_time=:arrive_time,
                          duration=:duration,can_web_buy=:can_web_buy,seat_types=:seat_types,seats=:seats,raw_id=:raw_id""",
                     r)
         elif api_type == "price":

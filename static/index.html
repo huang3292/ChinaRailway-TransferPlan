@@ -38,6 +38,9 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
 .logbox.show{display:block}
 .logbox .lerr{color:#fca5a5}
 .logbox .lwarn{color:#fcd34d}
+.prog{height:6px;background:#e2e8f0;border-radius:4px;overflow:hidden;margin:6px 0 0;display:none}
+.prog.show{display:block}
+.prog>div{height:100%;background:var(--blue);width:0%;transition:width .2s ease}
 .plan{border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;background:#fff}
 .plan .sum{font-size:13px;color:var(--muted);margin-bottom:8px}
 .plan .sum b{color:var(--text);font-size:15px}
@@ -120,8 +123,7 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
         <label style="display:inline;color:var(--text);margin-left:12px"><input type="checkbox" id="s-live" style="width:auto"> 自动查询票价/余票</label></div>
     </div>
     <div class="row" style="margin-top:10px">
-      <div><label>车次包含</label><input id="s-filter" placeholder="如 Z126"></div>
-      <div><label>车次头</label><input id="s-prefix" placeholder="如 G,D 逗号分隔"></div>
+      <div><label>车次筛选</label><input id="s-filter" placeholder="如 G,D 或 Z126（逗号分隔）"></div>
       <div style="flex:0 0 150px"><label>席位（按已查余票）</label>
         <select id="s-seat"><option value="">不限</option><option value="swz">商务</option><option value="tz">特等</option><option value="yxyz">优选一等</option><option value="zy">一等</option><option value="ze">二等</option><option value="rw">软卧/一等卧</option><option value="yw">硬卧/二等卧</option><option value="rz">软座</option><option value="yz">硬座</option><option value="wz">无座</option><option value="srrb">动卧</option></select></div>
       <div style="flex:0 0 210px"><label>出发时间</label>
@@ -136,6 +138,7 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
     </div>
     <div class="hint">时间基准为北京时间(UTC+8)；异站换乘默认额外预留60分钟（可调）；无当日数据时按最近日期与 running_fig 校验推算并剔除余票冲突车次。</div>
     <div style="display:flex;gap:8px;align-items:center"><div class="msg" id="s-msg" style="flex:1"></div><button class="btn sec" id="s-cancel" style="display:none">停止任务</button></div>
+    <div class="prog" id="s-prog"><div></div></div>
     <pre class="logbox" id="s-log"></pre>
   </div>
   <div id="s-result"></div>
@@ -153,6 +156,7 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
       <div style="flex:0"><button class="btn" id="w-go">一键导入</button></div>
     </div>
     <div style="display:flex;gap:8px;align-items:center"><div class="msg" id="w-msg" style="flex:1"></div><button class="btn sec" id="w-cancel" style="display:none">停止导入</button></div>
+    <div class="prog" id="w-prog"><div></div></div>
     <pre class="logbox" id="w-log"></pre>
     <div class="hint">只需填出发地、到达地、日期，自动抓取 <b>两端车站大屏</b> → <b>车次时刻表</b> → <b>直达余票</b> → <b>票价</b>，全部合并入库（联网数据覆盖本地）。完成后直接到「换乘搜索」搜索即可，无需手动逐项导入。不勾选“完整导入”则只抓大屏+余票，更快但换乘方案较少。</div>
   </div>
@@ -174,7 +178,7 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
   </div>
   <div class="card">
     <h3>车站站名表（电报码）</h3>
-    <button class="btn sec" id="c-stations">更新车站站名表</button>
+    <button class="btn sec" id="c-stations">更新车站站名表</button><button class="btn sec" id="c-st-list-cancel" style="display:none;margin-left:8px">停止任务</button>
     <span class="hint" style="display:inline;margin-left:10px">首次使用请先更新，来自官方 station_name.js</span>
     <div class="msg" id="c-st-msg"></div>
   </div>
@@ -185,7 +189,7 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
       <div><label>日期</label><input id="c-date" type="date"></div>
       <div style="flex:0"><button class="btn" id="c-st-go">爬取经由车次</button></div>
     </div>
-    <div class="msg" id="c-stn-msg"></div>
+    <div style="display:flex;gap:8px;align-items:center"><div class="msg" id="c-stn-msg" style="flex:1"></div><button class="btn sec" id="c-stn-cancel" style="display:none">停止任务</button></div>
     <div class="hint">搜索直达/换乘需要<b>出发站和到达站都爬取</b>经由车次；大屏含真实开行日期，无需逐车抓时刻表。</div>
     <div class="scroll" id="c-stn-table"></div>
   </div>
@@ -199,6 +203,7 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
       <div style="flex:0"><button class="btn" id="c-t-go">爬取余票</button></div>
     </div>
     <div style="display:flex;gap:8px;align-items:center"><div class="msg" id="c-t-msg" style="flex:1"></div><button class="btn sec" id="c-t-cancel" style="display:none">停止任务</button></div>
+    <div class="prog" id="c-t-prog"><div></div></div>
     <div class="scroll" id="c-t-table"></div>
   </div>
 </section>
@@ -288,35 +293,56 @@ async function api(url,opt){
   if(!r.ok)throw new Error(j.detail||r.status);
   return j;
 }
-function post(url,body){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}
+function post(url,body,opt={}){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),...opt});}
+function setProg(id,done,total){
+  const el=$(id);if(!el)return;
+  if(done==null||total==null||total<=0){el.className='prog';el.firstElementChild.style.width='0%';return;}
+  el.className='prog show';
+  el.firstElementChild.style.width=Math.min(100,Math.max(0,Math.round(done*100/total)))+'%';
+}
 function fmtMin(m){const h=Math.floor(m/60),x=m%60;return h?`${h}小时${x?x+'分':''}`:`${x}分`;}
 function fmtStation(name,tc){return name&&tc?`${name}(${tc})`:(name||tc||'--');}
 function fmtTrain(code,no){return code&&no?`${code}(${no})`:(code||no||'--');}
 function trainBadge(code){const c=(String(code||'').match(/^[A-Za-z]/)||[''])[0].toUpperCase();const blue=['G','C','D','Z','T'];return `<span class="tcode ${blue.includes(c)?'blue':'green'}">${esc(code)}</span>`;}
 function seatsHtml(s){if(!s)return'';const arr=Object.entries(s);if(!arr.length)return'';return `<span class="seats">${arr.map(([k,v])=>{const name=SEAT[k]||k;let cls='none',label=v;if(v==='有')cls='full';else if(v==null||v===''||v==='无'||v==='--'||v==='*'){cls='none';}else cls='num';if(v==null||v==='')label='--';return `<span class="seat ${cls}"><span class="sn">${esc(name)}</span><span class="sv">${esc(label)}</span></span>`;}).join('')}</span>`;}
-function legAvailPrices(l){
-  if(!l.prices||!l.prices.length)return {list:[],soldOut:false};
-  if(!l.seats||!Object.keys(l.seats).length)return {list:l.prices,soldOut:false};
-  const valid=l.prices.filter(x=>{
-    const st=x.seat_type;
-    if(!st)return true;
-    const keys=PRICE_SEAT_ALIASES[st]||[st];
+// 统计车次价格与最便宜席位余票状态：最便宜席位无票时保持原最低价并标记为可候补，不顺延跳价至更贵席位
+function legPriceInfo(l){
+  const p=l.prices;
+  if(!p||!p.length)return null;
+  const minPrice=Math.min(...p.map(x=>+x.price));
+  const hasSeats=!!(l.seats&&Object.keys(l.seats).length);
+  const seatState=x=>{
+    if(!hasSeats||!x.seat_type)return 'unknown';
+    const keys=PRICE_SEAT_ALIASES[x.seat_type]||[x.seat_type];
     const hasKey=keys.some(k=>k in l.seats);
-    if(!hasKey)return true;
-    return keys.some(k=>avail(l.seats[k]));
-  });
-  return {list:valid,soldOut:valid.length===0};
+    if(!hasKey)return 'unknown';
+    if(keys.some(k=>avail(l.seats[k])))return 'avail';
+    if(keys.some(k=>l.seats[k]==='无'||l.seats[k]==='0'))return 'waitlist';
+    return 'soldout';
+  };
+  const states=p.map(x=>({item:x,st:seatState(x)}));
+  const cheapest=states.filter(s=>+s.item.price===minPrice);
+  const cheapestAvail=cheapest.some(s=>s.st==='avail'||s.st==='unknown');
+  const cheapestWaitlist=!cheapestAvail&&cheapest.some(s=>s.st==='waitlist');
+  const anyAvail=states.some(s=>s.st==='avail'||s.st==='unknown');
+  const availItems=states.filter(s=>s.st==='avail');
+  const availMin=availItems.length?Math.min(...availItems.map(s=>+s.item.price)):null;
+  return {minPrice,cheapestAvail,cheapestWaitlist,anyAvail,availMin};
 }
 function pricesHtml(l){
   const p=l.prices;
   if(!p||!p.length)return'';
-  const {list,soldOut}=legAvailPrices(l);
-  const src=list.length?list:p;
-  const min=Math.min(...src.map(x=>+x.price));
+  const info=legPriceInfo(l);
   const detail=p.map(x=>`${x.seat} ¥${x.price}`).join('　');
   const note=(l.price_date?'｜价日:'+esc(l.price_date):'')+(l.price_stale?'（历史缓存）':'');
-  if(soldOut)return `<span class="price" style="color:#94a3b8;text-decoration:line-through" title="当前无余票｜${esc(detail)}${note}">¥${yuan(min)}<small>售罄</small></span>`;
-  return `<span class="price" title="${esc(detail)}${note}">¥${yuan(min)}<small>${l.price_stale?'旧':'起'}</small></span>`;
+  if(!info.cheapestAvail){
+    if(l.can_web_buy==='N'&&!info.cheapestWaitlist){
+      return `<span class="price" style="color:#94a3b8;text-decoration:line-through" title="当前不可购｜${esc(detail)}${note}">¥${yuan(info.minPrice)}<small>停售</small></span>`;
+    }
+    const tip=(info.availMin!=null?`最低席位无票（可候补）；当前有票最低 ¥${yuan(info.availMin)}`:'当前各席位无余票（可候补）')+`｜${detail}${note}`;
+    return `<span class="price" style="color:#d97706" title="${esc(tip)}">¥${yuan(info.minPrice)}<small>候补</small></span>`;
+  }
+  return `<span class="price" title="${esc(detail)}${note}">¥${yuan(info.minPrice)}<small>${l.price_stale?'旧':'起'}</small></span>`;
 }
 function estText(e){if(!e)return'';const s=Object.values(e.seats).slice(0,3).map(x=>`${x.name} ¥${x.min}–${x.max}`).join('　');return `<span class="est" title="${esc(e.basis)}">估 ${s}</span>`;}
 
@@ -352,38 +378,96 @@ function attachAC(inp){
 document.querySelectorAll('input.station-ac').forEach(attachAC);
 
 // ---------- 换乘搜索 ----------
-let R=null,page=1,planPoll=null,activePlanJob=null,activeRouteJob=null,activeTicketJob=null,ticketPoll=null,planGen=0;
+let R=null,page=1,planPoll=null,activePlanJob=null,activeSearchJob=null,searchPoll=null,activeRouteJob=null,activeTicketJob=null,ticketPoll=null,planGen=0,searchGen=0,planCtrl=null,searchCtrl=null;
 function cnNowStr(){return new Date(Date.now()+8*3600e3).toISOString().slice(0,16).replace('T',' ');}
 function departed(p){if(typeof p.departed==='boolean')return p.departed;const n=cnNowStr();return p.legs.some(l=>l.depart<=n);}
 function setCancelBtn(btnId,jobId,onCancel){
   const b=$(btnId);if(!b)return;
   if(!jobId){b.style.display='none';b.onclick=null;return;}
   b.style.display='';b.disabled=false;
-  b.onclick=async()=>{b.disabled=true;try{await post(`/api/jobs/${jobId}/cancel`,{});if(onCancel)onCancel();}catch(e){}};
+  b.onclick=async()=>{b.disabled=true;try{await post(`/api/jobs/${jobId}/cancel`,{});}catch(e){}if(onCancel)onCancel();};
+}
+function setAbortBtn(btnId,ctrl,onAbort){
+  const b=$(btnId);if(!b)return;
+  if(!ctrl){b.style.display='none';b.onclick=null;return;}
+  b.style.display='';b.disabled=false;
+  b.onclick=()=>{b.disabled=true;try{ctrl.abort();}catch(e){}if(onAbort)onAbort();};
 }
 // 取消上一次仍在运行的后台查票任务，避免切页/改筛选后旧任务继续占用爬虫队列
 async function cancelActivePlanJob(silent=false){
   if(planPoll){clearInterval(planPoll);planPoll=null;}
+  if(planCtrl){try{planCtrl.abort();}catch(e){}planCtrl=null;}
   setCancelBtn('s-cancel',null);
   const oldId=activePlanJob;
   activePlanJob=null;
   if(!oldId)return;
   try{await post(`/api/jobs/${oldId}/cancel`,{});}catch(e){}
-  if(!silent)msg('s-msg','【票价/余票】已取消上一个未完成查票任务');
+  if(!silent){setProg('s-prog',null);msg('s-msg','【票价/余票】任务已中断');}
+}
+async function cancelActiveSearchJob(){
+  if(searchPoll){clearInterval(searchPoll);searchPoll=null;}
+  if(searchCtrl){try{searchCtrl.abort();}catch(e){}searchCtrl=null;}
+  const oldId=activeSearchJob;
+  activeSearchJob=null;
+  if(oldId){try{await post(`/api/jobs/${oldId}/cancel`,{});}catch(e){}}
+  if(activeRouteJob){const rid=activeRouteJob;activeRouteJob=null;try{await post(`/api/jobs/${rid}/cancel`,{});}catch(e){}}
+  setCancelBtn('s-cancel',null);
+}
+async function runTransferSearch(body,myGen){
+  const ctrl=searchCtrl=new AbortController();
+  let stopped=false;
+  setAbortBtn('s-cancel',ctrl,()=>{stopped=true;searchGen++;});
+  setProg('s-prog',0,1);
+  msg('s-msg','【换乘搜索】正在提交搜索任务…');
+  const start=await post('/api/transfers/start',body,{signal:ctrl.signal});
+  searchCtrl=null;
+  if(stopped||myGen!==searchGen){post(`/api/jobs/${start.job_id}/cancel`,{}).catch(()=>{});throw new Error('【换乘搜索】任务已中断');}
+  activeSearchJob=start.job_id;
+  return await new Promise((resolve,reject)=>{
+    let done=false;
+    const finish=()=>{if(searchPoll){clearInterval(searchPoll);searchPoll=null;}activeSearchJob=null;setCancelBtn('s-cancel',null);};
+    setCancelBtn('s-cancel',start.job_id,()=>{if(done)return;done=true;finish();setProg('s-prog',null);reject(new Error('【换乘搜索】任务已中断'));});
+    const tick=async()=>{
+      if(done)return;
+      try{
+        const j=await api('/api/jobs/'+start.job_id);
+        if(done)return;
+        setProg('s-prog',j.done,j.total);
+        if(j.status==='running'){
+          const pct=j.total?Math.round(j.done*100/j.total):0;
+          msg('s-msg',`【换乘搜索】${j.done}/${j.total} (${pct}%)${j.current?` — ${j.current}`:''}`);
+          return;
+        }
+        done=true;finish();setProg('s-prog',null);
+        if(j.status==='cancelled'){reject(new Error('【换乘搜索】任务已中断'));return;}
+        if(j.status==='error'){reject(new Error(j.error||'搜索失败'));return;}
+        resolve(j.result);
+      }catch(e){if(!done){done=true;finish();setProg('s-prog',null);reject(e);}}
+    };
+    tick();
+    searchPoll=setInterval(tick,350);
+  });
 }
 $('s-go').onclick=async()=>{
   const btn=$('s-go');btn.disabled=true;$('s-result').innerHTML='';
   clearTimeout(autoTimer);planGen++;
+  const mySearch=++searchGen;
   await cancelActivePlanJob(true);
+  await cancelActiveSearchJob();
+  setProg('s-prog',null);
   if(!$('s-online').checked){$('s-log').innerHTML='';$('s-log').className='logbox';}
   try{
     if($('s-online').checked){
-      await runRouteImport($('s-from').value,$('s-to').value,$('s-date').value,true,'s-msg','s-cancel','s-log');
+      await runRouteImport($('s-from').value,$('s-to').value,$('s-date').value,true,'s-msg','s-cancel','s-log','s-prog');
     }
-    const p=new URLSearchParams({from_station:$('s-from').value,to_station:$('s-to').value,date:$('s-date').value,
-      min_wait:$('s-min').value||30,max_wait:$('s-max').value||360,max_legs:$('s-legs').value,
-      expand_city:$('s-city').checked,cross_extra:$('s-cross').value||60});
-    R=await api('/api/transfers?'+p);page=1;
+    if(mySearch!==searchGen)return;
+    const body={
+      from_station:$('s-from').value,to_station:$('s-to').value,date:$('s-date').value,
+      min_wait:+($('s-min').value||30),max_wait:+($('s-max').value||360),
+      max_legs:+$('s-legs').value,expand_city:$('s-city').checked,
+      cross_extra:+($('s-cross').value||60),
+    };
+    R=await runTransferSearch(body,mySearch);page=1;
     R.direct.forEach((x,i)=>{x._k='d'+i;x._type='direct';});
     R.transfers.forEach((x,i)=>{x._k='t'+i;x._type='transfer';});
     const fl=R.from_station_labels||R.from_stations,tl=R.to_station_labels||R.to_stations;
@@ -391,12 +475,12 @@ $('s-go').onclick=async()=>{
     msg('s-msg',`${scope}大屏车次 ${R.screen_trains} 个，时刻表 ${R.timetable_trains} 个 · 直达 ${R.direct.length} 个，换乘 ${R.transfers.length} 个 · ${R.note}`);
     render();
     if($('s-live').checked)autoQuery();
-  }catch(e){msg('s-msg',e.message,false);}
+  }catch(e){setProg('s-prog',null);setCancelBtn('s-cancel',null);msg('s-msg',e.name==='AbortError'?'【换乘搜索】任务已中断':e.message,false);}
   btn.disabled=false;
 };
 ['s-sort','s-type','s-seat','s-same'].forEach(id=>$(id).onchange=()=>{applyTypeUI();page=1;render();refreshAutoQuery();});
 $('s-size').onchange=()=>{page=1;render();refreshAutoQuery();};
-$('s-live').onchange=()=>{if(!$('s-live').checked){clearTimeout(autoTimer);planGen++;cancelActivePlanJob(true);}else if(R){autoQuery();}};
+$('s-live').onchange=()=>{if(!$('s-live').checked){clearTimeout(autoTimer);planGen++;cancelActivePlanJob(true);setProg('s-prog',null);}else if(R){autoQuery();}};
 // 方案类型=仅直达时，隐藏与换乘无关的换乘时间/换乘站/换乘类型输入框
 function applyTypeUI(){
   const direct=$('s-type').value==='direct';
@@ -404,41 +488,42 @@ function applyTypeUI(){
   if(direct){$('s-tst').value='';$('s-same').value='';}
 }
 applyTypeUI();
-['s-filter','s-prefix','s-dep1','s-dep2','s-arr1','s-arr2','s-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();refreshAutoQuery();});
+['s-filter','s-dep1','s-dep2','s-arr1','s-arr2','s-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();refreshAutoQuery();});
 
 let autoTimer=null;
 function refreshAutoQuery(){
   clearTimeout(autoTimer);
   planGen++;
   cancelActivePlanJob(true);
+  setProg('s-prog',null);
   if(!$('s-live').checked||!R)return;
   autoTimer=setTimeout(autoQuery,900);
 }
 
 function legKey(l){return [l.train_no,l.from_telecode||l.from,l.to_telecode||l.to,l.depart.slice(0,10)].join('|');}
 function priceKey(p){
-  let sum=0,est=false,miss=false,soldOut=false;
+  let sum=0,est=false,miss=false,waitlist=false,allSoldOut=false;
   for(const l of p.legs){
-    if(l.prices&&l.prices.length){
-      const {list,soldOut:so}=legAvailPrices(l);
-      if(so){soldOut=true;sum+=Math.min(...l.prices.map(x=>+x.price));}
-      else sum+=Math.min(...list.map(x=>+x.price));
+    const info=legPriceInfo(l);
+    if(info){
+      sum+=info.minPrice;
+      if(!info.cheapestAvail)waitlist=true;
+      if(!info.anyAvail)allSoldOut=true;
     }
     else if(l.price_est&&Object.keys(l.price_est.seats).length){sum+=Math.min(...Object.values(l.price_est.seats).map(x=>x.min));est=true;}
     else miss=true;
   }
-  // 实际有票价优先 > 售罄价/缺价 > 估价
-  return [soldOut?1:0,miss?1:0,est?1:0,sum];
+  // 实价优先 > 估价；按真实最低票价排序（同价位下有票优先于候补）
+  return [miss?1:0,est?1:0,sum,waitlist?1:0,allSoldOut?1:0];
 }
 const yuan=v=>String(Math.round(v*10)/10);
 function totalPrice(p){
-  let min=0,max=0,est=false,miss=false,has=false,soldOut=false;
+  let min=0,max=0,est=false,miss=false,has=false,waitlist=false;
   for(const l of p.legs){
-    if(l.prices&&l.prices.length){
-      const {list,soldOut:so}=legAvailPrices(l);
-      if(so)soldOut=true;
-      const src=list.length?list:l.prices;
-      const v=Math.min(...src.map(x=>+x.price));min+=v;max+=v;has=true;
+    const info=legPriceInfo(l);
+    if(info){
+      min+=info.minPrice;max+=info.minPrice;has=true;
+      if(!info.cheapestAvail)waitlist=true;
     }else if(l.price_est&&Object.keys(l.price_est.seats).length){
       const cheap=Object.values(l.price_est.seats).reduce((a,b)=>b.min<a.min?b:a);
       min+=cheap.min;max+=cheap.max;est=true;has=true;}
@@ -446,19 +531,25 @@ function totalPrice(p){
   }
   if(!has)return '';
   const txt=est?(min===max?`合计 估 ¥${yuan(min)}`:`合计 估 ¥${yuan(min)}–${yuan(max)}`):`合计 <span class="price">¥${yuan(min)}</span>`;
-  return `<span class="${est?'est':''}" style="font-weight:bold">${txt}${soldOut?'（含售罄程）':''}${miss?'（部分程无价）':''}</span>`;
+  return `<span class="${est?'est':''}" style="font-weight:bold">${txt}${waitlist?'（含候补席）':''}${miss?'（部分程无价）':''}</span>`;
 }
 function sortPlans(list){
   const mode=$('s-sort').value,a=[...list];
   if(mode==='depart')a.sort((x,y)=>x.legs[0].depart.localeCompare(y.legs[0].depart)||x.total_min-y.total_min);
-  else if(mode==='price')a.sort((x,y)=>{const u=priceKey(x),v=priceKey(y);return u[0]-v[0]||u[1]-v[1]||u[2]-v[2]||u[3]-v[3]||x.total_min-y.total_min;});
+  else if(mode==='price')a.sort((x,y)=>{const u=priceKey(x),v=priceKey(y);return u[0]-v[0]||u[1]-v[1]||u[2]-v[2]||u[3]-v[3]||u[4]-v[4]||x.total_min-y.total_min;});
   else a.sort((x,y)=>x.total_min-y.total_min);
   return a;
 }
 function avail(v){return v!=null&&v!==''&&v!=='无'&&v!=='--'&&v!=='0'&&v!=='*';}
+function matchTrainToken(train,tok){
+  const code=String(train||'').toUpperCase();
+  if(!code)return false;
+  // 纯字母按车次头匹配（兼容 G123/G126 合并车次），含数字则按包含匹配
+  if(/^[A-Z]+$/.test(tok))return code.split('/').some(c=>c.startsWith(tok));
+  return code.includes(tok);
+}
 function filterPlans(list){
-  const q=$('s-filter').value.trim().toUpperCase();
-  const prefixes=$('s-prefix').value.toUpperCase().split(/[,，\s]+/).filter(Boolean);
+  const tokens=$('s-filter').value.trim().toUpperCase().split(/[,，\s]+/).filter(Boolean);
   const seat=$('s-seat').value,type=$('s-type').value,same=$('s-same').value;
   const d1=$('s-dep1').value,d2=$('s-dep2').value,a1=$('s-arr1').value,a2=$('s-arr2').value;
   const tst=$('s-tst').value.trim();
@@ -466,8 +557,7 @@ function filterPlans(list){
   return list.filter(p=>{
     if(type&&p._type!==type)return false;
     if(transferOnly&&p._type!=='transfer')return false;
-    if(q&&!p.legs.some(l=>(l.train||'').toUpperCase().includes(q)))return false;
-    if(prefixes.length&&!p.legs.some(l=>prefixes.some(x=>(l.train||'').toUpperCase().startsWith(x))))return false;
+    if(tokens.length&&!p.legs.some(l=>tokens.some(tok=>matchTrainToken(l.train,tok))))return false;
     if(seat&&!p.legs.every(l=>l.seats&&avail(l.seats[seat])))return false;
     const dep=p.legs[0].depart.slice(11,16),arr=p.legs[p.legs.length-1].arrive.slice(11,16);
     if(d1&&dep<d1)return false;
@@ -496,7 +586,7 @@ function render(){
   const size=+$('s-size').value||50;
   const pages=Math.max(1,Math.ceil(list.length/size));
   page=Math.min(Math.max(1,page),pages);
-  const sortName={duration:'总耗时',depart:'发车时间',price:'价格（有票实价优先）'}[$('s-sort').value];
+  const sortName={duration:'总耗时',depart:'发车时间',price:'价格（最低席位优先，无票按候补计入）'}[$('s-sort').value];
   const nd=list.filter(p=>p._type==='direct').length;
   if(!list.length){
     $('s-result').innerHTML='<div class="card">无匹配方案。若选了“席位”筛选，需先查询余票；或在“爬取数据”页抓取两端大屏/时刻表。</div>';
@@ -527,6 +617,7 @@ function planHtml(p){
   const tags=`<span class="tag">${p._type==='direct'?'直达':`换乘${trs.length}次`}</span>`+
     (tag_transfer?`<span class="tag">${tag_transfer}</span>`:'')+
     (p.date_assumed?`<span class="tag est" title="源日期: ${esc(p.source_date||'时刻表')}">推算${p.source_date?'('+esc(p.source_date)+')':''}</span>`:'<span class="tag" style="color:#16a34a">实测日期</span>')+
+    (p.ticket_updated?`<span class="tag" style="color:#0369a1" title="余票更新时间: ${esc(p.ticket_updated)}">更新 ${esc(p.ticket_updated.slice(5))}</span>`:'')+
     (gone?'<span class="tag" style="color:#dc2626">已发车</span>':'');
   const sum=p._type==='transfer'
     ?`<b>${fmtMin(p.total_min)}</b> ${tags} ${trs.map(t=>esc(fmtStation(t.station,t.telecode))).join('→')} 换乘 · 总等待 ${fmtMin(trs.reduce((a,t)=>a+(t.wait_min||0),0))}`
@@ -553,12 +644,17 @@ async function queryPlan(k){
   const myGen=++planGen;
   await cancelActivePlanJob(true);
   if(myGen!==planGen)return;
+  const ctrl=planCtrl=new AbortController();
+  setAbortBtn('s-cancel',ctrl,()=>{planGen++;setProg('s-prog',null);msg('s-msg','【票价/余票】任务已中断',false);});
+  setProg('s-prog',0,1);
+  msg('s-msg',`【票价/余票】正在提交查询 ${p.legs.map(l=>fmtTrain(l.train,l.train_no)).join(' + ')}…`);
   try{
-    const r=await post('/api/plan_tickets',{legs:planLegs(p)});
+    const r=await post('/api/plan_tickets',{legs:planLegs(p)},{signal:ctrl.signal});
+    planCtrl=null;
     if(myGen!==planGen){post(`/api/jobs/${r.job_id}/cancel`,{}).catch(()=>{});return;}
     msg('s-msg',`【票价/余票】正在查询方案 ${p.legs.map(l=>fmtTrain(l.train,l.train_no)).join(' + ')}（${r.legs} 个行程段）…`);
-    pollPlanJob(r.job_id);
-  }catch(e){msg('s-msg',e.message,false);}
+    pollPlanJob(r.job_id,myGen);
+  }catch(e){planCtrl=null;setProg('s-prog',null);setCancelBtn('s-cancel',null);msg('s-msg',e.name==='AbortError'?'【票价/余票】任务已中断':e.message,false);}
 }
 async function autoQuery(){
   const list=sortPlans(filterPlans([...R.direct,...R.transfers]));
@@ -569,35 +665,65 @@ async function autoQuery(){
   const myGen=++planGen;
   await cancelActivePlanJob(true);
   if(myGen!==planGen)return;
+  const ctrl=planCtrl=new AbortController();
+  setAbortBtn('s-cancel',ctrl,()=>{planGen++;setProg('s-prog',null);msg('s-msg','【票价/余票】任务已中断',false);});
+  setProg('s-prog',0,1);
+  msg('s-msg',`【票价/余票】正在提交第 ${page} 页查询…`);
   try{
-    const r=await post('/api/plan_tickets',{legs});
+    const r=await post('/api/plan_tickets',{legs},{signal:ctrl.signal});
+    planCtrl=null;
     if(myGen!==planGen){post(`/api/jobs/${r.job_id}/cancel`,{}).catch(()=>{});return;}
     msg('s-msg',`【票价/余票】正在查询第 ${page} 页（去重后 ${r.legs} 个行程段）…`);
-    pollPlanJob(r.job_id);
-  }catch(e){msg('s-msg',e.message,false);}
+    pollPlanJob(r.job_id,myGen);
+  }catch(e){planCtrl=null;setProg('s-prog',null);setCancelBtn('s-cancel',null);msg('s-msg',e.name==='AbortError'?'【票价/余票】任务已中断':e.message,false);}
 }
-function pollPlanJob(id){
+function pollPlanJob(id,myGen){
   if(planPoll)clearInterval(planPoll);
   activePlanJob=id;
-  setCancelBtn('s-cancel',id,()=>{clearInterval(planPoll);planPoll=null;activePlanJob=null;msg('s-msg','【票价/余票】任务已取消',false);});
+  let lastSig='';
+  setCancelBtn('s-cancel',id,()=>{clearInterval(planPoll);planPoll=null;activePlanJob=null;setProg('s-prog',null);msg('s-msg','【票价/余票】正在中断任务（已查部分保留）…',false);});
   planPoll=setInterval(async()=>{
+    if(myGen!=null&&myGen!==planGen){clearInterval(planPoll);planPoll=null;return;}
     try{
       const j=await api('/api/jobs/'+id);
-      if(j.status==='running'){msg('s-msg',`【票价/余票】${j.done}/${j.total}${j.errors.length?`，失败 ${j.errors.length}`:''}`);return;}
-      clearInterval(planPoll);planPoll=null;activePlanJob=null;setCancelBtn('s-cancel',null);
-      if(j.status==='cancelled'){msg('s-msg',`【票价/余票】任务已取消（已完成 ${j.done}/${j.total}）`,false);return;}
-      applyTickets(j.result);render();
+      if(myGen!=null&&myGen!==planGen){clearInterval(planPoll);planPoll=null;return;}
+      const keys=j.result?Object.keys(j.result).length:0;
+      const sig=`${j.done}|${keys}|${j.status}`;
+      if(keys&&sig!==lastSig){lastSig=sig;applyTickets(j.result);render();}
+      setProg('s-prog',j.done,j.total);
+      if(j.status==='running'){
+        const pct=j.total?Math.round(j.done*100/j.total):0;
+        msg('s-msg',`【票价/余票】${j.done}/${j.total} (${pct}%)${j.current?` — ${j.current}`:''}${j.errors.length?`，失败 ${j.errors.length}`:''}`);
+        return;
+      }
+      clearInterval(planPoll);planPoll=null;activePlanJob=null;setCancelBtn('s-cancel',null);setProg('s-prog',null);
+      if(j.status==='cancelled'){msg('s-msg',`【票价/余票】任务已中断（已保留 ${j.done}/${j.total} 步已查结果）`,false);return;}
       msg('s-msg',`【票价/余票】查询完成 ${j.done}/${j.total}`+(j.errors.length?`，失败 ${j.errors.length} 项：\n${j.errors.join('\n')}`:''));
-    }catch(e){clearInterval(planPoll);planPoll=null;activePlanJob=null;setCancelBtn('s-cancel',null);}
-  },1500);
+    }catch(e){clearInterval(planPoll);planPoll=null;activePlanJob=null;setCancelBtn('s-cancel',null);setProg('s-prog',null);}
+  },800);
 }
 function applyTickets(result){
-  for(const p of [...R.direct,...R.transfers])for(const l of p.legs){
-    const r=result[legKey(l)];
-    if(!r)continue;
-    if(r.seats){l.seats=r.seats;l.can_web_buy=r.can_web_buy;}
-    if(r.prices){l.prices=r.prices;l.price_date=r.price_date;l.price_stale=!!r.price_stale;}
-    if(r.error&&!r.seats)l.ticket_error=r.error;
+  if(!R)return;
+  const nowStr=cnNowStr();
+  for(const p of [...R.direct,...R.transfers]){
+    for(const l of p.legs){
+      const r=result[legKey(l)];
+      if(!r)continue;
+      if(r.seats){
+        l.seats=r.seats;l.can_web_buy=r.can_web_buy;
+        l.ticket_updated=r.ticket_updated||nowStr;
+        delete l.ticket_error;
+      }
+      if(r.prices){l.prices=r.prices;l.price_date=r.price_date;l.price_stale=!!r.price_stale;}
+      if(r.error&&!r.seats)l.ticket_error=r.error;
+    }
+    // 方案内全部行程均取得实时余票后，刷新为实测日期并同步最新更新时间
+    if(p.legs.length&&p.legs.every(l=>!!l.seats)){
+      p.date_assumed=false;
+      p.source_date=p.legs[0].depart.slice(0,10);
+      const ups=p.legs.map(l=>l.ticket_updated).filter(Boolean).sort();
+      if(ups.length)p.ticket_updated=ups[ups.length-1];
+    }
   }
 }
 // 时刻表展开
@@ -653,25 +779,39 @@ function renderJobLog(logEl,j){
   logEl.className='logbox show';
   if(stick)logEl.scrollTop=logEl.scrollHeight;
 }
-async function runRouteImport(from,to,date,deep,msgElId,cancelBtnId,logElId){
+async function runRouteImport(from,to,date,deep,msgElId,cancelBtnId,logElId,progElId){
   const logEl=logElId?$(logElId):null;
   if(logEl){logEl.innerHTML='';logEl.className='logbox';}
-  const r=await post('/api/import/route',{from_city:from,to_city:to,date:date,deep:!!deep});
+  const ctrl=new AbortController();
+  let aborted=false;
+  setAbortBtn(cancelBtnId,ctrl,()=>{aborted=true;});
+  setProg(progElId,0,1);
+  msg(msgElId,'【一键导入】正在提交导入任务…');
+  let r;
+  try{
+    r=await post('/api/import/route',{from_city:from,to_city:to,date:date,deep:!!deep},{signal:ctrl.signal});
+  }catch(e){
+    setAbortBtn(cancelBtnId,null);setProg(progElId,null);
+    throw new Error(e.name==='AbortError'?'【一键导入】任务已取消':e.message);
+  }
+  if(aborted){post(`/api/jobs/${r.job_id}/cancel`,{}).catch(()=>{});setProg(progElId,null);throw new Error('【一键导入】任务已取消');}
   activeRouteJob=r.job_id;
   const fl=r.from_station_labels||r.from_stations,tl=r.to_station_labels||r.to_stations;
   msg(msgElId,`【一键导入】已开始：出发 ${fl.join('/')} → 到达 ${tl.join('/')}（${deep?'完整':'快速'}导入）…`);
   await new Promise((resolve,reject)=>{
     let timer=null;
-    const stop=()=>{if(timer){clearInterval(timer);timer=null;}activeRouteJob=null;setCancelBtn(cancelBtnId,null);};
+    const stop=()=>{if(timer){clearInterval(timer);timer=null;}activeRouteJob=null;setCancelBtn(cancelBtnId,null);setProg(progElId,null);};
     setCancelBtn(cancelBtnId,r.job_id,()=>{stop();reject(new Error('【一键导入】任务已取消'));});
     timer=setInterval(async()=>{
       try{
         const j=await api('/api/jobs/'+r.job_id);
         renderJobLog(logEl,j);
+        setProg(progElId,j.done,j.total);
         const ph=PHASE[j.phase]||j.phase;
+        const pct=j.total?` (${Math.round(j.done*100/j.total)}%)`:'';
         const tail=j.errors.length?`，失败 ${j.errors.length}`:'';
         const truncTip=j.truncated>0?`（跳过 ${j.truncated} 趟）`:'';
-        msg(msgElId,`【${ph}】${j.done}/${j.total}${truncTip}${j.current?` — ${j.current}`:''}${tail}`);
+        msg(msgElId,`【${ph}】${j.done}/${j.total}${pct}${truncTip}${j.current?` — ${j.current}`:''}${tail}`);
         if(j.status==='done'){
           stop();
           const truncDone=j.truncated>0?`；按车型优先抓取前 200 趟，跳过其余 ${j.truncated} 趟`:'';
@@ -687,13 +827,13 @@ async function runRouteImport(from,to,date,deep,msgElId,cancelBtnId,logElId){
           reject(new Error(j.error));
         }
       }catch(e){stop();reject(e);}
-    },1500);
+    },1000);
   });
   return r;
 }
 $('w-go').onclick=async()=>{
   const btn=$('w-go');btn.disabled=true;
-  try{await runRouteImport($('w-from').value,$('w-to').value,$('w-date').value,$('w-deep').checked,'w-msg','w-cancel','w-log');}
+  try{await runRouteImport($('w-from').value,$('w-to').value,$('w-date').value,$('w-deep').checked,'w-msg','w-cancel','w-log','w-prog');}
   catch(e){msg('w-msg',e.message,false);}
   btn.disabled=false;
 };
@@ -724,15 +864,23 @@ $('c-rate-reset').onclick=async()=>{
   }catch(e){msg('c-rate-msg',e.message,false);}
 };
 $('c-stations').onclick=async()=>{
-  try{const r=await post('/api/crawl/stations',{});msg('c-st-msg',`【站名表】更新完成：入库 ${r.saved} 个车站`);}
-  catch(e){msg('c-st-msg',e.message,false);}
+  const btn=$('c-stations');btn.disabled=true;
+  const ctrl=new AbortController();
+  setAbortBtn('c-st-list-cancel',ctrl);
+  msg('c-st-msg','【站名表】正在请求官方 station_name.js…');
+  try{const r=await post('/api/crawl/stations',{},{signal:ctrl.signal});msg('c-st-msg',`【站名表】更新完成：入库 ${r.saved} 个车站`);}
+  catch(e){msg('c-st-msg',e.name==='AbortError'?'【站名表】已中断请求':e.message,false);}
+  setAbortBtn('c-st-list-cancel',null);btn.disabled=false;
 };
 $('c-st-go').onclick=async()=>{
   const btn=$('c-st-go');btn.disabled=true;
+  const ctrl=new AbortController();
+  setAbortBtn('c-stn-cancel',ctrl);
   try{
     const body={station:$('c-station').value,date:$('c-date').value};
-    const r=await post('/api/crawl/station_trains',body);
-    const list=await api(`/api/station_trains?station=${encodeURIComponent(body.station)}&date=${body.date}`);
+    msg('c-stn-msg',`【车站大屏】正在抓取 ${body.station}（${body.date}）…`);
+    const r=await post('/api/crawl/station_trains',body,{signal:ctrl.signal});
+    const list=await api(`/api/station_trains?station=${encodeURIComponent(body.station)}&date=${body.date}`,{signal:ctrl.signal});
     const stLabel=list[0]?fmtStation(list[0].station_name||body.station,list[0].station_telecode):body.station;
     msg('c-stn-msg',`【车站大屏】${stLabel}（${body.date}）爬取完成：入库 ${r.saved} 个经由车次（留档 raw_id=${r.raw_id}）`);
     $('c-stn-table').innerHTML=`<table><tr><th>车次 / 代号</th><th>类型</th><th>始发→终到</th><th>到达</th><th>出发</th><th>跨天</th><th>操作</th></tr>`+
@@ -740,8 +888,8 @@ $('c-st-go').onclick=async()=>{
         <td>${esc(fmtStation(t.start_station_name,t.start_station_telecode))} → ${esc(fmtStation(t.end_station_name,t.end_station_telecode))}</td>
         <td>${esc(t.arrive_time)}</td><td>${esc(t.start_time)}</td><td>${t.start_day_diff??0}</td>
         <td><button class="mini" onclick="crawlTT('${esc(t.train_no)}','${esc(t.station_train_code)}')">抓时刻表</button></td></tr>`).join('')+'</table>';
-  }catch(e){msg('c-stn-msg',e.message,false);}
-  btn.disabled=false;
+  }catch(e){msg('c-stn-msg',e.name==='AbortError'?'【车站大屏】已中断请求':e.message,false);}
+  setAbortBtn('c-stn-cancel',null);btn.disabled=false;
 };
 async function crawlTT(trainNo,code){
   try{
@@ -757,13 +905,20 @@ async function showTimetable(trainNo,code,extraNote=''){
 }
 $('c-t-go').onclick=async()=>{
   const btn=$('c-t-go');btn.disabled=true;
+  if(ticketPoll){clearInterval(ticketPoll);ticketPoll=null;}
+  if(activeTicketJob){const old=activeTicketJob;activeTicketJob=null;post(`/api/jobs/${old}/cancel`,{}).catch(()=>{});}
+  const ctrl=new AbortController();
+  setAbortBtn('c-t-cancel',ctrl);
+  setProg('c-t-prog',0,1);
   try{
     const body={from_station:$('c-from').value,to_station:$('c-to').value,date:$('c-t-date').value,with_prices:$('c-prices').checked};
-    const r=await post('/api/crawl/tickets',body);
+    msg('c-t-msg',`【站间余票】正在抓取 ${body.from_station}→${body.to_station}（${body.date}）…`);
+    const r=await post('/api/crawl/tickets',body,{signal:ctrl.signal});
     msg('c-t-msg',`【站间余票】${body.from_station}→${body.to_station}（${body.date}）爬取完成：入库 ${r.saved} 个车次`+(r.price_job?'，票价后台爬取中…':''));
     await renderTickets(body);
     if(r.price_job)pollJob(r.price_job,body);
-  }catch(e){msg('c-t-msg',e.message,false);}
+    else{setAbortBtn('c-t-cancel',null);setProg('c-t-prog',null);}
+  }catch(e){setAbortBtn('c-t-cancel',null);setProg('c-t-prog',null);msg('c-t-msg',e.name==='AbortError'?'【站间余票】已中断请求':e.message,false);}
   btn.disabled=false;
 };
 async function renderTickets(body){
@@ -775,20 +930,22 @@ async function renderTickets(body){
 async function pollJob(id,body){
   if(ticketPoll)clearInterval(ticketPoll);
   activeTicketJob=id;
-  setCancelBtn('c-t-cancel',id,()=>{clearInterval(ticketPoll);ticketPoll=null;activeTicketJob=null;msg('c-t-msg','【余票抓价】任务已取消',false);});
+  setCancelBtn('c-t-cancel',id,()=>{clearInterval(ticketPoll);ticketPoll=null;activeTicketJob=null;setProg('c-t-prog',null);msg('c-t-msg','【余票抓价】任务已取消',false);});
   ticketPoll=setInterval(async()=>{
     try{
       const j=await api('/api/jobs/'+id);
+      setProg('c-t-prog',j.done,j.total);
       if(j.status==='running'){
-        msg('c-t-msg',`【余票抓价】${j.done}/${j.total}${j.current?` — ${j.current}`:''}`+(j.errors.length?`，失败 ${j.errors.length}`:''));
+        const pct=j.total?` (${Math.round(j.done*100/j.total)}%)`:'';
+        msg('c-t-msg',`【余票抓价】${j.done}/${j.total}${pct}${j.current?` — ${j.current}`:''}`+(j.errors.length?`，失败 ${j.errors.length}`:''));
         loadRate();
         return;
       }
-      clearInterval(ticketPoll);ticketPoll=null;activeTicketJob=null;setCancelBtn('c-t-cancel',null);
+      clearInterval(ticketPoll);ticketPoll=null;activeTicketJob=null;setCancelBtn('c-t-cancel',null);setProg('c-t-prog',null);
       if(j.status==='cancelled'){msg('c-t-msg',`【余票抓价】任务已取消（已完成 ${j.done}/${j.total}）`,false);return;}
       msg('c-t-msg',`【余票抓价】爬取完成 ${j.done}/${j.total}`+(j.errors.length?`，失败 ${j.errors.length} 项：\n${j.errors.join('\n')}`:''));
-    }catch(e){clearInterval(ticketPoll);ticketPoll=null;activeTicketJob=null;setCancelBtn('c-t-cancel',null);}
-  },2000);
+    }catch(e){clearInterval(ticketPoll);ticketPoll=null;activeTicketJob=null;setCancelBtn('c-t-cancel',null);setProg('c-t-prog',null);}
+  },1000);
 }
 
 // ---------- 导入 ----------
@@ -846,7 +1003,7 @@ function attachEnter(ids,btnId){
     const btn=$(btnId);if(btn&&!btn.disabled)btn.click();
   }));
 }
-attachEnter(['s-from','s-to','s-date','s-min','s-max','s-cross','s-filter','s-prefix','s-tst'],'s-go');
+attachEnter(['s-from','s-to','s-date','s-min','s-max','s-cross','s-filter','s-tst'],'s-go');
 attachEnter(['w-from','w-to','w-date'],'w-go');
 attachEnter(['c-station','c-date'],'c-st-go');
 attachEnter(['c-from','c-to','c-t-date'],'c-t-go');

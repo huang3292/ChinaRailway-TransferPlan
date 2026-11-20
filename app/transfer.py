@@ -16,6 +16,16 @@ from datetime import date, datetime, timedelta
 from . import db, fare, parsers
 
 
+class SearchCancelled(Exception):
+    """换乘搜索被用户中途打断。"""
+    pass
+
+
+def _check_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise SearchCancelled("搜索任务已取消")
+
+
 def _int(v) -> int | None:
     try:
         return int(v)
@@ -84,11 +94,12 @@ def _price_map(target_date: str | None = None) -> dict:
 
 def _seat_map(target_date: str | None = None) -> dict:
     out = {}
-    sql = "SELECT train_no,from_telecode,to_telecode,train_date,seats,can_web_buy FROM tickets"
+    sql = ("SELECT t.train_no,t.from_telecode,t.to_telecode,t.train_date,t.seats,t.can_web_buy,"
+           "r.fetched_at FROM tickets t LEFT JOIN raw_payloads r ON r.id=t.raw_id")
     params = ()
     if target_date:
         # 多程跨天可能查到次日余票，仍按全日期索引或限定 >= target_date
-        sql += " WHERE train_date >= ?"
+        sql += " WHERE t.train_date >= ?"
         params = (target_date,)
     for r in db.rows(sql, params):
         out[(r["train_no"], r["from_telecode"], r["to_telecode"], r["train_date"])] = r
@@ -123,6 +134,8 @@ def _enrich(leg: dict, train_no: str, fno, tno, ftc, ttc, dep_date: str,
     if tk:
         leg["seats"] = json.loads(tk["seats"] or "{}")
         leg["can_web_buy"] = tk["can_web_buy"]
+        if tk.get("fetched_at"):
+            leg["ticket_updated"] = tk["fetched_at"].replace("T", " ")[:16]
     return leg
 
 
@@ -272,7 +285,7 @@ def _fig_valid(t: dict, query_date: str) -> bool:
 
 
 def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait,
-                   prices, seats, cal, sno, cities, cross_extra=60):
+                   prices, seats, cal, sno, cities, cross_extra=60, cancel_event=None):
     by_station = {}
     for tn, t in trains.items():
         for k in t["obs"]:
@@ -311,6 +324,7 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
     direct, transfers = [], []
     sorted_fkeys = sorted(fkeys)
     for tn in at_from:
+        _check_cancel(cancel_event)
         t = trains[tn]
         fo_cands, seen_phys = [], set()
         for k in sorted_fkeys:
@@ -463,7 +477,7 @@ def _load_trains(train_filter: set[str] | None = None) -> list[Train]:
 
 
 def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, seats, cal, sno, cities,
-                      cross_extra=60):
+                      cross_extra=60, cancel_event=None):
     available = {s["key"] for t in trains for s in t.stops}
 
     def find_idx(t, keys):
@@ -483,6 +497,7 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
 
     direct, transfers = [], []
     for A in trains:
+        _check_cancel(cancel_event)
         fi = find_idx(A, fkeys)
         if not fi:
             continue
@@ -592,7 +607,8 @@ def _load_services(screen: dict, tt: list) -> list[dict]:
 
 def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs,
                   prices, seats, cal, sno, cities, real_tk=None, n2c=None,
-                  cross_extra=60, frontier_k=FRONTIER_K) -> list[dict]:
+                  cross_extra=60, frontier_k=FRONTIER_K,
+                  cancel_event=None, depth_cb=None) -> list[dict]:
     """BFS 多程换乘，返回 3..max_legs 程的换乘方案（含换乘段明细）。"""
     if max_legs < 3:
         return []
@@ -648,9 +664,13 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                              "start": _epoch(leg["depart"]), "has_seats": "seats" in leg})
 
     results, frontier = [], init
-    for _depth in range(2, max_legs + 1):
+    for depth in range(2, max_legs + 1):
+        _check_cancel(cancel_event)
+        if depth_cb is not None:
+            depth_cb(depth, len(frontier))
         nxt = {}
         for state in frontier:
+            _check_cancel(cancel_event)
             t = state["arr"]
             if t - state["start"] > MAX_TOTAL_MIN:
                 continue
@@ -760,7 +780,16 @@ def _load_sno(target_date: str | None = None) -> dict:
 def search(from_q: str, to_q: str, date: str,
            min_wait: int = 30, max_wait: int = 360, limit: int = 0,
            max_legs: int = 2, expand_city: bool = True,
-           cross_extra: int = 60, frontier_k: int = FRONTIER_K) -> dict:
+           cross_extra: int = 60, frontier_k: int = FRONTIER_K,
+           progress_cb=None, cancel_event=None) -> dict:
+    total_steps = 6 if max_legs < 3 else 5 + (max_legs - 1)
+
+    def step(done: int, msg: str):
+        _check_cancel(cancel_event)
+        if progress_cb is not None:
+            progress_cb(done, total_steps, msg)
+
+    step(1, "解析车站与价格/余票索引")
     fstations = db.resolve_stations(from_q, expand_city)
     tstations = db.resolve_stations(to_q, expand_city)
     if not fstations or not tstations:
@@ -788,13 +817,18 @@ def search(from_q: str, to_q: str, date: str,
             city_groups.setdefault(r["city"], set()).update((r["telecode"], r["name"]))
     cities = (city_of, city_groups, tele_of)
 
+    step(2, "加载大屏与时刻表缓存")
     cand = _candidate_trains(fkeys, tkeys) if max_legs <= 2 else None
     screen = _load_screen(cand)
     tt = _load_trains(cand)
+    step(3, f"计算大屏直达/换乘（{len(screen)} 班次）")
     d1, t1 = _search_screen(screen, fkeys, tkeys, day_min, date, min_wait, max_wait,
-                            prices, seats, cal, sno, cities, cross_extra=cross_extra)
+                            prices, seats, cal, sno, cities, cross_extra=cross_extra,
+                            cancel_event=cancel_event)
+    step(4, f"计算时刻表直达/换乘（{len(tt)} 车次）")
     d2, t2 = _search_timetable(tt, fkeys, tkeys, base, min_wait, max_wait,
-                               prices, seats, cal, sno, cities, cross_extra=cross_extra)
+                               prices, seats, cal, sno, cities, cross_extra=cross_extra,
+                               cancel_event=cancel_event)
 
     def rank(p):
         return (0 if any("prices" in l for l in p["legs"]) else 1,
@@ -825,10 +859,16 @@ def search(from_q: str, to_q: str, date: str,
     # 引擎 D：多程换乘（3 程及以上，每日开行假设）
     if max_legs >= 3:
         services = _load_services(screen, tt)
-        transfers.extend(_search_multi(services, fkeys, tkeys, day_min, min_wait, max_wait,
-                                       max_legs, prices, seats, cal, sno, cities,
-                                       real_tk=real_tk, n2c=n2c,
-                                       cross_extra=cross_extra, frontier_k=frontier_k))
+        transfers.extend(_search_multi(
+            services, fkeys, tkeys, day_min, min_wait, max_wait,
+            max_legs, prices, seats, cal, sno, cities,
+            real_tk=real_tk, n2c=n2c,
+            cross_extra=cross_extra, frontier_k=frontier_k,
+            cancel_event=cancel_event,
+            depth_cb=lambda d, n_st: step(4 + (d - 1), f"多程 BFS 搜索第 {d}/{max_legs} 程（状态 {n_st}）"),
+        ))
+
+    step(total_steps, "汇总余票直达并校验冲突")
 
     # 引擎 C：仅有余票数据的直达
     have = {(p["legs"][0]["train_no"], p["legs"][0].get("from_telecode"), p["legs"][0].get("to_telecode"))
@@ -878,6 +918,13 @@ def search(from_q: str, to_q: str, date: str,
     cn_now_str = db.cn_now().strftime("%Y-%m-%d %H:%M")
     for p in direct + transfers:
         p["departed"] = any(l["depart"] <= cn_now_str for l in p["legs"])
+        # 若所有行程段均已有对应出发日的余票实测记录，说明开行已实测验证，不再标为推算
+        if p["legs"] and all("seats" in l for l in p["legs"]):
+            p["date_assumed"] = False
+            p["source_date"] = p["legs"][0]["depart"][:10]
+            ups = [l["ticket_updated"] for l in p["legs"] if l.get("ticket_updated")]
+            if ups:
+                p["ticket_updated"] = max(ups)
 
     direct.sort(key=lambda x: x["total_min"])
     transfers.sort(key=lambda x: x["total_min"])
