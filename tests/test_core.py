@@ -449,6 +449,181 @@ class TestCrawlerAndMainStubbed(TempDBTestCase):
         self.assertIn("时刻表 D6454(5u000D645402)", st["log"])
         self.assertIn("余票 北京(BJP)→上海(SHH)", st["log"])
 
+    def test_screen_cross_night_bridging_and_same_city_multi_stop(self):
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [
+                    ("JNA", "甲北", "jiabei", "jb", "甲市"),
+                    ("JNB", "甲南", "jianan", "jn", "甲市"),
+                    ("MID", "中转站", "zhongzhuan", "zz", "中市"),
+                    ("DST", "终点站", "zhongdian", "zd", "乙市"),
+                ],
+            )
+            # 跨夜直达车 Z10：11-20 22:00 甲北始发 -> 11-21 06:00 到终点站；
+            # 模拟“两端均只抓 11-20 当天大屏”，终点站抓到的是 11-19 始发班次的 11-20 06:00 终到记录
+            conn.execute(
+                """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                     station_train_date,start_train_date,station_no,arrive_time,start_time,start_station_name,
+                     start_station_telecode,end_station_name,end_station_telecode)
+                   VALUES('JNA','甲北','2026-11-20','Z10','TN_Z10','2026-11-20','2026-11-20',1,'----','22:00',
+                     '甲北','JNA','终点站','DST')"""
+            )
+            conn.execute(
+                """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                     station_train_date,start_train_date,station_no,arrive_time,start_time,start_station_name,
+                     start_station_telecode,end_station_name,end_station_telecode)
+                   VALUES('DST','终点站','2026-11-20','Z10','TN_Z10','2026-11-20','2026-11-19',2,'06:00','06:00',
+                     '甲北','JNA','终点站','DST')"""
+            )
+            # 同城双站停靠车 G50：同在 11-20 先停甲北(08:00) 再停甲南(08:30) 到中转站(10:00)
+            # 在中转站接 G60(10:40->12:00) 到终点站，验证不会因遇到甲北后提前 break 而漏掉甲南上车方案
+            conn.executemany(
+                """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                     station_train_date,start_train_date,station_no,arrive_time,start_time,start_station_name,
+                     start_station_telecode,end_station_name,end_station_telecode)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    ("JNA", "甲北", "2026-11-20", "G50", "TN_G50", "2026-11-20", "2026-11-20", 1, "----", "08:00", "甲北", "JNA", "中转站", "MID"),
+                    ("JNB", "甲南", "2026-11-20", "G50", "TN_G50", "2026-11-20", "2026-11-20", 2, "08:25", "08:30", "甲北", "JNA", "中转站", "MID"),
+                    ("MID", "中转站", "2026-11-20", "G50", "TN_G50", "2026-11-20", "2026-11-20", 3, "10:00", "10:00", "甲北", "JNA", "中转站", "MID"),
+                    ("MID", "中转站", "2026-11-20", "G60", "TN_G60", "2026-11-20", "2026-11-20", 1, "----", "10:40", "中转站", "MID", "终点站", "DST"),
+                    ("DST", "终点站", "2026-11-20", "G60", "TN_G60", "2026-11-20", "2026-11-20", 2, "12:00", "12:00", "中转站", "MID", "终点站", "DST"),
+                ],
+            )
+
+        sr = transfer.search("甲市", "终点站", "2026-11-20", expand_city=True)
+        # 校验跨夜直达已成功桥接，且标为推算方案
+        z10 = [p for p in sr["direct"] if p["legs"][0]["train_no"] == "TN_Z10"]
+        self.assertEqual(len(z10), 1)
+        self.assertEqual(z10[0]["legs"][0]["depart"], "2026-11-20 22:00")
+        self.assertEqual(z10[0]["legs"][0]["arrive"], "2026-11-21 06:00")
+        self.assertTrue(z10[0]["date_assumed"])
+
+        # 校验同城多停靠站均被枚举，且大屏换乘方案补齐 source_date
+        g50_froms = {p["legs"][0]["from"] for p in sr["transfers"] if p["legs"][0]["train_no"] == "TN_G50"}
+        self.assertEqual(g50_froms, {"甲北", "甲南"})
+        for p in sr["transfers"]:
+            self.assertTrue(p.get("source_date"))
+
+    def test_fare_load_calibration_avoids_n_plus_one(self):
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,station_train_date,station_no,distance) VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    ("BJP", "北京", "2026-11-20", "G1", "TN1", "2026-11-20", 1, "0"),
+                    ("SHH", "上海", "2026-11-20", "G1", "TN1", "2026-11-20", 2, "1000"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO prices(train_no,station_train_code,train_date,from_station_no,to_station_no,seat_type,seat_name,price) VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    ("TN1", "", "2026-11-20", "01", "02", "ze", "二等座", 500.0),
+                    ("TN1", "", "2026-11-20", "01", "02", "zy", "一等座", 800.0),
+                ],
+            )
+        with mock.patch.object(db, "rows", wraps=db.rows) as spy_rows:
+            cal = fare.load_calibration()
+        # 无论 prices 有多少行，固定只发 2 条 SQL（station_trains + prices）
+        self.assertEqual(spy_rows.call_count, 2)
+        self.assertEqual(cal[("G", "ze")], [0.5])
+        self.assertEqual(cal[("G", "zy")], [0.8])
+
+    def test_crawler_reset_session_and_non_json_reinit(self):
+        from app import crawler as crawler_mod
+
+        c = crawler_mod.Crawler()
+        old_sess = c.session
+        c._inited = True
+        c._left_ticket_url = "leftTicket/queryZ"
+        c.reset_session()
+        self.assertIsNot(c.session, old_sess)
+        self.assertFalse(c._inited)
+        self.assertIsNone(c._left_ticket_url)
+
+        # 模拟第一次请求返回非 JSON 触发自动重置 _inited，第二次重初始化并按 c_url 重定向后成功
+        bad_resp = types.SimpleNamespace(json=mock.Mock(side_effect=ValueError("html")))
+        init_resp = types.SimpleNamespace(text="var CLeftTicketUrl = 'leftTicket/queryA';")
+        c_url_resp = types.SimpleNamespace(
+            json=mock.Mock(return_value={"status": False, "c_url": "leftTicket/queryB"})
+        )
+        ok_resp = types.SimpleNamespace(json=mock.Mock(return_value={"data": {"result": []}}))
+
+        c._inited = True
+        c._left_ticket_url = "leftTicket/queryOld"
+        with mock.patch.object(c, "_request", side_effect=[bad_resp, init_resp, c_url_resp, ok_resp]):
+            res = c.crawl_tickets("BJP", "SHH", "2026-11-20")
+        self.assertEqual(res["saved"], 0)
+        self.assertEqual(c._left_ticket_url, "leftTicket/queryB")
+        self.assertTrue(c._inited)
+
+    def test_route_job_class_priority_truncation_date_validation_and_import_file(self):
+        import asyncio
+        from app import main as main_mod
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [("BJP", "北京", "bj", "bj", "北京"), ("SHH", "上海", "sh", "sh", "上海")],
+            )
+            # 插入 210 趟混编车次：含 S 市郊、纯数字普客、K/Z 普速、G/D/C 高铁动车
+            rows = []
+            for i in range(100):
+                rows.append(("BJP", "北京", "2026-11-20", f"S{100+i}", f"TN_S_{i:03d}", "2026-11-20", "2026-11-20", 1, "BJP", "SHH"))
+            for i in range(60):
+                rows.append(("BJP", "北京", "2026-11-20", f"K{100+i}", f"TN_K_{i:03d}", "2026-11-20", "2026-11-20", 1, "BJP", "SHH"))
+            for i in range(50):
+                rows.append(("BJP", "北京", "2026-11-20", f"G{100+i}", f"TN_G_{i:03d}", "2026-11-20", "2026-11-20", 1, "BJP", "SHH"))
+            conn.executemany(
+                """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                     station_train_date,start_train_date,station_no,start_station_telecode,end_station_telecode)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                rows,
+            )
+
+        crawled = []
+        jid, ev = main_mod._create_job({"status": "running", "done": 0, "total": 0, "phase": "init", "current": "", "truncated": 0, "log": [], "errors": [], "result": {}})
+        with mock.patch.object(main_mod.crawler, "crawl_station_trains"), \
+             mock.patch.object(main_mod.crawler, "crawl_timetable", side_effect=lambda tn, d, f, t: crawled.append(tn)), \
+             mock.patch.object(main_mod.crawler, "crawl_tickets"):
+            main_mod._route_job(jid, ev, "北京", "上海", "2026-11-20", True)
+
+        st = main_mod.job_status(jid)
+        self.assertEqual(st["status"], "done")
+        self.assertEqual(len(crawled), 200)
+        self.assertEqual(st["truncated"], 10)
+        # 50 趟 G 与 60 趟 K 必须全部命中，S 字头只补齐剩余 90 趟，最后 10 趟 S 被截断跳过
+        self.assertEqual(sum(1 for x in crawled if x.startswith("TN_G_")), 50)
+        self.assertEqual(sum(1 for x in crawled if x.startswith("TN_K_")), 60)
+        self.assertEqual(sum(1 for x in crawled if x.startswith("TN_S_")), 90)
+        self.assertTrue(any("截断提示" in line and "10 趟" in line for line in st["log"]))
+
+        # 日期非法格式拦截
+        with self.assertRaises(main_mod.HTTPException) as ctx:
+            main_mod.station_trains("北京", "2026-02-30")
+        self.assertEqual(ctx.exception.status_code, 400)
+        with self.assertRaises(main_mod.HTTPException) as ctx2:
+            main_mod.station_trains("北京", "2026-11-2")
+        self.assertEqual(ctx2.exception.status_code, 400)
+
+        # 文件导入端点传递 station_train_code（区分 G/D 复用票价编码）
+        sample_price = (SAMPLES / "queryTicketPrice_G531.json").read_bytes()
+
+        class FakeUpload:
+            async def read(self):
+                return sample_price
+
+        imp_res = asyncio.run(
+            main_mod.do_import_file(
+                file=FakeUpload(),
+                api_type="price",
+                train_no="2400000D170O",
+                station_train_code="D17",
+                date="2026-11-20",
+            )
+        )
+        self.assertGreater(imp_res["saved"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

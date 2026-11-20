@@ -33,11 +33,15 @@ def class_of(code: str) -> str:
 def load_calibration() -> dict:
     """(车型, 席别) -> 已爬票价反推的费率样本列表"""
     dist = {}
-    for r in db.rows("SELECT train_no,station_no,distance FROM station_trains WHERE distance IS NOT NULL"):
-        try:
-            dist[(r["train_no"], r["station_no"])] = int(r["distance"])
-        except (TypeError, ValueError):
-            continue
+    code_by_no = {}
+    for r in db.rows("SELECT train_no,station_train_code,station_no,distance FROM station_trains"):
+        if r["station_train_code"] and r["train_no"] not in code_by_no:
+            code_by_no[r["train_no"]] = r["station_train_code"]
+        if r["distance"] is not None:
+            try:
+                dist[(r["train_no"], r["station_no"])] = int(r["distance"])
+            except (TypeError, ValueError):
+                continue
     cal = {}
     for r in db.rows("SELECT train_no,station_train_code,from_station_no,to_station_no,seat_type,price FROM prices"):
         try:
@@ -48,10 +52,7 @@ def load_calibration() -> dict:
         km = d2 - d1
         if km <= 0 or not r["price"]:
             continue
-        code = r["station_train_code"] or ""
-        if not code:
-            t = db.rows("SELECT station_train_code FROM station_trains WHERE train_no=? LIMIT 1", (r["train_no"],))
-            code = t[0]["station_train_code"] if t else ""
+        code = r["station_train_code"] or code_by_no.get(r["train_no"]) or ""
         cal.setdefault((class_of(code), r["seat_type"]), []).append(r["price"] / km)
     return cal
 

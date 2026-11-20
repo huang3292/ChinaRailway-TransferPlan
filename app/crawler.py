@@ -153,23 +153,39 @@ class Crawler:
             self._sleep(2 * (attempt + 1), cancel_event)
         raise CrawlError(f"请求失败 {url}: {last_err}{_maint_hint()}")
 
+    def reset_session(self):
+        """重置 HTTP 会话与左票初始化状态，用于会话失效自愈或人工排障。"""
+        with self._req_lock:
+            try:
+                self.session.close()
+            except Exception:
+                pass
+            self.session = requests.Session()
+            self.session.headers.update({"User-Agent": UA})
+            self._left_ticket_url = None
+            self._inited = False
+
     def _json(self, method, url, **kw):
         resp = self._request(method, url, **kw)
         try:
             return resp.json()
         except ValueError:
+            # 遇到非 JSON（如登录跳转/维护 HTML）时清除初始化标记，触发上层重初始化
+            with self._req_lock:
+                self._inited = False
             self._note_throttled()
             raise CrawlError(f"{url} 返回非 JSON（可能被风控或跳转维护页）{_maint_hint()}")
 
-    def ensure_init(self):
+    def ensure_init(self) -> str:
         with self._req_lock:
-            if self._inited:
-                return
+            if self._inited and self._left_ticket_url:
+                return self._left_ticket_url
         resp = self._request("GET", f"{KYFW}/otn/leftTicket/init")
         m = re.search(r"CLeftTicketUrl\s*=\s*'([^']+)'", resp.text)
         with self._req_lock:
             self._left_ticket_url = m.group(1) if m else "leftTicket/query"
             self._inited = True
+            return self._left_ticket_url
 
     # ---- 车站站名表 ----
     def crawl_stations(self) -> dict:
@@ -212,17 +228,30 @@ class Crawler:
 
     # ---- 站间余票（含车次/时刻/席别余票） ----
     def crawl_tickets(self, from_telecode: str, to_telecode: str, date: str) -> dict:
-        self.ensure_init()
         params = {"leftTicketDTO.train_date": date,
                   "leftTicketDTO.from_station": from_telecode,
                   "leftTicketDTO.to_station": to_telecode,
                   "purpose_codes": "ADULT"}
-        payload = self._json("GET", f"{KYFW}/otn/{self._left_ticket_url}",
-                             params=params, referer=f"{KYFW}/otn/leftTicket/init")
-        if payload.get("status") is False and payload.get("c_url"):
-            self._left_ticket_url = payload["c_url"]
-            payload = self._json("GET", f"{KYFW}/otn/{self._left_ticket_url}",
-                                 params=params, referer=f"{KYFW}/otn/leftTicket/init")
+        for retry in range(2):
+            lt_url = self.ensure_init()
+            try:
+                payload = self._json("GET", f"{KYFW}/otn/{lt_url}",
+                                     params=params, referer=f"{KYFW}/otn/leftTicket/init")
+                if payload.get("status") is False and payload.get("c_url"):
+                    with self._req_lock:
+                        self._left_ticket_url = payload["c_url"]
+                        lt_url = self._left_ticket_url
+                    payload = self._json("GET", f"{KYFW}/otn/{lt_url}",
+                                         params=params, referer=f"{KYFW}/otn/leftTicket/init")
+                break
+            except CrawlCancelled:
+                raise
+            except CrawlError:
+                with self._req_lock:
+                    need_reinit = not self._inited
+                if retry == 0 and need_reinit:
+                    continue
+                raise
         if not isinstance((payload.get("data") or {}).get("result"), list):
             msgs = str(payload.get("messages") or "")
             if not any(k in msgs for k in ("预售", "日期", "暂无", "不存在", "没有")):
@@ -235,13 +264,24 @@ class Crawler:
     # ---- 票价 ----
     def crawl_price(self, train_no: str, from_station_no: str, to_station_no: str,
                     seat_types: str, date: str) -> dict:
-        self.ensure_init()
-        payload = self._json(
-            "GET", f"{KYFW}/otn/leftTicket/queryTicketPrice",
-            params={"train_no": train_no, "from_station_no": from_station_no,
-                    "to_station_no": to_station_no, "seat_types": seat_types,
-                    "train_date": date},
-            referer=f"{KYFW}/otn/leftTicket/init")
+        for retry in range(2):
+            self.ensure_init()
+            try:
+                payload = self._json(
+                    "GET", f"{KYFW}/otn/leftTicket/queryTicketPrice",
+                    params={"train_no": train_no, "from_station_no": from_station_no,
+                            "to_station_no": to_station_no, "seat_types": seat_types,
+                            "train_date": date},
+                    referer=f"{KYFW}/otn/leftTicket/init")
+                break
+            except CrawlCancelled:
+                raise
+            except CrawlError:
+                with self._req_lock:
+                    need_reinit = not self._inited
+                if retry == 0 and need_reinit:
+                    continue
+                raise
         if not isinstance(payload.get("data"), dict) or "train_no" not in payload["data"]:
             msgs = str(payload.get("messages") or "")
             if not any(k in msgs for k in ("暂无", "不存在", "预售")):

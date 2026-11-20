@@ -145,8 +145,11 @@ def _load_screen(train_filter: set[str] | None = None) -> dict:
             continue
         # 同一 train_no 可能对应多个开行日期/往返班次，按开行实例分组
         run = (tn, r["start_train_date"] or r["station_train_date"])
+        sd_min = _date_min(r["start_train_date"]) or _date_min(r["station_train_date"])
         t = trains.setdefault(run, {"code": r["station_train_code"], "obs": {}, "running_figs": set(),
-                                    "source_date": r["station_train_date"]})
+                                    "source_date": r["station_train_date"], "sd_min": sd_min})
+        if t.get("sd_min") is None and sd_min is not None:
+            t["sd_min"] = sd_min
         if r["running_fig"]:
             t["running_figs"].add(r["running_fig"])
         t["start_key"] = r["start_station_telecode"] or r["start_station_name"]
@@ -188,6 +191,48 @@ def _load_screen(train_filter: set[str] | None = None) -> dict:
                 t["min_no"], t["start_code"] = no, r["station_train_code"]
             if t.get("max_no") is None or no > t["max_no"]:
                 t["max_no"], t["end_code"] = no, r["station_train_code"]
+
+    # 跨夜大屏桥接：同一 train_no 在不同始发日班次下若缺失停靠站，按各自始发日差值平移补全，
+    # 解决“两端仅各爬同一查询日大屏，跨零点车次因 start_train_date 相差 1 天而断裂”的问题
+    by_tn: dict[str, list[tuple[tuple, dict]]] = {}
+    for run, t in trains.items():
+        by_tn.setdefault(run[0], []).append((run, t))
+    for run_list in by_tn.values():
+        if len(run_list) <= 1:
+            continue
+        # 先拍摄各班次原始停靠快照，避免链式二次桥接混淆
+        snapshots = {run: {k: dict(v) for k, v in t["obs"].items()} for run, t in run_list}
+        for run, t in run_list:
+            sd1 = t.get("sd_min")
+            if sd1 is None:
+                continue
+            others = sorted(
+                ((r2, t2) for r2, t2 in run_list if r2 != run and t2.get("sd_min") is not None),
+                key=lambda x: (abs(sd1 - x[1]["sd_min"]), -x[1]["sd_min"]),
+            )
+            for r2, t2 in others:
+                delta = sd1 - t2["sd_min"]
+                for k, o in snapshots[r2].items():
+                    if k not in t["obs"]:
+                        co = dict(o)
+                        if "arr" in co:
+                            co["arr"] = co["arr"] + delta
+                        if "dep" in co:
+                            co["dep"] = co["dep"] + delta
+                        co["bridged"] = True
+                        t["obs"][k] = co
+                        ono = co.get("no")
+                        if ono is not None:
+                            if t.get("min_no") is None or ono < t["min_no"]:
+                                t["min_no"] = ono
+                            if t.get("max_no") is None or ono > t["max_no"]:
+                                t["max_no"] = ono
+                    elif t["obs"][k].get("no") is None and o.get("no") is not None:
+                        ono = o["no"]
+                        t["obs"][k]["no"] = ono
+                        if t.get("max_no") is None or ono > t["max_no"]:
+                            t["max_no"] = ono
+
     for t in trains.values():
         if t["start_key"] in t["obs"]:
             t["obs"][t["start_key"]].setdefault("code", t.get("start_code") or t["code"])
@@ -264,84 +309,91 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
             code=a.get("code") or t["code"], km=km, duration_min=b["arr"] - a["dep"], cal=cal, sno=sno)
 
     direct, transfers = [], []
+    sorted_fkeys = sorted(fkeys)
     for tn in at_from:
         t = trains[tn]
-        fo, shift = None, 0
-        for k in fkeys:
+        fo_cands, seen_phys = [], set()
+        for k in sorted_fkeys:
             o = t["obs"].get(k)
             if o and "dep" in o and o["dep"] // 1440 == day_min // 1440:
-                fo = o
-                break
-        if fo is None:
+                phys = (o.get("telecode") or o.get("name"), o["dep"])
+                if phys not in seen_phys:
+                    seen_phys.add(phys)
+                    fo_cands.append((o, 0))
+        if not fo_cands:
             # 无当日数据：取最近爬取的班次，按每日开行假设平移到查询日期
             if tn[0] in exact or not _fig_valid(t, query_date):
                 continue
-            for k in fkeys:
+            for k in sorted_fkeys:
                 o = t["obs"].get(k)
                 if o and "dep" in o:
-                    fo = o
-                    shift = day_min - (o["dep"] // 1440) * 1440
-                    break
-        if fo is None:
-            continue
-        a_dep = fo["dep"] + shift
-        assumed = shift != 0
-        for k, to in to_obs.get(tn, ()):
-            if to["arr"] + shift > a_dep and _ordered(fo, to):
-                direct.append({"total_min": to["arr"] - fo["dep"], "date_assumed": assumed,
-                               "source_date": t.get("source_date"),
-                               "legs": [leg(tn, t, fo, to, shift)]})
-        before_from = set(fkeys)
-        if fo.get("no") is not None:
-            before_from |= {k2 for k2, o2 in t["obs"].items()
-                            if o2.get("no") is not None and o2["no"] < fo["no"]}
-        for sk, so in t["obs"].items():
-            if sk in fkeys or sk in tkeys or "arr" not in so or not _ordered(fo, so):
-                continue
-            a_arr_s = so["arr"] + shift
-            if a_arr_s <= a_dep:
-                continue
-            forbidden = before_from | {sk}
-            passed_canon = {tele_of.get(k2, k2) for k2 in before_from}
-            if so.get("no") is not None and fo.get("no") is not None:
-                passed = {k2 for k2, o2 in t["obs"].items()
-                          if o2.get("no") is not None and fo["no"] <= o2["no"] < so["no"]}
-                if passed & tkeys:
-                    continue  # 换乘前已越过到达站，属于折返
-                forbidden |= passed
-                passed_canon |= {tele_of.get(k2, k2) for k2 in passed}
-            for dk in _dep_keys(sk, so.get("name"), available, cities, exclude=passed_canon):
-                same = dk == sk
-                eff_min = min_wait if same else min_wait + cross_extra
-                for bn in by_station.get(dk, ()):
-                    if bn[0] == tn[0]:
-                        continue
-                    b = trains[bn]
-                    bs = b["obs"].get(dk)
-                    if not bs or "dep" not in bs:
-                        continue
-                    n = math.ceil((a_arr_s + eff_min - bs["dep"]) / 1440)
-                    wait = bs["dep"] + n * 1440 - a_arr_s
-                    if wait > max_wait:
-                        continue
-                    b_dep_date = _fmt_epoch(bs["dep"] + n * 1440)[:10]
-                    if n != 0 and not _fig_valid(b, b_dep_date):
-                        continue
-                    b_dep = bs["dep"] + n * 1440
-                    for tk2, bt in to_obs.get(bn, ()):
-                        if tk2 == dk or tk2 in forbidden or not _ordered(bs, bt) or bt["arr"] + n * 1440 <= b_dep:
+                    phys = (o.get("telecode") or o.get("name"), o["dep"])
+                    if phys not in seen_phys:
+                        seen_phys.add(phys)
+                        fo_cands.append((o, day_min - (o["dep"] // 1440) * 1440))
+        for fo, shift in fo_cands:
+            a_dep = fo["dep"] + shift
+            assumed = (shift != 0) or bool(fo.get("bridged"))
+            for _k, to in to_obs.get(tn, ()):
+                if to["arr"] + shift > a_dep and _ordered(fo, to):
+                    direct.append({"total_min": to["arr"] - fo["dep"],
+                                   "date_assumed": assumed or bool(to.get("bridged")),
+                                   "source_date": t.get("source_date"),
+                                   "legs": [leg(tn, t, fo, to, shift)]})
+            before_from = set(fkeys)
+            if fo.get("no") is not None:
+                before_from |= {k2 for k2, o2 in t["obs"].items()
+                                if o2.get("no") is not None and o2["no"] < fo["no"]}
+            for sk, so in t["obs"].items():
+                if sk in fkeys or sk in tkeys or "arr" not in so or not _ordered(fo, so):
+                    continue
+                a_arr_s = so["arr"] + shift
+                if a_arr_s <= a_dep:
+                    continue
+                forbidden = before_from | {sk}
+                passed_canon = {tele_of.get(k2, k2) for k2 in before_from}
+                if so.get("no") is not None and fo.get("no") is not None:
+                    passed = {k2 for k2, o2 in t["obs"].items()
+                              if o2.get("no") is not None and fo["no"] <= o2["no"] < so["no"]}
+                    if passed & tkeys:
+                        continue  # 换乘前已越过到达站，属于折返
+                    forbidden |= passed
+                    passed_canon |= {tele_of.get(k2, k2) for k2 in passed}
+                for dk in _dep_keys(sk, so.get("name"), available, cities, exclude=passed_canon):
+                    same = dk == sk
+                    eff_min = min_wait if same else min_wait + cross_extra
+                    for bn in by_station.get(dk, ()):
+                        if bn[0] == tn[0]:
                             continue
-                        # 第二程重新经过出发站/第一程走过的站 = 无意义折返
-                        if bs.get("no") is not None and bt.get("no") is not None:
-                            if any(k2 in forbidden and o2.get("no") is not None
-                                   and bs["no"] < o2["no"] <= bt["no"] for k2, o2 in b["obs"].items()):
+                        b = trains[bn]
+                        bs = b["obs"].get(dk)
+                        if not bs or "dep" not in bs:
+                            continue
+                        n = math.ceil((a_arr_s + eff_min - bs["dep"]) / 1440)
+                        wait = bs["dep"] + n * 1440 - a_arr_s
+                        if wait > max_wait:
+                            continue
+                        b_dep_date = _fmt_epoch(bs["dep"] + n * 1440)[:10]
+                        if n != 0 and not _fig_valid(b, b_dep_date):
+                            continue
+                        b_dep = bs["dep"] + n * 1440
+                        for tk2, bt in to_obs.get(bn, ()):
+                            if tk2 == dk or tk2 in forbidden or not _ordered(bs, bt) or bt["arr"] + n * 1440 <= b_dep:
                                 continue
-                        transfers.append({
-                            "total_min": bt["arr"] + n * 1440 - a_dep, "wait_min": wait,
-                            "transfer_station": so.get("name") or sk, "same_station": same,
-                            "date_assumed": assumed or n != 0,
-                            "legs": [leg(tn, t, fo, so, shift), leg(bn, b, bs, bt, n * 1440)],
-                        })
+                            # 第二程重新经过出发站/第一程走过的站 = 无意义折返
+                            if bs.get("no") is not None and bt.get("no") is not None:
+                                if any(k2 in forbidden and o2.get("no") is not None
+                                       and bs["no"] < o2["no"] <= bt["no"] for k2, o2 in b["obs"].items()):
+                                    continue
+                            is_assumed = (assumed or n != 0 or bool(so.get("bridged"))
+                                          or bool(bs.get("bridged")) or bool(bt.get("bridged")))
+                            transfers.append({
+                                "total_min": bt["arr"] + n * 1440 - a_dep, "wait_min": wait,
+                                "transfer_station": so.get("name") or sk, "same_station": same,
+                                "date_assumed": is_assumed,
+                                "source_date": t.get("source_date") or b.get("source_date"),
+                                "legs": [leg(tn, t, fo, so, shift), leg(bn, b, bs, bt, n * 1440)],
+                            })
     return direct, transfers
 
 

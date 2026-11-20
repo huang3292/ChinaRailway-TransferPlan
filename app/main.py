@@ -1,7 +1,9 @@
 import json
+import re
 import threading
 import time
 import uuid
+from datetime import date as dt_date
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile
@@ -98,6 +100,24 @@ def _train_code_map(train_nos: set[str] | list[str]) -> dict[str, str]:
     return out
 
 
+def _validate_date(d: str) -> str:
+    """校验日期字符串为合法的 YYYY-MM-DD 格式。"""
+    if not isinstance(d, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        raise ValueError(f"日期格式不合法“{d}”，请使用 YYYY-MM-DD")
+    try:
+        dt_date.fromisoformat(d)
+    except ValueError:
+        raise ValueError(f"日期不存在“{d}”，请使用有效的 YYYY-MM-DD")
+    return d
+
+
+def _check_date(d: str) -> str:
+    try:
+        return _validate_date(d)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 def _station_or_400(q: str) -> dict:
     s = db.resolve_station(q)
     if not s:
@@ -157,6 +177,13 @@ def set_rate(body: RateBody):
     return crawler.set_rate(body.mode, body.interval)
 
 
+@app.post("/api/crawler/reset")
+def reset_crawler_session():
+    """手动重置爬虫 HTTP 会话与初始化状态。"""
+    crawler.reset_session()
+    return {"ok": True}
+
+
 # ---------- 导入 ----------
 class ImportBody(BaseModel):
     payload: str
@@ -170,16 +197,21 @@ class ImportBody(BaseModel):
 
 @app.post("/api/import")
 def do_import(body: ImportBody):
+    if body.date:
+        _check_date(body.date)
     ctx = body.model_dump(exclude={"payload", "api_type"})
     return _run(importer.ingest, body.payload, body.api_type, ctx, "import")
 
 
 @app.post("/api/import/file")
 async def do_import_file(file: UploadFile, api_type: str | None = None,
-                         train_no: str | None = None, date: str | None = None,
+                         train_no: str | None = None, station_train_code: str | None = None,
+                         date: str | None = None,
                          from_station_no: str | None = None, to_station_no: str | None = None):
+    if date:
+        _check_date(date)
     text = (await file.read()).decode("utf-8-sig", errors="replace")
-    ctx = {"train_no": train_no, "date": date,
+    ctx = {"train_no": train_no, "station_train_code": station_train_code, "date": date,
            "from_station_no": from_station_no, "to_station_no": to_station_no}
     return _run(importer.ingest, text, api_type or None, ctx, "import")
 
@@ -197,6 +229,7 @@ def crawl_stations():
 
 @app.post("/api/crawl/station_trains")
 def crawl_station_trains(body: StationDate):
+    _check_date(body.date)
     s = _station_or_400(body.station)
     return _run(crawler.crawl_station_trains, s["telecode"], body.date)
 
@@ -210,6 +243,8 @@ class TimetableReq(BaseModel):
 
 @app.post("/api/crawl/timetable")
 def crawl_timetable(body: TimetableReq):
+    if body.date:
+        _check_date(body.date)
     ctx = station_timetable_context(body.train_no)
     date = body.date or (ctx and ctx["date"])
     f = body.from_telecode or (ctx and ctx["from"])
@@ -228,6 +263,7 @@ class TicketReq(BaseModel):
 
 @app.post("/api/crawl/tickets")
 def crawl_tickets(body: TicketReq):
+    _check_date(body.date)
     f, t = _station_or_400(body.from_station), _station_or_400(body.to_station)
     result = _run(crawler.crawl_tickets, f["telecode"], t["telecode"], body.date)
     if body.with_prices:
@@ -297,12 +333,21 @@ class PriceReq(BaseModel):
 
 @app.post("/api/crawl/price")
 def crawl_price(body: PriceReq):
+    _check_date(body.date)
     return _run(crawler.crawl_price, body.train_no, body.from_station_no,
                 body.to_station_no, body.seat_types, body.date)
 
 
 # ---------- 一键导入向导 / 在线模式共用 ----------
 MAX_TIMETABLES = 200   # 单次向导最多抓取的车次时刻表数（大站车次很多时封顶）
+_TRAIN_CLASS_ORDER = {"G": 0, "C": 0, "D": 0, "Z": 1, "T": 1, "K": 1, "S": 3}
+
+
+def _train_rank(code: str | None) -> tuple[int, str]:
+    """按车型优先级排序：G/C/D > Z/T/K > 普速/其他 > S(市郊)。"""
+    c = (code or "").strip().upper()
+    prefix = c[0] if c else ""
+    return (_TRAIN_CLASS_ORDER.get(prefix, 2), c)
 
 
 class RouteImportReq(BaseModel):
@@ -353,10 +398,18 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
             for r in rows:
                 if r["train_no"] and r["train_no"] not in uniq:
                     uniq[r["train_no"]] = r
-            items = list(uniq.values())[:MAX_TIMETABLES]
+            all_items = sorted(uniq.values(), key=lambda r: _train_rank(r["station_train_code"]))
+            items = all_items[:MAX_TIMETABLES]
+            truncated = max(0, len(all_items) - len(items))
             with _jobs_lock:
                 cur_total = jobs[job_id]["total"]
-            _job_update(job_id, phase="timetable", total=cur_total + len(items))
+            _job_update(job_id, phase="timetable", total=cur_total + len(items), truncated=truncated)
+            if truncated > 0:
+                _job_append(
+                    job_id,
+                    "log",
+                    f"【时刻表截断提示】共命中 {len(all_items)} 趟，按车型优先抓取前 {len(items)} 趟，跳过其余 {truncated} 趟",
+                )
             for r in items:
                 tn = r["train_no"]
                 t_label = _fmt_train(r["station_train_code"], tn)
@@ -412,12 +465,13 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
 
 @app.post("/api/import/route")
 def import_route(body: RouteImportReq):
+    _check_date(body.date)
     fstations = db.resolve_stations(body.from_city, True)
     tstations = db.resolve_stations(body.to_city, True)
     if not fstations or not tstations:
         raise HTTPException(400, "车站/城市不存在，请先在「爬取数据」页更新车站站名表")
     job_id, ev = _create_job({"status": "running", "done": 0, "total": 0, "phase": "init",
-                               "current": "", "log": [], "errors": [], "result": {}})
+                               "current": "", "truncated": 0, "log": [], "errors": [], "result": {}})
     threading.Thread(target=_route_job, args=(job_id, ev, body.from_city, body.to_city,
                                               body.date, body.deep), daemon=True).start()
     return {"job_id": job_id,
@@ -431,6 +485,8 @@ def import_route(body: RouteImportReq):
 # ---------- 浏览 ----------
 @app.get("/api/station_trains")
 def station_trains(station: str, date: str | None = None):
+    if date:
+        _check_date(date)
     s = _station_or_400(station)
     if date:
         return db.rows("""SELECT * FROM station_trains WHERE station_telecode=? AND station_train_date=?
@@ -487,6 +543,7 @@ def trains(q: str = "", limit: int = 50):
 
 @app.get("/api/tickets")
 def tickets(from_station: str, to_station: str, date: str):
+    _check_date(date)
     f, t = _station_or_400(from_station), _station_or_400(to_station)
     return db.rows("""SELECT * FROM tickets WHERE from_telecode=? AND to_telecode=? AND train_date=?
                       ORDER BY start_time""", (f["telecode"], t["telecode"], date))
@@ -499,6 +556,8 @@ def prices(train_no: str):
 
 @app.delete("/api/cache")
 def clear_cache(before_date: str | None = None, include_raw: bool = False):
+    if before_date:
+        _check_date(before_date)
     return {"deleted": db.clear_cache(before_date or None, include_raw)}
 
 
@@ -508,6 +567,7 @@ def transfers(from_station: str, to_station: str, date: str,
               min_wait: int = 30, max_wait: int = 360, limit: int = 0,
               max_legs: int = 2, expand_city: bool = True,
               cross_extra: int = 60, frontier_k: int = 8):
+    _check_date(date)
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
     if cross_extra < 0 or cross_extra > 360:
@@ -541,6 +601,7 @@ def _leg_ident(l: PlanLeg) -> tuple:
 def plan_tickets(body: PlanTicketsReq):
     legs, seen = [], set()
     for l in body.legs:
+        _check_date(l.date)
         fs = db.resolve_station(l.from_telecode) if l.from_telecode else db.resolve_station(l.from_name)
         ts = db.resolve_station(l.to_telecode) if l.to_telecode else db.resolve_station(l.to_name)
         f = l.from_telecode or (fs or {}).get("telecode")
