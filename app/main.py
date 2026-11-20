@@ -316,10 +316,26 @@ def station_trains(station: str, date: str | None = None):
 def timetable(train_no: str):
     r = db.rows("SELECT DISTINCT train_date FROM train_stops WHERE train_no=? ORDER BY train_date DESC LIMIT 1",
                 (train_no,))
-    if not r:
-        raise HTTPException(404, "该车次暂无时刻表数据")
-    return db.rows("""SELECT * FROM train_stops WHERE train_no=? AND train_date=? ORDER BY station_no""",
-                   (train_no, r[0]["train_date"]))
+    if r:
+        stops = db.rows("""SELECT * FROM train_stops WHERE train_no=? AND train_date=? ORDER BY station_no""",
+                        (train_no, r[0]["train_date"]))
+        return {"stops": stops, "complete": True, "source": "train_stops"}
+    # 退回车站大屏：把已抓取各站的经停拼成（可能不完整的）时刻表
+    scr = db.rows("""SELECT station_no, station_name, station_telecode, arrive_time, start_time,
+                            stopover_time, station_train_date
+                     FROM station_trains WHERE train_no=? AND station_no IS NOT NULL
+                     ORDER BY station_no, station_train_date DESC""", (train_no,))
+    seen, stops = set(), []
+    for s in scr:
+        if s["station_no"] in seen:
+            continue
+        seen.add(s["station_no"])
+        stops.append({"station_no": s["station_no"], "station_name": s["station_name"],
+                      "telecode": s["station_telecode"], "arrive_time": s["arrive_time"],
+                      "start_time": s["start_time"], "stopover_time": s["stopover_time"], "enabled": 1})
+    if stops:
+        return {"stops": stops, "complete": False, "source": "station_screen"}
+    raise HTTPException(404, "该车次暂无时刻表数据")
 
 
 @app.get("/api/trains")

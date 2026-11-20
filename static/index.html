@@ -513,11 +513,18 @@ async function toggleTT(k,i){
   const l=findPlan(k).legs[i];
   el.dataset.open='1';el.innerHTML='<div class="hint">时刻表加载中…</div>';
   try{
-    const list=await api('/api/timetable?train_no='+encodeURIComponent(l.train_no));
-    el.innerHTML=ttTable(list,l);
+    const r=await api('/api/timetable?train_no='+encodeURIComponent(l.train_no));
+    el.innerHTML=renderTT(r,l,k,i);
   }catch(e){
     el.innerHTML=`<div class="hint">该车次时刻表未入库。<button class="mini" onclick="crawlTTPlan('${k}',${i})">抓取时刻表</button></div>`;
   }
+}
+function renderTT(r,l,k,i){
+  let html=ttTable(r.stops,l);
+  if(!r.complete){
+    html+=`<div class="hint">以上为车站大屏已抓取的经停站，可能不完整。<button class="mini" onclick="crawlTTPlan('${k}',${i})">抓取完整时刻表</button></div>`;
+  }
+  return html;
 }
 function ttTable(list,l){
   return '<div class="scroll"><table><tr><th>#</th><th>车站</th><th>到达</th><th>出发</th><th>停留</th></tr>'+
@@ -529,8 +536,8 @@ async function crawlTTPlan(k,i){
   el.innerHTML='<div class="hint">正在抓取时刻表…</div>';
   try{
     await post('/api/crawl/timetable',{train_no:l.train_no});
-    const list=await api('/api/timetable?train_no='+encodeURIComponent(l.train_no));
-    el.innerHTML=ttTable(list,l);
+    const r=await api('/api/timetable?train_no='+encodeURIComponent(l.train_no));
+    el.innerHTML=renderTT(r,l,k,i);
   }catch(e){el.innerHTML=`<div class="hint" style="color:#dc2626">${esc(e.message)}</div>`;}
 }
 
@@ -604,8 +611,10 @@ async function crawlTT(trainNo,code){
   }catch(e){alert(e.message);}
 }
 async function showTimetable(trainNo,title){
-  const list=await api('/api/timetable?train_no='+encodeURIComponent(trainNo));
-  $('modal-body').innerHTML=`<h3>${esc(title||trainNo)}</h3><table><tr><th>#</th><th>车站</th><th>到达</th><th>出发</th><th>停留</th><th>客运</th></tr>`+
+  const r=await api('/api/timetable?train_no='+encodeURIComponent(trainNo));
+  const list=r.stops;
+  const note=r.complete?'':'<div class="hint">来自车站大屏，仅含已抓取经停站，可能不完整。</div>';
+  $('modal-body').innerHTML=`<h3>${esc(title||trainNo)}</h3>${note}<table><tr><th>#</th><th>车站</th><th>到达</th><th>出发</th><th>停留</th><th>客运</th></tr>`+
     list.map(s=>`<tr><td>${s.station_no}</td><td>${esc(s.station_name)}</td><td>${esc(s.arrive_time)}</td>
       <td>${esc(s.start_time)}</td><td>${esc(s.stopover_time)}</td><td>${s.enabled?'✓':'✗'}</td></tr>`).join('')+'</table>';
   $('modal').style.display='block';
