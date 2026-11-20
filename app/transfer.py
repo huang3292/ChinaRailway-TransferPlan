@@ -562,12 +562,13 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
 
 def search(from_q: str, to_q: str, date: str,
            min_wait: int = 30, max_wait: int = 360, limit: int = 0,
-           max_legs: int = 2) -> dict:
-    fs, ts = db.resolve_station(from_q), db.resolve_station(to_q)
-    if not fs or not ts:
-        raise ValueError("车站不存在，请先在“爬取数据”页更新车站站名表")
-    fkeys = {fs["telecode"], fs["name"]}
-    tkeys = {ts["telecode"], ts["name"]}
+           max_legs: int = 2, expand_city: bool = True) -> dict:
+    fstations = db.resolve_stations(from_q, expand_city)
+    tstations = db.resolve_stations(to_q, expand_city)
+    if not fstations or not tstations:
+        raise ValueError("车站/城市不存在，请先在“爬取数据”页更新车站站名表")
+    fkeys = {s["telecode"] for s in fstations} | {s["name"] for s in fstations}
+    tkeys = {s["telecode"] for s in tstations} | {s["name"] for s in tstations}
     base = datetime.strptime(date, "%Y-%m-%d")
     day_min = base.toordinal() * 1440
     prices, seats = _price_map(), _seat_map()
@@ -626,25 +627,29 @@ def search(from_q: str, to_q: str, date: str,
 
     # 引擎 C：仅有余票数据的直达
     have = {p["legs"][0]["train_no"] for p in direct}
-    for r in db.rows("""SELECT * FROM tickets WHERE from_telecode=? AND to_telecode=? AND train_date=?""",
-                     (fs["telecode"], ts["telecode"], date)):
-        if r["train_no"] in have:
-            continue
-        dep, arr = _minutes(r["start_time"]), _minutes(r["arrive_time"])
-        if dep is None or arr is None:
-            continue
-        dur = arr - dep
-        if dur < 0:
-            dur += 1440
-        direct.append({"total_min": dur, "legs": [_enrich({
-            "train": r["station_train_code"], "train_no": r["train_no"],
-            "from": fs["name"], "to": ts["name"],
-            "from_telecode": r["from_telecode"], "to_telecode": r["to_telecode"],
-            "depart": _fmt(base, dep), "arrive": _fmt(base, dep + dur),
-            "duration_min": dur,
-        }, r["train_no"], r["from_station_no"], r["to_station_no"],
-            r["from_telecode"], r["to_telecode"], date, prices, seats,
-            code=r["station_train_code"], duration_min=dur, cal=cal, sno=sno)]})
+    seen_tk = set()
+    for fst in fstations:
+        for tst in tstations:
+            for r in db.rows("""SELECT * FROM tickets WHERE from_telecode=? AND to_telecode=? AND train_date=?""",
+                             (fst["telecode"], tst["telecode"], date)):
+                if r["train_no"] in have or r["train_no"] in seen_tk:
+                    continue
+                seen_tk.add(r["train_no"])
+                dep, arr = _minutes(r["start_time"]), _minutes(r["arrive_time"])
+                if dep is None or arr is None:
+                    continue
+                dur = arr - dep
+                if dur < 0:
+                    dur += 1440
+                direct.append({"total_min": dur, "legs": [_enrich({
+                    "train": r["station_train_code"], "train_no": r["train_no"],
+                    "from": fst["name"], "to": tst["name"],
+                    "from_telecode": r["from_telecode"], "to_telecode": r["to_telecode"],
+                    "depart": _fmt(base, dep), "arrive": _fmt(base, dep + dur),
+                    "duration_min": dur,
+                }, r["train_no"], r["from_station_no"], r["to_station_no"],
+                    r["from_telecode"], r["to_telecode"], date, prices, seats,
+                    code=r["station_train_code"], duration_min=dur, cal=cal, sno=sno)]})
 
     def _assumed_conflict(p) -> bool:
         """推算方案（无当日真实数据平移而来）若与实际余票冲突，则以实际余票为准剔除。"""
@@ -666,7 +671,9 @@ def search(from_q: str, to_q: str, date: str,
     direct.sort(key=lambda x: x["total_min"])
     transfers.sort(key=lambda x: x["total_min"])
     return {
-        "from": fs["name"], "to": ts["name"], "date": date,
+        "from": from_q, "to": to_q, "date": date,
+        "from_stations": [s["name"] for s in fstations],
+        "to_stations": [s["name"] for s in tstations],
         "screen_trains": len(screen), "timetable_trains": len(tt),
         "note": "大屏数据优先按真实开行日期，无当日数据时按最近爬取日期每日开行假设平移；"
                 "推算方案若与当日实际余票冲突（该车次当日不开行）则自动剔除；"

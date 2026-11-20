@@ -199,6 +199,108 @@ def crawl_price(body: PriceReq):
                 body.to_station_no, body.seat_types, body.date)
 
 
+# ---------- 一键导入向导 / 在线模式共用 ----------
+MAX_TIMETABLES = 200   # 单次向导最多抓取的车次时刻表数（大站车次很多时封顶）
+
+
+class RouteImportReq(BaseModel):
+    from_city: str
+    to_city: str
+    date: str
+    deep: bool = True
+
+
+def _route_job(job_id: str, from_q: str, to_q: str, date: str, deep: bool):
+    job = jobs[job_id]
+
+    def run(txt, fn, *args):
+        job["current"] = txt
+        try:
+            fn(*args)
+        except Exception as e:
+            job["errors"].append(f"{txt}: {e}")
+        job["done"] += 1
+        job["log"].append(txt)
+
+    try:
+        fstations = db.resolve_stations(from_q, True)
+        tstations = db.resolve_stations(to_q, True)
+        if not fstations or not tstations:
+            job["status"] = "error"
+            job["error"] = "车站/城市不存在，请先在“爬取数据”页更新车站站名表"
+            return
+        ftcs = [s["telecode"] for s in fstations]
+        ttcs = [s["telecode"] for s in tstations]
+        all_tcs = list(dict.fromkeys(ftcs + ttcs))
+
+        job["phase"], job["total"] = "screen", len(all_tcs)
+        for tc in all_tcs:
+            run(f"车站大屏 {tc}", crawler.crawl_station_trains, tc, date)
+
+        if deep:
+            ph = ",".join("?" * len(all_tcs))
+            rows = db.rows(
+                f"""SELECT DISTINCT train_no,start_station_telecode,end_station_telecode,start_train_date
+                    FROM station_trains WHERE station_telecode IN ({ph}) AND station_train_date=?""",
+                (*all_tcs, date))
+            uniq = {}
+            for r in rows:
+                if r["train_no"] and r["train_no"] not in uniq:
+                    uniq[r["train_no"]] = r
+            items = list(uniq.values())[:MAX_TIMETABLES]
+            job["phase"], job["total"] = "timetable", job["total"] + len(items)
+            for r in items:
+                tn = r["train_no"]
+                f = r["start_station_telecode"]
+                t = r["end_station_telecode"]
+                d = r["start_train_date"] or date
+                if not f or not t:
+                    ctx = station_timetable_context(tn) or {}
+                    f, t, d = ctx.get("from"), ctx.get("to"), ctx.get("date") or date
+                if not f or not t:
+                    run(f"时刻表 {tn} 跳过（缺始发/终到）", lambda: None)
+                    continue
+                run(f"时刻表 {tn}", crawler.crawl_timetable, tn, d, f, t)
+
+        pairs = [(f, t) for f in ftcs for t in ttcs if f != t]
+        job["phase"], job["total"] = "tickets", job["total"] + len(pairs)
+        for f, t in pairs:
+            run(f"余票 {f}→{t}", crawler.crawl_tickets, f, t, date)
+
+        if deep:
+            phf, pht = ",".join("?" * len(ftcs)), ",".join("?" * len(ttcs))
+            tk = db.rows(
+                f"""SELECT train_no,from_station_no,to_station_no,seat_types FROM tickets
+                    WHERE from_telecode IN ({phf}) AND to_telecode IN ({pht}) AND train_date=?""",
+                (*ftcs, *ttcs, date))
+            job["phase"], job["total"] = "price", job["total"] + len(tk)
+            for r in tk:
+                run(f"票价 {r['train_no']}",
+                    crawler.crawl_price, r["train_no"], r["from_station_no"] or "",
+                    r["to_station_no"] or "", r["seat_types"] or "", date)
+
+        job["phase"], job["status"] = "done", "done"
+    except Exception as e:
+        job["status"], job["error"] = "error", str(e)
+
+
+@app.post("/api/import/route")
+def import_route(body: RouteImportReq):
+    fstations = db.resolve_stations(body.from_city, True)
+    tstations = db.resolve_stations(body.to_city, True)
+    if not fstations or not tstations:
+        raise HTTPException(400, "车站/城市不存在，请先在“爬取数据”页更新车站站名表")
+    job_id = uuid.uuid4().hex[:8]
+    jobs[job_id] = {"status": "running", "done": 0, "total": 0, "phase": "init",
+                    "current": "", "log": [], "errors": [], "result": {}}
+    threading.Thread(target=_route_job, args=(job_id, body.from_city, body.to_city,
+                                              body.date, body.deep), daemon=True).start()
+    return {"job_id": job_id,
+            "from_stations": [s["name"] for s in fstations],
+            "to_stations": [s["name"] for s in tstations],
+            "date": body.date, "deep": body.deep}
+
+
 # ---------- 浏览 ----------
 @app.get("/api/station_trains")
 def station_trains(station: str, date: str | None = None):
@@ -245,11 +347,11 @@ def prices(train_no: str):
 @app.get("/api/transfers")
 def transfers(from_station: str, to_station: str, date: str,
               min_wait: int = 30, max_wait: int = 360, limit: int = 0,
-              max_legs: int = 2):
+              max_legs: int = 2, expand_city: bool = True):
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
     return _run(transfer.search, from_station, to_station, date,
-                min_wait, max_wait, limit, max_legs)
+                min_wait, max_wait, limit, max_legs, expand_city)
 
 
 # ---------- 方案票价/余票实时查询 ----------

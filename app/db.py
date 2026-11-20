@@ -191,6 +191,43 @@ def resolve_station(q: str) -> dict | None:
     return r[0] if r else None
 
 
+# 部分城市的城区主站名不以城市名开头（如武汉→武昌/汉口），手动补充
+CITY_PROPER = {
+    "武汉": ("武昌", "汉口"),
+    "重庆": ("沙坪坝", "菜园坝"),
+}
+
+
+def city_stations(q: str) -> list[dict]:
+    """返回某城市（如“厦门”“南昌”，可带“市”后缀）的城区车站，主站优先。
+
+    城市范围只保留“站名以城市名开头”的车站（厦门/厦门北/厦门高崎、南昌/南昌西/南昌东/南昌南），
+    另加 CITY_PROPER 别名（武汉=武昌/汉口），避免把郊县站（如南昌的向塘/进贤）误算进市区。
+    """
+    q = q.strip()
+    base = q.removesuffix("市")
+    all_rows = rows("SELECT * FROM stations WHERE city=? OR city=? OR city=?",
+                    (q, base, base + "市"))
+    proper = set(CITY_PROPER.get(base, ()))
+    out = [r for r in all_rows
+           if r["name"].startswith(base) or r["name"] in proper or r["name"].removesuffix("站") in proper]
+    if not out:
+        out = all_rows
+    out.sort(key=lambda r: (0 if r["name"] in (base, base + "站") else 1, r["name"]))
+    return out
+
+
+def resolve_stations(q: str, expand_city: bool = True) -> list[dict]:
+    """解析出发/到达为车站列表：城市名展开为该市全部车站，否则按单站匹配。"""
+    q = q.strip()
+    if expand_city:
+        cs = city_stations(q)
+        if cs:
+            return cs
+    s = resolve_station(q)
+    return [s] if s else []
+
+
 def get_setting(key: str, default=None):
     r = rows("SELECT value FROM settings WHERE key=?", (key,))
     return r[0]["value"] if r else default

@@ -109,8 +109,10 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
         <select id="s-legs"><option value="2" selected>2程(1次换乘)</option><option value="3">3程(2次换乘)</option><option value="4">4程(3次换乘)</option><option value="5">5程(4次换乘)</option></select></div>
       <div style="flex:0 0 100px"><label>每页方案数</label>
         <select id="s-size"><option>20</option><option selected>50</option><option>100</option><option>200</option></select></div>
-      <div style="flex:2"><label>&nbsp;</label>
-        <label style="display:inline;color:var(--text)"><input type="checkbox" id="s-live" style="width:auto"> 搜索后自动查询票价/余票（前50个未发车方案，含换乘各程）</label></div>
+      <div style="flex:3"><label>&nbsp;</label>
+        <label style="display:inline;color:var(--text)"><input type="checkbox" id="s-city" checked style="width:auto"> 城市范围（厦门=厦门+厦门北+厦门高崎）</label>
+        <label style="display:inline;color:var(--text);margin-left:12px"><input type="checkbox" id="s-online" style="width:auto"> 在线模式（搜索前实时抓取，不依赖本地库）</label>
+        <label style="display:inline;color:var(--text);margin-left:12px"><input type="checkbox" id="s-live" style="width:auto"> 自动查询票价/余票</label></div>
     </div>
     <div class="row" style="margin-top:10px">
       <div><label>车次包含</label><input id="s-filter" placeholder="如 Z126"></div>
@@ -127,7 +129,7 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
       <div style="flex:0 0 150px"><label>换乘类型</label>
         <select id="s-same"><option value="">不限</option><option value="1">同站换乘</option><option value="0">异站换乘(同城)</option></select></div>
     </div>
-    <div class="hint">直达与换乘方案混合展示，可排序/筛选/分页。异站换乘为同城车站（如福州/福州南），额外预留30分钟；已发车方案不提供实时查询；无当日数据时自动回退最近爬取数据按每日开行推算。数据越全方案越全 —— 先在“爬取数据”页抓取<b>出发站和到达站</b>的经由车次。</div>
+    <div class="hint">直达与换乘方案混合展示，可排序/筛选/分页。异站换乘为同城车站（如福州/福州南），额外预留30分钟；已发车方案不提供实时查询；无当日数据时自动回退最近爬取数据按每日开行推算。勾选「城市范围」时，输入厦门即含厦门/厦门北/厦门高崎；勾选「在线模式」则搜索前自动联网抓取（联网数据优先并覆盖本地）。推荐先到「爬取数据 → 一键导入向导」一键导入两端数据，方案最全。</div>
     <div class="msg" id="s-msg"></div>
   </div>
   <div id="s-result"></div>
@@ -135,6 +137,18 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
 
 <!-- ============ 爬取 ============ -->
 <section class="tab" id="tab-crawl">
+  <div class="card" style="border-color:#bfdbfe;background:#f8fbff">
+    <h3>一键导入向导（推荐）</h3>
+    <div class="row">
+      <div><label>出发地（城市/车站）</label><input id="w-from" class="station-ac" placeholder="如：厦门"></div>
+      <div><label>到达地（城市/车站）</label><input id="w-to" class="station-ac" placeholder="如：威海"></div>
+      <div><label>日期</label><input id="w-date" type="date"></div>
+      <div style="flex:0 0 170px"><label><input type="checkbox" id="w-deep" style="width:auto" checked> 完整导入（含时刻表/票价）</label></div>
+      <div style="flex:0"><button class="btn" id="w-go">一键导入</button></div>
+    </div>
+    <div class="msg" id="w-msg"></div>
+    <div class="hint">只需填出发地、到达地、日期，自动抓取 <b>两端车站大屏</b> → <b>车次时刻表</b> → <b>直达余票</b> → <b>票价</b>，全部合并入库（联网数据覆盖本地）。完成后直接到「换乘搜索」搜索即可，无需手动逐项导入。不勾选“完整导入”则只抓大屏+余票，更快但换乘方案较少。</div>
+  </div>
   <div class="card">
     <h3>请求速率（限速）</h3>
     <div class="row">
@@ -236,7 +250,7 @@ th{color:var(--muted);font-weight:normal;background:#f8fafc}
 const $=id=>document.getElementById(id);
 const SEAT={swz:'商务',tz:'特等',zy:'一等',ze:'二等',gr:'高软',rw:'软卧',yw:'硬卧',rz:'软座',yz:'硬座',wz:'无座',srrb:'动卧',qt:'其他',yb:'预留'};
 const today=new Date(Date.now()+8*3600e3).toISOString().slice(0,10);
-['s-date','c-date','c-t-date'].forEach(id=>$(id).value=today);
+['s-date','c-date','c-t-date','w-date'].forEach(id=>$(id).value=today);
 
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
@@ -300,12 +314,17 @@ function departed(p){const n=nowStr();return p.legs.some(l=>l.depart<=n);}
 $('s-go').onclick=async()=>{
   const btn=$('s-go');btn.disabled=true;$('s-result').innerHTML='';
   try{
+    if($('s-online').checked){
+      await runRouteImport($('s-from').value,$('s-to').value,$('s-date').value,true,'s-msg');
+    }
     const p=new URLSearchParams({from_station:$('s-from').value,to_station:$('s-to').value,date:$('s-date').value,
-      min_wait:$('s-min').value||30,max_wait:$('s-max').value||360,max_legs:$('s-legs').value});
+      min_wait:$('s-min').value||30,max_wait:$('s-max').value||360,max_legs:$('s-legs').value,
+      expand_city:$('s-city').checked});
     R=await api('/api/transfers?'+p);page=1;
     R.direct.forEach((x,i)=>{x._k='d'+i;x._type='direct';});
     R.transfers.forEach((x,i)=>{x._k='t'+i;x._type='transfer';});
-    msg('s-msg',`大屏车次 ${R.screen_trains} 个，时刻表 ${R.timetable_trains} 个。直达 ${R.direct.length} 个，换乘 ${R.transfers.length} 个（全部返回，可排序/筛选/分页）。${R.note}`);
+    const scope=(R.from_stations.length>1||R.to_stations.length>1)?`出发 ${R.from_stations.join('/')} → 到达 ${R.to_stations.join('/')}。`:'';
+    msg('s-msg',`${scope}大屏车次 ${R.screen_trains} 个，时刻表 ${R.timetable_trains} 个。直达 ${R.direct.length} 个，换乘 ${R.transfers.length} 个。${R.note}`);
     render();
     if($('s-live').checked)autoQuery();
   }catch(e){msg('s-msg',e.message,false);}
@@ -507,6 +526,30 @@ async function crawlTTPlan(k,i){
 }
 
 // ---------- 爬取 ----------
+const PHASE={init:'准备中',screen:'抓取车站大屏',timetable:'抓取车次时刻表',tickets:'抓取直达余票',price:'抓取票价',done:'完成'};
+async function runRouteImport(from,to,date,deep,msgElId){
+  const r=await post('/api/import/route',{from_city:from,to_city:to,date:date,deep:!!deep});
+  msg(msgElId,`已开始：出发 ${r.from_stations.join('/')} → 到达 ${r.to_stations.join('/')}（${deep?'完整':'快速'}导入）…`);
+  await new Promise((resolve,reject)=>{
+    const timer=setInterval(async()=>{
+      try{
+        const j=await api('/api/jobs/'+r.job_id);
+        const ph=PHASE[j.phase]||j.phase;
+        const tail=j.errors.length?`，失败 ${j.errors.length}`:'';
+        msg(msgElId,`${ph}：${j.done}/${j.total}${j.current?` — ${j.current}`:''}${tail}`);
+        if(j.status==='done'){clearInterval(timer);msg(msgElId,`导入完成：${j.done} 步${j.errors.length?`，失败 ${j.errors.length} 项：\n${j.errors.slice(0,6).join('\n')}`:''}`);resolve(j);}
+        else if(j.status==='error'){clearInterval(timer);msg(msgElId,j.error||'导入失败',false);reject(new Error(j.error));}
+      }catch(e){clearInterval(timer);reject(e);}
+    },1500);
+  });
+  return r;
+}
+$('w-go').onclick=async()=>{
+  const btn=$('w-go');btn.disabled=true;
+  try{await runRouteImport($('w-from').value,$('w-to').value,$('w-date').value,$('w-deep').checked,'w-msg');}
+  catch(e){msg('w-msg',e.message,false);}
+  btn.disabled=false;
+};
 async function loadRate(){
   try{
     const r=await api('/api/rate');
