@@ -500,17 +500,31 @@ $('s-prune').onchange=()=>{
 ['s-fk','s-maxh','s-detour','s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst','s-allow-cross','s-dom'].forEach(id=>{
   $(id).addEventListener('change',()=>{$('s-prune').value='custom';});
 });
-function formatPruneStats(st){
-  if(!st)return '';
+const PRUNE_LEVEL_NAMES={strict:'严格精简',balanced:'均衡剪枝',relaxed:'宽松探索',custom:'自定义剪枝'};
+function numVal(id,def){
+  const el=$(id);if(!el)return def;
+  const raw=String(el.value??'').trim();
+  if(raw==='')return def;
+  const n=+raw;
+  return Number.isFinite(n)?n:def;
+}
+function pruneBreakdownItems(st){
+  if(!st)return [];
   const loop=(st.loopback||0)+(st.city_loop||0)+(st.passed_dest||0);
-  const parts=[];
-  if(st.repeat_train)parts.push(`重复车次 ${st.repeat_train}`);
-  if(loop)parts.push(`折返绕回 ${loop}`);
-  if(st.total_time)parts.push(`超时 ${st.total_time}`);
-  if(st.custom_rule)parts.push(`自定义规则 ${st.custom_rule}`);
-  if(st.dominated)parts.push(`劣势支配 ${st.dominated}`);
-  if(st.frontier)parts.push(`束宽截断 ${st.frontier}`);
-  return parts.length?` · 树枝剪枝：${parts.join(' / ')}`:'';
+  const items=[];
+  if(st.detour)items.push(`绕行截断 ${st.detour}`);
+  if(st.dominated)items.push(`劣势支配 ${st.dominated}`);
+  if(st.frontier)items.push(`束宽截断 ${st.frontier}`);
+  if(st.total_time)items.push(`总耗时超限 ${st.total_time}`);
+  if(st.custom_rule)items.push(`自定义规则 ${st.custom_rule}`);
+  if(st.repeat_train)items.push(`重复车次 ${st.repeat_train}`);
+  if(loop)items.push(`折返绕回 ${loop}`);
+  return items;
+}
+function formatPruneStats(st,cfg){
+  const items=pruneBreakdownItems(st);
+  const limitTxt=cfg&&cfg.detour_limit_min?`（绕行上限 ${fmtMin(cfg.detour_limit_min)}）`:'';
+  return items.length?` · 树枝剪枝${limitTxt}：${items.join(' / ')}`:(limitTxt?` · 树枝剪枝${limitTxt}`:'');
 }
 $('s-go').onclick=async()=>{
   const btn=$('s-go');btn.disabled=true;$('s-result').innerHTML='';
@@ -525,16 +539,16 @@ $('s-go').onclick=async()=>{
       await runRouteImport($('s-from').value,$('s-to').value,$('s-date').value,true,'s-msg','s-cancel','s-log','s-prog');
     }
     if(mySearch!==searchGen)return;
-    const maxh=Math.min(168,Math.max(1,+($('s-maxh').value||48)));
+    const maxh=Math.min(168,Math.max(1,numVal('s-maxh',48)));
     const body={
       from_station:$('s-from').value,to_station:$('s-to').value,date:$('s-date').value,
-      min_wait:+($('s-min').value||30),max_wait:+($('s-max').value||360),
-      max_legs:+$('s-legs').value,expand_city:$('s-city').checked,
-      cross_extra:+($('s-cross').value||60),
+      min_wait:numVal('s-min',30),max_wait:numVal('s-max',360),
+      max_legs:+numVal('s-legs',2),expand_city:$('s-city').checked,
+      cross_extra:numVal('s-cross',60),
       prune_level:$('s-prune').value,
-      frontier_k:Math.min(32,Math.max(1,+($('s-fk').value||8))),
+      frontier_k:Math.min(32,Math.max(1,numVal('s-fk',8))),
       max_total_min:Math.round(maxh*60),
-      detour_ratio:Math.max(0,+($('s-detour').value||0)),
+      detour_ratio:Math.max(0,numVal('s-detour',0)),
       prune_dominated:$('s-dom').checked,
       allow_cross_station:$('s-allow-cross').checked,
       allow_prefixes:$('s-inc-pfx').value.trim(),
@@ -547,7 +561,7 @@ $('s-go').onclick=async()=>{
     R.transfers.forEach((x,i)=>{x._k='t'+i;x._type='transfer';});
     const fl=R.from_station_labels||R.from_stations,tl=R.to_station_labels||R.to_stations;
     const scope=(fl.length>1||tl.length>1)?`出发 ${fl.join('/')} → 到达 ${tl.join('/')} · `:'';
-    const pruneText=formatPruneStats(R.prune_stats);
+    const pruneText=formatPruneStats(R.prune_stats,R.prune_config);
     msg('s-msg',`${scope}大屏车次 ${R.screen_trains} 个，时刻表 ${R.timetable_trains} 个 · 直达 ${R.direct.length} 个，换乘 ${R.transfers.length} 个${pruneText} · ${R.note}`);
     render();
     if($('s-live').checked)autoQuery();
@@ -656,6 +670,37 @@ function pagerHtml(pages){
     <button class="btn sec" ${page>=pages?'disabled':''} onclick="goPage(page+1)">下一页</button></div>`;
 }
 function goPage(p){page=p;render();refreshAutoQuery();}
+function quickExpand3Legs(){
+  $('s-legs').value='3';
+  applyTypeUI();
+  $('s-go').click();
+}
+function quickRelaxPrune(){
+  $('s-prune').value='relaxed';
+  $('s-prune').onchange();
+  $('s-go').click();
+}
+function pruneDiagHtml(shownCount,transferCount){
+  if(!R)return '';
+  const cfg=R.prune_config||{},st=R.prune_stats||{};
+  const lvName=PRUNE_LEVEL_NAMES[cfg.prune_level]||cfg.prune_level||'均衡剪枝';
+  const items=pruneBreakdownItems(st);
+  const limitPart=cfg.detour_limit_min?` · 绕行上限 ${fmtMin(cfg.detour_limit_min)}（含至少8小时保底）`:'';
+  const statsPart=items.length?items.join(' · '):'未触发剪枝拦截';
+  const actions=[];
+  const lowResult=shownCount<10||transferCount<5;
+  if(lowResult&&(R.max_legs||2)<3&&$('s-type').value!=='direct'){
+    actions.push('<button type="button" class="mini" id="s-quick-3legs" onclick="quickExpand3Legs()">扩展为 3 程重搜</button>');
+  }
+  const hasPruned=!!(st.detour||st.dominated||st.frontier||st.total_time||st.custom_rule);
+  if((lowResult||hasPruned)&&cfg.prune_level!=='relaxed'){
+    actions.push('<button type="button" class="mini" id="s-quick-relax" onclick="quickRelaxPrune()">放宽剪枝并重搜</button>');
+  }
+  return `<div class="hint" style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+    <span>剪枝策略：<b>${esc(lvName)}</b>${esc(limitPart)} ｜ 拦截明细：${esc(statsPart)}</span>
+    ${actions.length?`<span style="display:inline-flex;gap:6px">${actions.join('')}</span>`:''}
+  </div>`;
+}
 function render(){
   if(!R)return;
   const list=sortPlans(filterPlans([...R.direct,...R.transfers]));
@@ -664,11 +709,13 @@ function render(){
   page=Math.min(Math.max(1,page),pages);
   const sortName={duration:'总耗时',depart:'发车时间',price:'价格（最低席位优先，无票按候补计入）'}[$('s-sort').value];
   const nd=list.filter(p=>p._type==='direct').length;
+  const nt=list.length-nd;
+  const diag=pruneDiagHtml(list.length,nt);
   if(!list.length){
-    $('s-result').innerHTML='<div class="card">无匹配方案。若选了“席位”筛选，需先查询余票；或在“爬取数据”页抓取两端大屏/时刻表。</div>';
+    $('s-result').innerHTML=`<div class="card">无匹配方案。若选了“席位”筛选，需先查询余票；或在“爬取数据”页抓取两端大屏/时刻表。${diag}</div>`;
     return;
   }
-  const head=`<div class="card" style="padding:12px 16px"><b>共 ${list.length} 个方案</b>（直达 ${nd} / 换乘 ${list.length-nd}），按${sortName}排序${pagerHtml(pages)}</div>`;
+  const head=`<div class="card" style="padding:12px 16px"><b>共 ${list.length} 个方案</b>（直达 ${nd} / 换乘 ${nt}），按${sortName}排序${diag}${pagerHtml(pages)}</div>`;
   $('s-result').innerHTML=head+list.slice((page-1)*size,page*size).map(planHtml).join('')+pagerHtml(pages);
 }
 function planHtml(p){
