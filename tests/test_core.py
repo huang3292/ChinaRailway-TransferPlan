@@ -260,6 +260,100 @@ class TestTransferFixes(TempDBTestCase):
         self.assertEqual(deleted["tickets"], 1)
         self.assertEqual(deleted["train_stops"], 0)
 
+    def test_pruning_hard_rules_and_multi_level_custom(self):
+        self._seed_stations([
+            ("A01", "甲东", "jd", "jd", "甲市"),
+            ("A02", "甲西", "jx", "jx", "甲市"),
+            ("B01", "乙站", "yz", "yz", "乙市"),
+            ("B02", "乙南", "yn", "yn", "乙市"),
+            ("C01", "丙站", "bz", "bz", "丙市"),
+            ("D01", "丁站", "dz", "dz", "丁市"),
+            ("D02", "丁东", "dd", "dd", "丁市"),
+        ])
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    # G1: 甲东(08:00) -> 乙站(09:00) -> 丁站(11:30)（可直达丁站，用于检验 detour_ratio 与过终点剪枝）
+                    ("T_G1", "G1", "2026-11-20", 1, "甲东", "A01", "----", "08:00"),
+                    ("T_G1", "G1", "2026-11-20", 2, "乙站", "B01", "09:00", "09:05"),
+                    ("T_G1", "G1", "2026-11-20", 3, "丁站", "D01", "11:30", "11:30"),
+                    # G2: 乙站(09:40) -> 丙站(10:30)
+                    ("T_G2", "G2", "2026-11-20", 1, "乙站", "B01", "----", "09:40"),
+                    ("T_G2", "G2", "2026-11-20", 2, "丙站", "C01", "10:30", "10:30"),
+                    # T_G1_DUP 与 G1 同车次号（模拟第3程再坐回同名车次 G1，即使 train_no 不同也应按 repeat_train 剪掉）
+                    ("T_G1_DUP", "G1", "2026-11-20", 1, "丙站", "C01", "----", "11:05"),
+                    ("T_G1_DUP", "G1", "2026-11-20", 2, "丁东", "D02", "12:00", "12:00"),
+                    # G3: 丙站(11:10) -> 丁东(12:10)（合法3程：G1 -> G2 -> G3）
+                    ("T_G3", "G3", "2026-11-20", 1, "丙站", "C01", "----", "11:10"),
+                    ("T_G3", "G3", "2026-11-20", 2, "丁东", "D02", "12:10", "12:10"),
+                    # G4: 乙站(09:50) -> 甲西(10:40) -> 丙站(11:30)（经过已离城市甲市，应触发 city_loop 剪枝）
+                    ("T_G4", "G4", "2026-11-20", 1, "乙站", "B01", "----", "09:50"),
+                    ("T_G4", "G4", "2026-11-20", 2, "甲西", "A02", "10:35", "10:40"),
+                    ("T_G4", "G4", "2026-11-20", 3, "丙站", "C01", "11:30", "11:30"),
+                    # G5: 丁站(12:10) -> 丁东(12:30)（若前程已到终点丁站，不得继续向丁东换乘绕行）
+                    ("T_G5", "G5", "2026-11-20", 1, "丁站", "D01", "----", "12:10"),
+                    ("T_G5", "G5", "2026-11-20", 2, "丁东", "D02", "12:30", "12:30"),
+                    # K9: 慢车 2 程方案 甲东(08:00)->乙南(10:00) + K10 乙南(11:00)->丁站(17:00)（总耗时 540 分钟 > G1 直达 210 分钟的 2.0 倍）
+                    ("T_K9", "K9", "2026-11-20", 1, "甲东", "A01", "----", "08:00"),
+                    ("T_K9", "K9", "2026-11-20", 2, "乙南", "B02", "10:00", "10:00"),
+                    ("T_K10", "K10", "2026-11-20", 1, "乙南", "B02", "----", "11:00"),
+                    ("T_K10", "K10", "2026-11-20", 2, "丁站", "D01", "17:00", "17:00"),
+                    # D8: 甲东(08:10) -> 乙站(09:10) + D9 乙站(09:45) -> 丁站(12:30)（被 G1+G2/直达等对比，且比另一同站早到方案慢时用于检验支配剪枝）
+                    ("T_D8", "D8", "2026-11-20", 1, "甲东", "A01", "----", "08:10"),
+                    ("T_D8", "D8", "2026-11-20", 2, "乙站", "B01", "09:10", "09:10"),
+                    ("T_D9", "D9", "2026-11-20", 1, "乙站", "B01", "----", "09:45"),
+                    ("T_D9", "D9", "2026-11-20", 2, "丁站", "D01", "12:30", "12:30"),
+                    # 另一更优同站换乘：甲东(08:20) -> 乙站(09:10) + D9(09:45 -> 12:30) 晚发同到，支配 D8+D9
+                    ("T_D7", "D7", "2026-11-20", 1, "甲东", "A01", "----", "08:20"),
+                    ("T_D7", "D7", "2026-11-20", 2, "乙站", "B01", "09:10", "09:10"),
+                ],
+            )
+
+        # 1) 均衡模式下：校验 3 程硬剪枝（禁止同车次 G1 重复、禁止经过甲市绕回、禁止过终点丁站再转）
+        res_bal = transfer.search("甲市", "丁市", "2026-11-20", min_wait=30, max_wait=120, max_legs=3, prune_level="balanced")
+        self.assertGreater(res_bal["prune_stats"]["repeat_train"], 0)
+        self.assertGreater(res_bal["prune_stats"]["city_loop"], 0)
+        self.assertGreater(res_bal["prune_stats"]["passed_dest"], 0)
+        for p in res_bal["transfers"]:
+            codes = [l["train"] for l in p["legs"]]
+            self.assertEqual(len(codes), len(set(codes)), "同一方案内不得出现重复车次")
+            self.assertNotIn("G4", codes, "不得出现绕回甲市的方案")
+            self.assertNotIn("G5", codes, "不得出现已到丁站再转丁东的方案")
+        self.assertTrue(any([l["train"] for l in p["legs"]] == ["G1", "G2", "G3"] for p in res_bal["transfers"]))
+
+        # 2) 严格级别：detour_ratio=2.0 应剪除 540 分钟的 K9+K10，prune_dominated=True 应剪除被 D7+D9 支配的 D8+D9
+        res_strict = transfer.search("甲市", "丁市", "2026-11-20", min_wait=30, max_wait=120, max_legs=3, prune_level="strict")
+        self.assertEqual(res_strict["prune_config"]["frontier_k"], 4)
+        self.assertGreater(res_strict["prune_stats"]["dominated"], 0)
+        strict_chains = {[l["train"] for l in p["legs"]].__str__() for p in res_strict["transfers"]}
+        self.assertNotIn("['K9', 'K10']", strict_chains)
+        self.assertNotIn("['D8', 'D9']", strict_chains)
+        self.assertIn("['D7', 'D9']", strict_chains)
+
+        # 3) 自定义剪枝组合：排除丙站中转 + 剪除 K 字头 + 禁止同城异站换乘
+        res_custom = transfer.search(
+            "甲市", "丁市", "2026-11-20", min_wait=30, max_wait=120, max_legs=3,
+            prune_level="custom", exclude_stations="丙站", exclude_prefixes="K", allow_cross_station=False,
+        )
+        for p in res_custom["transfers"]:
+            self.assertTrue(all(tr["same"] for tr in p["transfers"]))
+            for l in p["legs"]:
+                self.assertFalse(l["train"].startswith("K"))
+            for tr in p["transfers"]:
+                self.assertNotIn("丙", tr["station"])
+
+        # 4) 必经中转站 + 只含车型头（仅保留含丙站且只乘 G 字头的方案）
+        res_inc = transfer.search(
+            "甲市", "丁市", "2026-11-20", min_wait=30, max_wait=120, max_legs=3,
+            prune_level="custom", allow_prefixes="G", include_stations="丙站",
+        )
+        self.assertTrue(res_inc["transfers"])
+        for p in res_inc["transfers"]:
+            self.assertTrue(all(l["train"].startswith("G") for l in p["legs"]))
+            self.assertTrue(any("丙" in tr["station"] for tr in p["transfers"]))
+
+
 
 class TestCrawlerAndMainStubbed(TempDBTestCase):
     @classmethod
@@ -750,6 +844,16 @@ class TestCrawlerAndMainStubbed(TempDBTestCase):
         self.assertEqual(st_err["status"], "done")
         self.assertEqual(st_err["result"]["TN1|BJP|SHH|2099-02-01"]["ticket_updated"], "2099-02-01 10:30")
         self.assertIn("余票请求失败：网络超时", st_err["result"]["TN2|BJP|TJP|2099-02-01"]["error"])
+
+        # 6) 验证非法剪枝参数在接口层被拦截并返回 400
+        with self.assertRaises(main_mod.HTTPException) as ctx_p:
+            main_mod.transfers("北京", "上海", "2026-11-20", prune_level="bad_level")
+        self.assertEqual(ctx_p.exception.status_code, 400)
+        with self.assertRaises(main_mod.HTTPException) as ctx_t:
+            main_mod.start_transfers(
+                main_mod.TransferSearchReq(from_station="北京", to_station="上海", date="2026-11-20", max_total_min=10)
+            )
+        self.assertEqual(ctx_t.exception.status_code, 400)
 
 
 if __name__ == "__main__":

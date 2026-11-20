@@ -562,20 +562,46 @@ def clear_cache(before_date: str | None = None, include_raw: bool = False):
 
 
 # ---------- 换乘搜索 ----------
-@app.get("/api/transfers")
-def transfers(from_station: str, to_station: str, date: str,
-              min_wait: int = 30, max_wait: int = 360, limit: int = 0,
-              max_legs: int = 2, expand_city: bool = True,
-              cross_extra: int = 60, frontier_k: int = 8):
+def _validate_search_params(date: str, max_legs: int, cross_extra: int,
+                            frontier_k: int | None, prune_level: str,
+                            max_total_min: int | None, detour_ratio: float | None):
     _check_date(date)
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
     if cross_extra < 0 or cross_extra > 360:
         raise HTTPException(400, "cross_extra 必须在 0-360 之间")
-    if frontier_k < 1 or frontier_k > 32:
+    if frontier_k is not None and (frontier_k < 1 or frontier_k > 32):
         raise HTTPException(400, "frontier_k 必须在 1-32 之间")
-    return _run(transfer.search, from_station, to_station, date,
-                min_wait, max_wait, limit, max_legs, expand_city, cross_extra, frontier_k)
+    if prune_level not in ("strict", "balanced", "relaxed", "custom"):
+        raise HTTPException(400, "prune_level 必须为 strict / balanced / relaxed / custom")
+    if max_total_min is not None and (max_total_min < 60 or max_total_min > 10080):
+        raise HTTPException(400, "max_total_min 必须在 60-10080 分钟之间")
+    if detour_ratio is not None and (detour_ratio < 0 or detour_ratio > 20):
+        raise HTTPException(400, "detour_ratio 必须在 0-20 之间")
+
+
+@app.get("/api/transfers")
+def transfers(from_station: str, to_station: str, date: str,
+              min_wait: int = 30, max_wait: int = 360, limit: int = 0,
+              max_legs: int = 2, expand_city: bool = True,
+              cross_extra: int = 60, frontier_k: int | None = None,
+              prune_level: str = "balanced",
+              max_total_min: int | None = None,
+              detour_ratio: float | None = None,
+              prune_dominated: bool | None = None,
+              allow_cross_station: bool = True,
+              allow_prefixes: str = "",
+              exclude_prefixes: str = "",
+              include_stations: str = "",
+              exclude_stations: str = ""):
+    _validate_search_params(date, max_legs, cross_extra, frontier_k, prune_level, max_total_min, detour_ratio)
+    return _run(
+        transfer.search, from_station, to_station, date,
+        min_wait, max_wait, limit, max_legs, expand_city, cross_extra, frontier_k,
+        prune_level, max_total_min, detour_ratio, prune_dominated,
+        allow_cross_station, allow_prefixes, exclude_prefixes,
+        include_stations, exclude_stations,
+    )
 
 
 class TransferSearchReq(BaseModel):
@@ -588,7 +614,16 @@ class TransferSearchReq(BaseModel):
     max_legs: int = 2
     expand_city: bool = True
     cross_extra: int = 60
-    frontier_k: int = 8
+    frontier_k: int | None = None
+    prune_level: str = "balanced"
+    max_total_min: int | None = None
+    detour_ratio: float | None = None
+    prune_dominated: bool | None = None
+    allow_cross_station: bool = True
+    allow_prefixes: str = ""
+    exclude_prefixes: str = ""
+    include_stations: str = ""
+    exclude_stations: str = ""
 
 
 def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchReq):
@@ -601,6 +636,15 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
             min_wait=body.min_wait, max_wait=body.max_wait, limit=body.limit,
             max_legs=body.max_legs, expand_city=body.expand_city,
             cross_extra=body.cross_extra, frontier_k=body.frontier_k,
+            prune_level=body.prune_level,
+            max_total_min=body.max_total_min,
+            detour_ratio=body.detour_ratio,
+            prune_dominated=body.prune_dominated,
+            allow_cross_station=body.allow_cross_station,
+            allow_prefixes=body.allow_prefixes,
+            exclude_prefixes=body.exclude_prefixes,
+            include_stations=body.include_stations,
+            exclude_stations=body.exclude_stations,
             progress_cb=on_prog, cancel_event=ev,
         )
         if ev.is_set():
@@ -618,13 +662,10 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
 @app.post("/api/transfers/start")
 def start_transfers(body: TransferSearchReq):
     """启动可实时查询进度与中途打断的换乘搜索任务。"""
-    _check_date(body.date)
-    if body.max_legs < 1 or body.max_legs > 6:
-        raise HTTPException(400, "max_legs 必须在 1-6 之间")
-    if body.cross_extra < 0 or body.cross_extra > 360:
-        raise HTTPException(400, "cross_extra 必须在 0-360 之间")
-    if body.frontier_k < 1 or body.frontier_k > 32:
-        raise HTTPException(400, "frontier_k 必须在 1-32 之间")
+    _validate_search_params(
+        body.date, body.max_legs, body.cross_extra, body.frontier_k,
+        body.prune_level, body.max_total_min, body.detour_ratio,
+    )
     fstations = db.resolve_stations(body.from_station, body.expand_city)
     tstations = db.resolve_stations(body.to_station, body.expand_city)
     if not fstations or not tstations:
