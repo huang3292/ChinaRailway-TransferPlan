@@ -358,77 +358,8 @@ class TestTransferFixes(TempDBTestCase):
 class TestCrawlerAndMainStubbed(TempDBTestCase):
     @classmethod
     def setUpClass(cls):
-        # 为容器内缺失的三方库注入轻量桩模块，以便离线测试爬虫与主流程逻辑
-        if "requests" not in sys.modules:
-            req_mod = types.ModuleType("requests")
-
-            class RequestException(Exception):
-                pass
-
-            class Session:
-                def __init__(self):
-                    self.headers = {}
-
-                def request(self, *args, **kwargs):
-                    raise RequestException("stub")
-
-            req_mod.RequestException = RequestException
-            req_mod.Session = Session
-            sys.modules["requests"] = req_mod
-
-        if "fastapi" not in sys.modules:
-            fa = types.ModuleType("fastapi")
-            fa_resp = types.ModuleType("fastapi.responses")
-            fa_stat = types.ModuleType("fastapi.staticfiles")
-            pyd = types.ModuleType("pydantic")
-
-            class HTTPException(Exception):
-                def __init__(self, status_code, detail=""):
-                    super().__init__(detail)
-                    self.status_code = status_code
-                    self.detail = detail
-
-            class FastAPI:
-                def __init__(self, *a, **kw):
-                    pass
-
-                def on_event(self, *a, **kw):
-                    return lambda f: f
-
-                def get(self, *a, **kw):
-                    return lambda f: f
-
-                def post(self, *a, **kw):
-                    return lambda f: f
-
-                def delete(self, *a, **kw):
-                    return lambda f: f
-
-                def mount(self, *a, **kw):
-                    pass
-
-            class UploadFile:
-                pass
-
-            class BaseModel:
-                def __init__(self, **kw):
-                    for k, v in kw.items():
-                        setattr(self, k, v)
-
-                def model_dump(self, exclude=None):
-                    ex = exclude or set()
-                    return {k: v for k, v in self.__dict__.items() if k not in ex}
-
-            fa.FastAPI = FastAPI
-            fa.HTTPException = HTTPException
-            fa.UploadFile = UploadFile
-            fa_resp.FileResponse = lambda *a, **kw: None
-            fa_stat.StaticFiles = lambda *a, **kw: None
-            pyd.BaseModel = BaseModel
-            sys.modules["fastapi"] = fa
-            sys.modules["fastapi.responses"] = fa_resp
-            sys.modules["fastapi.staticfiles"] = fa_stat
-            sys.modules["pydantic"] = pyd
+        # app.crawler 与 app.main 已内置无三方库兼容层，无需注入临时桩模块
+        pass
 
     def test_crawler_cancel_and_maint_hint(self):
         from app import crawler as crawler_mod
@@ -854,6 +785,167 @@ class TestCrawlerAndMainStubbed(TempDBTestCase):
                 main_mod.TransferSearchReq(from_station="北京", to_station="上海", date="2026-11-20", max_total_min=10)
             )
         self.assertEqual(ctx_t.exception.status_code, 400)
+
+    def test_search_sub_progress_and_large_timetable_index(self):
+        import time
+        from app import main as main_mod
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [
+                    ("BJP", "北京", "bj", "bj", "北京"),
+                    ("M01", "中一", "zy", "zy", "中一市"),
+                    ("M02", "中二", "ze", "ze", "中二市"),
+                    ("SHH", "上海", "sh", "sh", "上海"),
+                    ("X01", "旁站甲", "pxa", "pxa", "旁甲市"),
+                    ("X02", "旁站乙", "pxb", "pxb", "旁乙市"),
+                ],
+            )
+            rows = [
+                ("L1", "G101", "2026-11-20", 1, "北京", "BJP", "----", "08:00"),
+                ("L1", "G101", "2026-11-20", 2, "中一", "M01", "09:00", "09:05"),
+                ("L2", "G102", "2026-11-20", 1, "中一", "M01", "----", "09:40"),
+                ("L2", "G102", "2026-11-20", 2, "中二", "M02", "10:40", "10:45"),
+                ("L3", "G103", "2026-11-20", 1, "中二", "M02", "----", "11:20"),
+                ("L3", "G103", "2026-11-20", 2, "上海", "SHH", "12:30", "12:30"),
+            ]
+            # 构造 1,500 趟不经过终点或旁路车次，检验倒排索引优化与子进度回调（避免全量下 O(N^2) 卡死）
+            for i in range(1500):
+                tn = f"NOISE_{i:04d}"
+                cd = f"K{1000 + i}"
+                if i < 60:
+                    # 部分从北京始发但不到上海的列车，确保触发外层匹配并需走索引过滤
+                    rows.append((tn, cd, "2026-11-20", 1, "北京", "BJP", "----", "07:00"))
+                    rows.append((tn, cd, "2026-11-20", 2, "旁站甲", "X01", "08:00", "08:00"))
+                else:
+                    rows.append((tn, cd, "2026-11-20", 1, "旁站甲", "X01", "----", "08:00"))
+                    rows.append((tn, cd, "2026-11-20", 2, "旁站乙", "X02", "09:30", "09:30"))
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                rows,
+            )
+
+        prog_steps, sub_steps = [], []
+        t0 = time.monotonic()
+        sr = transfer.search(
+            "北京", "上海", "2026-11-20",
+            min_wait=30, max_wait=120, max_legs=3, expand_city=False,
+            progress_cb=lambda d, tot, m: prog_steps.append((d, tot, m)),
+            sub_cb=lambda sd, st, m: sub_steps.append((sd, st, m)),
+        )
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 5.0, f"全量索引搜索耗时过长: {elapsed:.2f}s")
+        self.assertEqual(len(sr["transfers"]), 1)
+        self.assertEqual([l["train"] for l in sr["transfers"][0]["legs"]], ["G101", "G102", "G103"])
+        self.assertTrue(any("计算时刻表直达/换乘" in m for _, _, m in sub_steps))
+        self.assertTrue(any("多程 BFS" in m or "构建多程路网" in m for _, _, m in sub_steps))
+        for sd, st, _ in sub_steps:
+            self.assertGreaterEqual(sd, 0)
+            self.assertGreater(st, 0)
+            self.assertLessEqual(sd, st)
+
+        # 验证 _transfer_search_job 正确维护与重置 sub_done / sub_total
+        req = main_mod.TransferSearchReq(from_station="北京", to_station="上海", date="2026-11-20", max_legs=3, expand_city=False)
+        jid, ev = main_mod._create_job({"status": "running", "phase": "search", "done": 0, "total": 7, "sub_done": 0, "sub_total": 0, "current": "", "errors": [], "result": {}})
+        main_mod._transfer_search_job(jid, ev, req)
+        st_job = main_mod.job_status(jid)
+        self.assertEqual(st_job["status"], "done")
+        self.assertEqual(st_job["sub_done"], 0)
+        self.assertEqual(st_job["sub_total"], 0)
+        self.assertEqual(len(st_job["result"]["transfers"]), 1)
+
+
+class TestStdlibHTTPServer(TempDBTestCase):
+    def test_http_routes_multipart_and_nested_models(self):
+        import json
+        import threading
+        import time
+        import urllib.error
+        import urllib.request
+        from app import server as server_mod
+
+        srv = server_mod.create_server("127.0.0.1", 0)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        base = f"http://127.0.0.1:{port}"
+
+        def req(method, path, body=None, headers=None):
+            h = dict(headers or {})
+            data = body
+            if isinstance(body, (dict, list)):
+                data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                h.setdefault("Content-Type", "application/json")
+            r = urllib.request.Request(base + path, data=data, headers=h, method=method)
+            try:
+                with urllib.request.urlopen(r, timeout=5) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        try:
+            # 1) 首页与统计接口
+            st, raw = req("GET", "/")
+            self.assertEqual(st, 200)
+            self.assertIn("12306 智能中转", raw.decode("utf-8"))
+
+            st, raw = req("GET", "/api/stats")
+            self.assertEqual(st, 200)
+            stats = json.loads(raw)
+            self.assertIn("stations", stats)
+
+            # 2) multipart/form-data 文件导入站点并校验入库
+            boundary = "----TestBoundary123"
+            stations_js = "var station_names ='@bjp|北京|BJP|beijing|bj|0|0357|北京|||@shh|上海|SHH|shanghai|sh|1|0712|上海|||';".encode("utf-8")
+            mp_body = (
+                f"--{boundary}\r\n"
+                f"Content-Disposition: form-data; name=\"api_type\"\r\n\r\n"
+                f"stations\r\n"
+                f"--{boundary}\r\n"
+                f"Content-Disposition: form-data; name=\"file\"; filename=\"station_name.js\"\r\n"
+                f"Content-Type: application/javascript\r\n\r\n"
+            ).encode("utf-8") + stations_js + f"\r\n--{boundary}--\r\n".encode("utf-8")
+            st, raw = req("POST", "/api/import/file", body=mp_body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            self.assertEqual(st, 200, raw.decode("utf-8", errors="replace"))
+            self.assertGreaterEqual(json.loads(raw)["saved"], 2)
+
+            # 3) 异步换乘搜索与参数校验（400 / 422）
+            st, raw = req("POST", "/api/transfers/start", {
+                "from_station": "北京", "to_station": "上海", "date": "2026-11-20",
+                "max_legs": 2, "expand_city": False, "prune_level": "balanced",
+            })
+            self.assertEqual(st, 200)
+            jid = json.loads(raw)["job_id"]
+            for _ in range(40):
+                st_j, raw_j = req("GET", f"/api/jobs/{jid}")
+                self.assertEqual(st_j, 200)
+                jobj = json.loads(raw_j)
+                if jobj.get("status") != "running":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(jobj["status"], "done")
+
+            st_bad, _ = req("POST", "/api/transfers/start", {
+                "from_station": "北京", "to_station": "上海", "date": "2026-11-20", "prune_level": "invalid"
+            })
+            self.assertEqual(st_bad, 400)
+
+            # 4) 嵌套 BaseModel (list[PlanLeg]) 校验
+            with mock.patch("app.main.crawler.crawl_tickets"):
+                st_p, raw_p = req("POST", "/api/plan_tickets", {
+                    "legs": [{"train_no": "T1", "train": "G1", "date": "2099-01-01", "from_telecode": "BJP", "to_telecode": "SHH"}]
+                })
+                self.assertEqual(st_p, 200)
+                self.assertEqual(json.loads(raw_p)["legs"], 1)
+
+            # 5) DELETE 清理缓存路由
+            st_d, raw_d = req("DELETE", "/api/cache?before_date=2099-01-01&include_raw=false")
+            self.assertEqual(st_d, 200)
+            self.assertIn("deleted", json.loads(raw_d))
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

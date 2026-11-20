@@ -7,7 +7,67 @@ import re
 import threading
 import time
 
-import requests
+try:
+    import requests
+except ImportError:
+    # 无 requests 三方库时回退至标准库 HTTP 会话，保证纯 Python 环境可直接启动与抓取
+    import http.cookiejar
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    class _StdlibRequestException(Exception):
+        pass
+
+    class _StdlibResponse:
+        def __init__(self, status_code: int, body: bytes, charset: str = "utf-8"):
+            self.status_code = status_code
+            self._body = body
+            self.text = body.decode(charset or "utf-8", errors="replace")
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise _StdlibRequestException(f"HTTP {self.status_code}")
+
+        def json(self):
+            return json.loads(self.text)
+
+    class _StdlibSession:
+        def __init__(self):
+            self.headers: dict[str, str] = {}
+            self._opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+            )
+
+        def request(self, method: str, url: str, params=None, data=None, headers=None, timeout=20):
+            if params:
+                qs = urllib.parse.urlencode(params)
+                url = f"{url}{'&' if '?' in url else '?'}{qs}"
+            req_headers = dict(self.headers)
+            if headers:
+                req_headers.update(headers)
+            body = None
+            if data is not None:
+                body = urllib.parse.urlencode(data).encode("utf-8") if isinstance(data, dict) else data
+            req = urllib.request.Request(url, data=body, headers=req_headers, method=method.upper())
+            try:
+                with self._opener.open(req, timeout=timeout) as resp:
+                    charset = resp.headers.get_content_charset() or "utf-8"
+                    return _StdlibResponse(resp.status, resp.read(), charset)
+            except urllib.error.HTTPError as e:
+                charset = e.headers.get_content_charset() if e.headers else "utf-8"
+                return _StdlibResponse(e.code, e.read(), charset or "utf-8")
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                raise _StdlibRequestException(str(e)) from e
+
+        def close(self):
+            pass
+
+    class _RequestsFallback:
+        RequestException = _StdlibRequestException
+        Session = _StdlibSession
+
+    requests = _RequestsFallback()
 
 from . import db, importer
 
