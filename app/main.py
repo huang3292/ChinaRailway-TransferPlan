@@ -422,7 +422,18 @@ def job_status(job_id: str):
         if job_id not in jobs:
             raise HTTPException(404, "任务不存在")
         j = jobs[job_id]
-        return {k: (list(v) if isinstance(v, list) else v) for k, v in j.items() if k != "created_at"}
+        out = {k: (list(v) if isinstance(v, list) else v) for k, v in j.items() if k != "created_at"}
+    if out.get("status") == "running":
+        total = out.get("total") or 0
+        frac = float(out.get("done") or 0)
+        sub_total = out.get("sub_total") or 0
+        if sub_total > 0 and frac < total:
+            frac += min(0.99, max(0.0, (out.get("sub_done") or 0) / sub_total))
+        elapsed = time.time() - (j.get("created_at") or time.time())
+        out["elapsed_sec"] = round(elapsed, 1)
+        if total > 0 and frac > 0:
+            out["eta_sec"] = round(elapsed / frac * (total - frac), 1)
+    return out
 
 
 @app.post("/api/jobs/{job_id}/cancel")
