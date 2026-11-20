@@ -2,11 +2,22 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "rail.db"
+CN_TZ = ZoneInfo("Asia/Shanghai")
 
 _local = threading.local()
+
+
+def cn_now() -> datetime:
+    return datetime.now(CN_TZ).replace(tzinfo=None)
+
+
+def cn_today() -> date:
+    return cn_now().date()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS stations(
@@ -75,6 +86,8 @@ CREATE TABLE IF NOT EXISTS train_stops(
 );
 CREATE INDEX IF NOT EXISTS idx_ts_station ON train_stops(station_name);
 CREATE INDEX IF NOT EXISTS idx_ts_code ON train_stops(station_train_code);
+CREATE INDEX IF NOT EXISTS idx_ts_telecode_train ON train_stops(telecode, train_no);
+CREATE INDEX IF NOT EXISTS idx_st_train_date ON station_trains(train_no, station_train_date);
 
 CREATE TABLE IF NOT EXISTS tickets(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,6 +122,7 @@ CREATE TABLE IF NOT EXISTS prices(
   raw_id INTEGER,
   UNIQUE(train_no, train_date, from_station_no, to_station_no, seat_type)
 );
+CREATE INDEX IF NOT EXISTS idx_pr_lookup ON prices(train_no, from_station_no, to_station_no, train_date);
 
 CREATE TABLE IF NOT EXISTS settings(
   key TEXT PRIMARY KEY,
@@ -127,6 +141,16 @@ def get_conn() -> sqlite3.Connection:
         conn.execute("PRAGMA foreign_keys=ON")
         _local.conn = conn
     return conn
+
+
+def close_conn():
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _local.conn = None
 
 
 @contextmanager
@@ -169,15 +193,36 @@ def rows(sql, params=()):
 
 
 def archive_raw(api_type: str, payload: str, params: dict, source: str) -> int:
-    from datetime import datetime
-
     with tx() as conn:
         cur = conn.execute(
             "INSERT INTO raw_payloads(api_type,params,source,fetched_at,payload) VALUES(?,?,?,?,?)",
             (api_type, json.dumps(params, ensure_ascii=False), source,
-             datetime.now().isoformat(timespec="seconds"), payload),
+             cn_now().isoformat(timespec="seconds"), payload),
         )
         return cur.lastrowid
+
+
+def clear_cache(before_date: str | None = None, include_raw: bool = False) -> dict:
+    deleted = {}
+    with tx() as conn:
+        if before_date:
+            deleted["station_trains"] = conn.execute(
+                "DELETE FROM station_trains WHERE station_train_date < ?", (before_date,)).rowcount
+            deleted["train_stops"] = conn.execute(
+                "DELETE FROM train_stops WHERE train_date != '' AND train_date < ?", (before_date,)).rowcount
+            deleted["tickets"] = conn.execute(
+                "DELETE FROM tickets WHERE train_date < ?", (before_date,)).rowcount
+            deleted["prices"] = conn.execute(
+                "DELETE FROM prices WHERE train_date != '' AND train_date < ?", (before_date,)).rowcount
+            if include_raw:
+                deleted["raw_payloads"] = conn.execute(
+                    "DELETE FROM raw_payloads WHERE substr(fetched_at, 1, 10) < ?", (before_date,)).rowcount
+        else:
+            for tbl in ("station_trains", "train_stops", "tickets", "prices"):
+                deleted[tbl] = conn.execute(f"DELETE FROM {tbl}").rowcount
+            if include_raw:
+                deleted["raw_payloads"] = conn.execute("DELETE FROM raw_payloads").rowcount
+    return deleted
 
 
 def station_lookup() -> dict:
@@ -191,10 +236,22 @@ def resolve_station(q: str) -> dict | None:
     return r[0] if r else None
 
 
-# 部分城市的城区主站名不以城市名开头（如武汉→武昌/汉口），手动补充
+# 部分城市的城区/近郊核心枢纽站名不以城市名开头，手动补充
 CITY_PROPER = {
+    "北京": ("清河", "昌平北", "亦庄", "通州"),
+    "天津": ("滨海", "滨海西", "滨海北", "塘沽", "军粮城北"),
+    "上海": ("松江", "金山北", "南翔北", "安亭北", "安亭西", "练塘"),
+    "广州": ("庆盛", "新塘", "南沙北"),
+    "深圳": ("光明城", "坪山"),
     "武汉": ("武昌", "汉口"),
-    "重庆": ("沙坪坝", "菜园坝"),
+    "重庆": ("沙坪坝", "菜园坝", "复盛"),
+    "成都": ("犀浦", "双流机场", "双流西", "天府机场", "安靖"),
+    "西安": ("阿房宫", "鄠邑", "引镇"),
+    "南京": ("江宁", "仙林", "江浦"),
+    "杭州": ("富阳", "富阳西", "钱塘"),
+    "郑州": ("航空港", "南曹"),
+    "沈阳": ("皇姑屯", "苏家屯"),
+    "哈尔滨": ("呼兰", "王岗"),
 }
 
 

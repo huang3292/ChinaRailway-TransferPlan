@@ -13,19 +13,20 @@ LT = {
     "seat_types": 35,
 }
 SEAT_FIELDS = {
-    21: "gr", 22: "qt", 23: "rw", 24: "rz", 25: "tz", 26: "wz",
+    20: "yxyz", 21: "gr", 22: "qt", 23: "rw", 24: "rz", 25: "tz", 26: "wz",
     27: "yb", 28: "yw", 29: "yz", 30: "ze", 31: "zy", 32: "swz", 33: "srrb",
 }
 SEAT_NAMES = {
-    "swz": "商务座", "tz": "特等座", "zy": "一等座", "ze": "二等座",
+    "swz": "商务座", "tz": "特等座", "yxyz": "优选一等", "zy": "一等座", "ze": "二等座",
     "gr": "高级软卧", "rw": "软卧", "yw": "硬卧", "rz": "软座",
     "yz": "硬座", "wz": "无座", "srrb": "动卧", "qt": "其他", "yb": "预留",
-    "dwo": "动卧", "fwo": "高级动卧",
+    "dwo": "动卧", "fwo": "高级动卧", "ydw": "一等卧", "edw": "二等卧",
 }
-# queryTicketPrice 返回键 -> 席别
+# queryTicketPrice / yp_info_new 返回键 -> 席别
 PRICE_KEYS = {
     "A9": "swz", "9": "swz", "P": "tz", "M": "zy", "O": "ze",
     "A6": "gr", "6": "gr", "F": "fwo", "D": "dwo",
+    "I": "ydw", "J": "edw",
     "A4": "rw", "4": "rw", "A3": "yw", "3": "yw",
     "A2": "rz", "2": "rz", "A1": "yz", "1": "yz", "WZ": "wz",
 }
@@ -89,6 +90,53 @@ def parse_left_ticket(payload: dict, ctx: dict | None = None) -> list[dict]:
     return out
 
 
+def parse_left_ticket_prices(payload: dict, ctx: dict | None = None) -> list[dict]:
+    """从 leftTicket 字段[39]（yp_info_new，每10字符=席别1+角价5+余票4）提取实时票价。"""
+    ctx = ctx or {}
+    data = payload.get("data") or {}
+    result = data.get("result") or []
+    out = []
+    for line in result:
+        if isinstance(line, dict):
+            line = line.get("queryLeftNewDTO", "")
+        f = line.split("|")
+        if len(f) <= 39 or not f[39]:
+            continue
+        yp = f[39].strip()
+        if len(yp) < 10 or len(yp) % 10 != 0:
+            continue
+        train_no = f[LT["train_no"]]
+        code = f[LT["station_train_code"]]
+        train_date = norm_date(ctx.get("date") or f[LT["start_train_date"]])
+        fno, tno = f[LT["from_station_no"]], f[LT["to_station_no"]]
+        if not (train_no and train_date and fno and tno):
+            continue
+        dedup = {}
+        for i in range(0, len(yp), 10):
+            chunk = yp[i:i + 10]
+            key, price_s, cnt_s = chunk[0], chunk[1:6], chunk[6:10]
+            if not (price_s.isdigit() and cnt_s.isdigit()):
+                continue
+            price = int(price_s) / 10.0
+            if price <= 0:
+                continue
+            if int(cnt_s) >= 3000:
+                seat = "wz"
+            elif key == "D" and not (code or "").upper().startswith("D"):
+                seat = "yxyz"
+            else:
+                seat = PRICE_KEYS.get(key)
+            if not seat:
+                continue
+            dedup[seat] = {
+                "train_no": train_no, "station_train_code": code,
+                "train_date": train_date, "from_station_no": fno, "to_station_no": tno,
+                "seat_type": seat, "seat_name": SEAT_NAMES.get(seat, key), "price": price,
+            }
+        out.extend(dedup.values())
+    return out
+
+
 def _price_value(v) -> float | None:
     if v is None:
         return None
@@ -110,6 +158,7 @@ def parse_price(payload: dict, ctx: dict) -> list[dict]:
     train_no = data.get("train_no") or ctx.get("train_no")
     if not train_no:
         raise ValueError("票价数据缺少 train_no，请在导入时补充车次编号")
+    code = data.get("station_train_code") or ctx.get("station_train_code") or ""
     out = []
     for k, v in data.items():
         if k not in PRICE_KEYS or isinstance(v, (list, dict)):
@@ -117,10 +166,10 @@ def parse_price(payload: dict, ctx: dict) -> list[dict]:
         price = _price_value(v)
         if price is None:
             continue
-        seat = PRICE_KEYS[k]
+        seat = "yxyz" if (k == "D" and code and not str(code).upper().startswith("D")) else PRICE_KEYS[k]
         out.append({
             "train_no": train_no,
-            "station_train_code": data.get("station_train_code") or ctx.get("station_train_code"),
+            "station_train_code": code or None,
             "train_date": norm_date(data.get("train_date") or ctx.get("date")),
             "from_station_no": data.get("from_station_no") or ctx.get("from_station_no"),
             "to_station_no": data.get("to_station_no") or ctx.get("to_station_no"),
@@ -209,6 +258,19 @@ def parse_station_screen(payload: dict, ctx: dict) -> list[dict]:
             "distance": int(t["distance"]) if str(t.get("distance", "")).isdigit() else None,
         })
     return out
+
+
+def running_fig_allows(fig: str | None, query_date: str) -> bool | None:
+    """根据大屏 running_fig（如 '20260126#1#1#20261124'）判断有效期，不匹配时返回 None。"""
+    if not fig or not query_date:
+        return None
+    m = re.fullmatch(r"(\d{8})#[^#]*#[^#]*#(\d{8})", str(fig).strip())
+    if not m:
+        return None
+    qd = query_date.replace("-", "")
+    if len(qd) != 8 or not qd.isdigit():
+        return None
+    return m.group(1) <= qd <= m.group(2)
 
 
 def detect_type(text: str) -> str:

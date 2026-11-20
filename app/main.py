@@ -1,7 +1,7 @@
 import json
 import threading
+import time
 import uuid
-from datetime import date
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile
@@ -10,12 +10,49 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import db, importer, transfer
-from .crawler import CrawlError, crawler, station_timetable_context
+from .crawler import CrawlCancelled, CrawlError, crawler, station_timetable_context
 
 app = FastAPI(title="12306 智能中转")
 STATIC = Path(__file__).resolve().parent.parent / "static"
 
+_jobs_lock = threading.Lock()
 jobs: dict[str, dict] = {}
+_job_cancels: dict[str, threading.Event] = {}
+MAX_JOBS = 100
+
+
+def _create_job(initial: dict) -> tuple[str, threading.Event]:
+    job_id = uuid.uuid4().hex[:8]
+    ev = threading.Event()
+    initial = dict(initial, created_at=time.time())
+    with _jobs_lock:
+        if len(jobs) >= MAX_JOBS:
+            done_ids = [jid for jid, j in jobs.items() if j.get("status") != "running"]
+            done_ids.sort(key=lambda jid: jobs[jid].get("created_at", 0))
+            for jid in done_ids[:len(jobs) - MAX_JOBS + 1]:
+                jobs.pop(jid, None)
+                _job_cancels.pop(jid, None)
+        jobs[job_id] = initial
+        _job_cancels[job_id] = ev
+    return job_id, ev
+
+
+def _job_update(job_id: str, **kwargs):
+    with _jobs_lock:
+        if job_id in jobs:
+            jobs[job_id].update(kwargs)
+
+
+def _job_inc(job_id: str, field: str, delta: int = 1):
+    with _jobs_lock:
+        if job_id in jobs:
+            jobs[job_id][field] = jobs[job_id].get(field, 0) + delta
+
+
+def _job_append(job_id: str, field: str, val):
+    with _jobs_lock:
+        if job_id in jobs:
+            jobs[job_id].setdefault(field, []).append(val)
 
 
 @app.on_event("startup")
@@ -156,33 +193,58 @@ def crawl_tickets(body: TicketReq):
     f, t = _station_or_400(body.from_station), _station_or_400(body.to_station)
     result = _run(crawler.crawl_tickets, f["telecode"], t["telecode"], body.date)
     if body.with_prices:
-        job_id = uuid.uuid4().hex[:8]
-        jobs[job_id] = {"status": "running", "done": 0, "total": 0, "errors": []}
-        threading.Thread(target=_price_job, args=(job_id, f["telecode"], t["telecode"], body.date),
+        job_id, ev = _create_job({"status": "running", "done": 0, "total": 0, "errors": []})
+        threading.Thread(target=_price_job, args=(job_id, ev, f["telecode"], t["telecode"], body.date),
                          daemon=True).start()
         result["price_job"] = job_id
     return result
 
 
-def _price_job(job_id, f_tc, t_tc, date):
-    tk = db.rows("""SELECT train_no,from_station_no,to_station_no,seat_types FROM tickets
-                    WHERE from_telecode=? AND to_telecode=? AND train_date=?""", (f_tc, t_tc, date))
-    jobs[job_id]["total"] = len(tk)
-    for r in tk:
-        try:
-            crawler.crawl_price(r["train_no"], r["from_station_no"], r["to_station_no"],
-                                r["seat_types"] or "", date)
-        except Exception as e:
-            jobs[job_id]["errors"].append(f"{r['train_no']}: {e}")
-        jobs[job_id]["done"] += 1
-    jobs[job_id]["status"] = "done"
+def _price_job(job_id, ev: threading.Event, f_tc, t_tc, date):
+    crawler.set_cancel_event(ev)
+    try:
+        tk = db.rows("""SELECT train_no,from_station_no,to_station_no,seat_types FROM tickets
+                        WHERE from_telecode=? AND to_telecode=? AND train_date=?""", (f_tc, t_tc, date))
+        _job_update(job_id, total=len(tk))
+        for r in tk:
+            if ev.is_set():
+                _job_update(job_id, status="cancelled")
+                return
+            try:
+                crawler.crawl_price(r["train_no"], r["from_station_no"], r["to_station_no"],
+                                    r["seat_types"] or "", date)
+            except CrawlCancelled:
+                _job_update(job_id, status="cancelled")
+                return
+            except Exception as e:
+                _job_append(job_id, "errors", f"{r['train_no']}: {e}")
+            _job_inc(job_id, "done")
+        _job_update(job_id, status="done")
+    finally:
+        crawler.set_cancel_event(None)
+        db.close_conn()
 
 
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(404, "任务不存在")
-    return jobs[job_id]
+    with _jobs_lock:
+        if job_id not in jobs:
+            raise HTTPException(404, "任务不存在")
+        j = jobs[job_id]
+        return {k: (list(v) if isinstance(v, list) else v) for k, v in j.items() if k != "created_at"}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    with _jobs_lock:
+        if job_id not in jobs:
+            raise HTTPException(404, "任务不存在")
+        ev = _job_cancels.get(job_id)
+        if ev:
+            ev.set()
+        if jobs[job_id].get("status") == "running":
+            jobs[job_id]["status"] = "cancelled"
+        return {"job_id": job_id, "status": jobs[job_id]["status"]}
 
 
 class PriceReq(BaseModel):
@@ -210,30 +272,33 @@ class RouteImportReq(BaseModel):
     deep: bool = True
 
 
-def _route_job(job_id: str, from_q: str, to_q: str, date: str, deep: bool):
-    job = jobs[job_id]
+def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: str, deep: bool):
+    crawler.set_cancel_event(ev)
 
     def run(txt, fn, *args):
-        job["current"] = txt
+        if ev.is_set():
+            raise CrawlCancelled("任务已取消")
+        _job_update(job_id, current=txt)
         try:
             fn(*args)
+        except CrawlCancelled:
+            raise
         except Exception as e:
-            job["errors"].append(f"{txt}: {e}")
-        job["done"] += 1
-        job["log"].append(txt)
+            _job_append(job_id, "errors", f"{txt}: {e}")
+        _job_inc(job_id, "done")
+        _job_append(job_id, "log", txt)
 
     try:
         fstations = db.resolve_stations(from_q, True)
         tstations = db.resolve_stations(to_q, True)
         if not fstations or not tstations:
-            job["status"] = "error"
-            job["error"] = "车站/城市不存在，请先在“爬取数据”页更新车站站名表"
+            _job_update(job_id, status="error", error="车站/城市不存在，请先在“爬取数据”页更新车站站名表")
             return
         ftcs = [s["telecode"] for s in fstations]
         ttcs = [s["telecode"] for s in tstations]
         all_tcs = list(dict.fromkeys(ftcs + ttcs))
 
-        job["phase"], job["total"] = "screen", len(all_tcs)
+        _job_update(job_id, phase="screen", total=len(all_tcs))
         for tc in all_tcs:
             run(f"车站大屏 {tc}", crawler.crawl_station_trains, tc, date)
 
@@ -248,7 +313,9 @@ def _route_job(job_id: str, from_q: str, to_q: str, date: str, deep: bool):
                 if r["train_no"] and r["train_no"] not in uniq:
                     uniq[r["train_no"]] = r
             items = list(uniq.values())[:MAX_TIMETABLES]
-            job["phase"], job["total"] = "timetable", job["total"] + len(items)
+            with _jobs_lock:
+                cur_total = jobs[job_id]["total"]
+            _job_update(job_id, phase="timetable", total=cur_total + len(items))
             for r in items:
                 tn = r["train_no"]
                 f = r["start_station_telecode"]
@@ -263,25 +330,41 @@ def _route_job(job_id: str, from_q: str, to_q: str, date: str, deep: bool):
                 run(f"时刻表 {tn}", crawler.crawl_timetable, tn, d, f, t)
 
         pairs = [(f, t) for f in ftcs for t in ttcs if f != t]
-        job["phase"], job["total"] = "tickets", job["total"] + len(pairs)
+        with _jobs_lock:
+            cur_total = jobs[job_id]["total"]
+        _job_update(job_id, phase="tickets", total=cur_total + len(pairs))
         for f, t in pairs:
             run(f"余票 {f}→{t}", crawler.crawl_tickets, f, t, date)
 
         if deep:
             phf, pht = ",".join("?" * len(ftcs)), ",".join("?" * len(ttcs))
             tk = db.rows(
-                f"""SELECT train_no,from_station_no,to_station_no,seat_types FROM tickets
-                    WHERE from_telecode IN ({phf}) AND to_telecode IN ({pht}) AND train_date=?""",
+                f"""SELECT t.train_no,t.from_station_no,t.to_station_no,t.seat_types
+                    FROM tickets t
+                    WHERE t.from_telecode IN ({phf}) AND t.to_telecode IN ({pht}) AND t.train_date=?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM prices p WHERE p.train_no=t.train_no
+                            AND p.from_station_no=t.from_station_no
+                            AND p.to_station_no=t.to_station_no
+                            AND p.train_date=t.train_date
+                      )""",
                 (*ftcs, *ttcs, date))
-            job["phase"], job["total"] = "price", job["total"] + len(tk)
+            with _jobs_lock:
+                cur_total = jobs[job_id]["total"]
+            _job_update(job_id, phase="price", total=cur_total + len(tk))
             for r in tk:
                 run(f"票价 {r['train_no']}",
                     crawler.crawl_price, r["train_no"], r["from_station_no"] or "",
                     r["to_station_no"] or "", r["seat_types"] or "", date)
 
-        job["phase"], job["status"] = "done", "done"
+        _job_update(job_id, phase="done", status="done")
+    except CrawlCancelled:
+        _job_update(job_id, status="cancelled")
     except Exception as e:
-        job["status"], job["error"] = "error", str(e)
+        _job_update(job_id, status="error", error=str(e))
+    finally:
+        crawler.set_cancel_event(None)
+        db.close_conn()
 
 
 @app.post("/api/import/route")
@@ -290,10 +373,9 @@ def import_route(body: RouteImportReq):
     tstations = db.resolve_stations(body.to_city, True)
     if not fstations or not tstations:
         raise HTTPException(400, "车站/城市不存在，请先在“爬取数据”页更新车站站名表")
-    job_id = uuid.uuid4().hex[:8]
-    jobs[job_id] = {"status": "running", "done": 0, "total": 0, "phase": "init",
-                    "current": "", "log": [], "errors": [], "result": {}}
-    threading.Thread(target=_route_job, args=(job_id, body.from_city, body.to_city,
+    job_id, ev = _create_job({"status": "running", "done": 0, "total": 0, "phase": "init",
+                               "current": "", "log": [], "errors": [], "result": {}})
+    threading.Thread(target=_route_job, args=(job_id, ev, body.from_city, body.to_city,
                                               body.date, body.deep), daemon=True).start()
     return {"job_id": job_id,
             "from_stations": [s["name"] for s in fstations],
@@ -359,15 +441,25 @@ def prices(train_no: str):
     return db.rows("SELECT * FROM prices WHERE train_no=? ORDER BY train_date DESC, seat_type", (train_no,))
 
 
+@app.delete("/api/cache")
+def clear_cache(before_date: str | None = None, include_raw: bool = False):
+    return {"deleted": db.clear_cache(before_date or None, include_raw)}
+
+
 # ---------- 换乘搜索 ----------
 @app.get("/api/transfers")
 def transfers(from_station: str, to_station: str, date: str,
               min_wait: int = 30, max_wait: int = 360, limit: int = 0,
-              max_legs: int = 2, expand_city: bool = True):
+              max_legs: int = 2, expand_city: bool = True,
+              cross_extra: int = 60, frontier_k: int = 8):
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
+    if cross_extra < 0 or cross_extra > 360:
+        raise HTTPException(400, "cross_extra 必须在 0-360 之间")
+    if frontier_k < 1 or frontier_k > 32:
+        raise HTTPException(400, "frontier_k 必须在 1-32 之间")
     return _run(transfer.search, from_station, to_station, date,
-                min_wait, max_wait, limit, max_legs, expand_city)
+                min_wait, max_wait, limit, max_legs, expand_city, cross_extra, frontier_k)
 
 
 # ---------- 方案票价/余票实时查询 ----------
@@ -403,73 +495,100 @@ def plan_tickets(body: PlanTicketsReq):
         legs.append({"key": "|".join(key), "train_no": l.train_no, "from": f, "to": t, "date": l.date})
     if not legs:
         raise HTTPException(400, "没有可查询的行程段")
-    job_id = uuid.uuid4().hex[:8]
-    jobs[job_id] = {"status": "running", "done": 0, "total": 0, "errors": [], "result": {}}
-    threading.Thread(target=_plan_tickets_job, args=(job_id, legs), daemon=True).start()
+    job_id, ev = _create_job({"status": "running", "done": 0, "total": 0, "errors": [], "result": {}})
+    threading.Thread(target=_plan_tickets_job, args=(job_id, ev, legs), daemon=True).start()
     return {"job_id": job_id, "legs": len(legs)}
 
 
-def _plan_tickets_job(job_id: str, legs: list[dict]):
-    job = jobs[job_id]
-    today = date.today().isoformat()
-    pairs = list(dict.fromkeys((l["from"], l["to"], l["date"]) for l in legs))
-    job["total"] = len(pairs)
-    for f, t, d in pairs:
-        # 已过去的日期不再实时查询，仅用已入库缓存
-        if d >= today:
+def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
+    crawler.set_cancel_event(ev)
+    try:
+        today = db.cn_today().isoformat()
+        pairs = list(dict.fromkeys((l["from"], l["to"], l["date"]) for l in legs))
+        _job_update(job_id, total=len(pairs))
+        for f, t, d in pairs:
+            if ev.is_set():
+                _job_update(job_id, status="cancelled")
+                return
+            # 已过去的日期不再实时查询，仅用已入库缓存
+            if d >= today:
+                try:
+                    crawler.crawl_tickets(f, t, d)
+                except CrawlCancelled:
+                    _job_update(job_id, status="cancelled")
+                    return
+                except Exception as e:
+                    _job_append(job_id, "errors", f"{f}→{t} {d}: {e}")
+            _job_inc(job_id, "done")
+
+        tk = {}
+        for f, t, d in pairs:
+            for r in db.rows("""SELECT * FROM tickets WHERE from_telecode=? AND to_telecode=? AND train_date=?""",
+                             (f, t, d)):
+                tk[(r["train_no"], f, t, d)] = r
+
+        sno = transfer._load_sno()
+        need = {}
+        for l in legs:
+            r = tk.get((l["train_no"], l["from"], l["to"], l["date"]))
+            fno = (r["from_station_no"] if r else None) or sno.get((l["train_no"], l["from"]))
+            tno = (r["to_station_no"] if r else None) or sno.get((l["train_no"], l["to"]))
+            l["fno"], l["tno"] = fno, tno
+            if not fno or not tno or l["date"] < today:
+                continue
+            fno, tno = str(fno).zfill(2), str(tno).zfill(2)
+            if db.rows("SELECT 1 FROM prices WHERE train_no=? AND from_station_no=? AND to_station_no=? AND train_date=? LIMIT 1",
+                       (l["train_no"], fno, tno, l["date"])):
+                continue
+            need.setdefault((l["train_no"], fno, tno, l["date"]), (r["seat_types"] if r else "") or "")
+        with _jobs_lock:
+            cur_total = jobs[job_id]["total"]
+        _job_update(job_id, total=cur_total + len(need))
+        for (tn, fno, tno, d), st in need.items():
+            if ev.is_set():
+                _job_update(job_id, status="cancelled")
+                return
             try:
-                crawler.crawl_tickets(f, t, d)
+                crawler.crawl_price(tn, fno, tno, st, d)
+            except CrawlCancelled:
+                _job_update(job_id, status="cancelled")
+                return
             except Exception as e:
-                job["errors"].append(f"{f}→{t} {d}: {e}")
-        job["done"] += 1
+                _job_append(job_id, "errors", f"票价 {tn} {fno}→{tno}: {e}")
+            _job_inc(job_id, "done")
 
-    tk = {}
-    for f, t, d in pairs:
-        for r in db.rows("""SELECT * FROM tickets WHERE from_telecode=? AND to_telecode=? AND train_date=?""",
-                         (f, t, d)):
-            tk[(r["train_no"], f, t, d)] = r
-
-    sno = {(r["train_no"], r["telecode"]): r["station_no"]
-           for r in db.rows("SELECT train_no,telecode,station_no FROM train_stops WHERE telecode IS NOT NULL")}
-    need = {}
-    for l in legs:
-        r = tk.get((l["train_no"], l["from"], l["to"], l["date"]))
-        fno = (r["from_station_no"] if r else None) or sno.get((l["train_no"], l["from"]))
-        tno = (r["to_station_no"] if r else None) or sno.get((l["train_no"], l["to"]))
-        l["fno"], l["tno"] = fno, tno
-        if not fno or not tno or l["date"] < today:
-            continue
-        fno, tno = str(fno).zfill(2), str(tno).zfill(2)
-        if db.rows("SELECT 1 FROM prices WHERE train_no=? AND from_station_no=? AND to_station_no=? LIMIT 1",
-                   (l["train_no"], fno, tno)):
-            continue
-        need.setdefault((l["train_no"], fno, tno, l["date"]), (r["seat_types"] if r else "") or "")
-    job["total"] += len(need)
-    for (tn, fno, tno, d), st in need.items():
-        try:
-            crawler.crawl_price(tn, fno, tno, st, d)
-        except Exception as e:
-            job["errors"].append(f"票价 {tn} {fno}→{tno}: {e}")
-        job["done"] += 1
-
-    out = {}
-    for l in legs:
-        res = {}
-        r = tk.get((l["train_no"], l["from"], l["to"], l["date"]))
-        if r:
-            res["seats"] = json.loads(r["seats"] or "{}")
-            res["can_web_buy"] = r["can_web_buy"]
-        else:
-            res["error"] = "当日该区间余票查询中无此车次"
-        if l.get("fno") and l.get("tno"):
-            pr = db.rows("""SELECT seat_name,price FROM prices WHERE train_no=? AND from_station_no=?
-                            AND to_station_no=? ORDER BY price""",
-                         (l["train_no"], str(l["fno"]).zfill(2), str(l["tno"]).zfill(2)))
-            if pr:
-                res["prices"] = [{"seat": x["seat_name"], "price": x["price"]} for x in pr]
-        out[l["key"]] = res
-    job["result"] = out
-    job["status"] = "done"
+        out = {}
+        for l in legs:
+            res = {}
+            r = tk.get((l["train_no"], l["from"], l["to"], l["date"]))
+            if r:
+                res["seats"] = json.loads(r["seats"] or "{}")
+                res["can_web_buy"] = r["can_web_buy"]
+            else:
+                res["error"] = "当日该区间余票查询中无此车次"
+            if l.get("fno") and l.get("tno"):
+                fno_s, tno_s = str(l["fno"]).zfill(2), str(l["tno"]).zfill(2)
+                pr = db.rows("""SELECT seat_type,seat_name,price,train_date FROM prices
+                                WHERE train_no=? AND from_station_no=? AND to_station_no=? AND train_date=?
+                                ORDER BY price""",
+                             (l["train_no"], fno_s, tno_s, l["date"]))
+                if not pr:
+                    pr = db.rows("""SELECT seat_type,seat_name,price,train_date FROM prices
+                                    WHERE train_no=? AND from_station_no=? AND to_station_no=?
+                                    AND train_date=(SELECT MAX(train_date) FROM prices WHERE train_no=? AND from_station_no=? AND to_station_no=?)
+                                    ORDER BY price""",
+                                 (l["train_no"], fno_s, tno_s, l["train_no"], fno_s, tno_s))
+                if pr:
+                    res["prices"] = [{"seat_type": x["seat_type"], "seat": x["seat_name"], "price": x["price"]} for x in pr]
+                    if pr[0]["train_date"]:
+                        res["price_date"] = pr[0]["train_date"]
+                        if pr[0]["train_date"] != l["date"]:
+                            res["price_stale"] = True
+            out[l["key"]] = res
+        _job_update(job_id, result=out, status="done")
+    finally:
+        crawler.set_cancel_event(None)
+        db.close_conn()
 
 
 app.mount("/static", StaticFiles(directory=STATIC), name="static")

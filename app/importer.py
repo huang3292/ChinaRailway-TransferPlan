@@ -13,12 +13,14 @@ def ingest(text: str, api_type: str | None = None, ctx: dict | None = None,
     if api_type not in API_TYPES:
         raise ValueError(f"未知类型 {api_type}，可选：{API_TYPES}")
 
+    extra_prices = []
     if api_type == "stations":
         records = parsers.parse_stations(text)
     else:
         payload = json.loads(text)
         if api_type == "left_ticket":
             records = parsers.parse_left_ticket(payload, ctx)
+            extra_prices = parsers.parse_left_ticket_prices(payload, ctx)
         elif api_type == "price":
             records = parsers.parse_price(payload, ctx)
         elif api_type == "train_stops":
@@ -28,6 +30,8 @@ def ingest(text: str, api_type: str | None = None, ctx: dict | None = None,
 
     raw_id = db.archive_raw(api_type, text, ctx, source)
     count = _save(api_type, records, raw_id)
+    if extra_prices:
+        _save("price", extra_prices, raw_id)
     return {"api_type": api_type, "parsed": len(records), "saved": count, "raw_id": raw_id}
 
 
