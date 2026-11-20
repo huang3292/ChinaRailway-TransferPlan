@@ -6,10 +6,125 @@ import uuid
 from datetime import date as dt_date
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+try:
+    from fastapi import FastAPI, HTTPException, UploadFile
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+    from pydantic import BaseModel
+except ImportError:
+    import types as _types
+    from typing import Any as _Any, Union as _Union, get_args as _get_args, get_origin as _get_origin, get_type_hints as _get_type_hints
+
+    class HTTPException(Exception):
+        def __init__(self, status_code: int, detail: str = ""):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    class UploadFile:
+        def __init__(self, filename: str = "", content: bytes = b""):
+            self.filename = filename
+            self._content = content
+
+        async def read(self) -> bytes:
+            return self._content
+
+    class FileResponse:
+        def __init__(self, path):
+            self.path = str(path)
+
+    class StaticFiles:
+        def __init__(self, directory):
+            self.directory = str(directory)
+
+    def _coerce_field(val, tp):
+        if tp is None or tp is _Any:
+            return val
+        origin = _get_origin(tp)
+        if origin in (_types.UnionType, _Union):
+            args = _get_args(tp)
+            if val is None and any(a is type(None) for a in args):
+                return None
+            non_none = [a for a in args if a is not type(None)]
+            if val == "" and len(non_none) == 1 and non_none[0] in (int, float):
+                return None
+            if len(non_none) == 1:
+                return _coerce_field(val, non_none[0])
+            return val
+        if origin is list:
+            item_tp = (_get_args(tp) or (_Any,))[0]
+            return [_coerce_field(x, item_tp) for x in (val or [])]
+        if isinstance(tp, type) and issubclass(tp, BaseModel) and isinstance(val, dict):
+            return tp(**val)
+        if tp is bool and not isinstance(val, bool):
+            return str(val).strip().lower() in ("1", "true", "yes", "on") if isinstance(val, str) else bool(val)
+        if tp is int and not isinstance(val, int):
+            return int(val)
+        if tp is float and not isinstance(val, float):
+            return float(val)
+        return val
+
+    class BaseModel:
+        def __init__(self, **kw):
+            cls = self.__class__
+            try:
+                hints = _get_type_hints(cls, globalns=globals(), localns=locals())
+            except Exception:
+                hints = dict(getattr(cls, "__annotations__", {}))
+            for k, tp in hints.items():
+                if k in kw:
+                    setattr(self, k, _coerce_field(kw[k], tp))
+                elif hasattr(cls, k):
+                    val = getattr(cls, k)
+                    setattr(self, k, list(val) if isinstance(val, list) else dict(val) if isinstance(val, dict) else val)
+                else:
+                    raise ValueError(f"缺少必填字段: {k}")
+            for k, v in kw.items():
+                if k not in hints:
+                    setattr(self, k, v)
+
+        def model_dump(self, exclude=None):
+            ex = exclude or set()
+            return {k: v for k, v in self.__dict__.items() if k not in ex}
+
+    class _Route:
+        def __init__(self, methods: set[str], path: str, endpoint):
+            self.methods = methods
+            self.path = path
+            self.endpoint = endpoint
+
+    class FastAPI:
+        def __init__(self, title: str = ""):
+            self.title = title
+            self.routes: list[_Route] = []
+            self.startup_handlers: list = []
+            self.mounts: list[tuple[str, StaticFiles]] = []
+
+        def on_event(self, event: str):
+            def _dec(fn):
+                if event == "startup":
+                    self.startup_handlers.append(fn)
+                return fn
+            return _dec
+
+        def _add(self, method: str, path: str):
+            def _dec(fn):
+                self.routes.append(_Route({method}, path, fn))
+                return fn
+            return _dec
+
+        def get(self, path: str):
+            return self._add("GET", path)
+
+        def post(self, path: str):
+            return self._add("POST", path)
+
+        def delete(self, path: str):
+            return self._add("DELETE", path)
+
+        def mount(self, path: str, app_obj, name: str = ""):
+            self.mounts.append((path.rstrip("/"), app_obj))
+
 
 from . import db, importer, transfer
 from .crawler import CrawlCancelled, CrawlError, crawler, station_timetable_context
@@ -562,20 +677,46 @@ def clear_cache(before_date: str | None = None, include_raw: bool = False):
 
 
 # ---------- 换乘搜索 ----------
-@app.get("/api/transfers")
-def transfers(from_station: str, to_station: str, date: str,
-              min_wait: int = 30, max_wait: int = 360, limit: int = 0,
-              max_legs: int = 2, expand_city: bool = True,
-              cross_extra: int = 60, frontier_k: int = 8):
+def _validate_search_params(date: str, max_legs: int, cross_extra: int,
+                            frontier_k: int | None, prune_level: str,
+                            max_total_min: int | None, detour_ratio: float | None):
     _check_date(date)
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
     if cross_extra < 0 or cross_extra > 360:
         raise HTTPException(400, "cross_extra 必须在 0-360 之间")
-    if frontier_k < 1 or frontier_k > 32:
+    if frontier_k is not None and (frontier_k < 1 or frontier_k > 32):
         raise HTTPException(400, "frontier_k 必须在 1-32 之间")
-    return _run(transfer.search, from_station, to_station, date,
-                min_wait, max_wait, limit, max_legs, expand_city, cross_extra, frontier_k)
+    if prune_level not in ("strict", "balanced", "relaxed", "custom"):
+        raise HTTPException(400, "prune_level 必须为 strict / balanced / relaxed / custom")
+    if max_total_min is not None and (max_total_min < 60 or max_total_min > 10080):
+        raise HTTPException(400, "max_total_min 必须在 60-10080 分钟之间")
+    if detour_ratio is not None and (detour_ratio < 0 or detour_ratio > 20):
+        raise HTTPException(400, "detour_ratio 必须在 0-20 之间")
+
+
+@app.get("/api/transfers")
+def transfers(from_station: str, to_station: str, date: str,
+              min_wait: int = 30, max_wait: int = 360, limit: int = 0,
+              max_legs: int = 2, expand_city: bool = True,
+              cross_extra: int = 60, frontier_k: int | None = None,
+              prune_level: str = "balanced",
+              max_total_min: int | None = None,
+              detour_ratio: float | None = None,
+              prune_dominated: bool | None = None,
+              allow_cross_station: bool = True,
+              allow_prefixes: str = "",
+              exclude_prefixes: str = "",
+              include_stations: str = "",
+              exclude_stations: str = ""):
+    _validate_search_params(date, max_legs, cross_extra, frontier_k, prune_level, max_total_min, detour_ratio)
+    return _run(
+        transfer.search, from_station, to_station, date,
+        min_wait, max_wait, limit, max_legs, expand_city, cross_extra, frontier_k,
+        prune_level, max_total_min, detour_ratio, prune_dominated,
+        allow_cross_station, allow_prefixes, exclude_prefixes,
+        include_stations, exclude_stations,
+    )
 
 
 class TransferSearchReq(BaseModel):
@@ -588,12 +729,24 @@ class TransferSearchReq(BaseModel):
     max_legs: int = 2
     expand_city: bool = True
     cross_extra: int = 60
-    frontier_k: int = 8
+    frontier_k: int | None = None
+    prune_level: str = "balanced"
+    max_total_min: int | None = None
+    detour_ratio: float | None = None
+    prune_dominated: bool | None = None
+    allow_cross_station: bool = True
+    allow_prefixes: str = ""
+    exclude_prefixes: str = ""
+    include_stations: str = ""
+    exclude_stations: str = ""
 
 
 def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchReq):
     def on_prog(done: int, total: int, cur: str):
-        _job_update(job_id, done=done, total=total, current=cur)
+        _job_update(job_id, done=done, total=total, sub_done=0, sub_total=0, current=cur)
+
+    def on_sub(s_done: int, s_total: int, cur: str):
+        _job_update(job_id, sub_done=s_done, sub_total=s_total, current=cur)
 
     try:
         res = transfer.search(
@@ -601,12 +754,21 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
             min_wait=body.min_wait, max_wait=body.max_wait, limit=body.limit,
             max_legs=body.max_legs, expand_city=body.expand_city,
             cross_extra=body.cross_extra, frontier_k=body.frontier_k,
-            progress_cb=on_prog, cancel_event=ev,
+            prune_level=body.prune_level,
+            max_total_min=body.max_total_min,
+            detour_ratio=body.detour_ratio,
+            prune_dominated=body.prune_dominated,
+            allow_cross_station=body.allow_cross_station,
+            allow_prefixes=body.allow_prefixes,
+            exclude_prefixes=body.exclude_prefixes,
+            include_stations=body.include_stations,
+            exclude_stations=body.exclude_stations,
+            progress_cb=on_prog, cancel_event=ev, sub_cb=on_sub,
         )
         if ev.is_set():
             _job_update(job_id, status="cancelled")
         else:
-            _job_update(job_id, status="done", phase="done", result=res)
+            _job_update(job_id, status="done", phase="done", sub_done=0, sub_total=0, result=res)
     except transfer.SearchCancelled:
         _job_update(job_id, status="cancelled")
     except Exception as e:
@@ -618,13 +780,10 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
 @app.post("/api/transfers/start")
 def start_transfers(body: TransferSearchReq):
     """启动可实时查询进度与中途打断的换乘搜索任务。"""
-    _check_date(body.date)
-    if body.max_legs < 1 or body.max_legs > 6:
-        raise HTTPException(400, "max_legs 必须在 1-6 之间")
-    if body.cross_extra < 0 or body.cross_extra > 360:
-        raise HTTPException(400, "cross_extra 必须在 0-360 之间")
-    if body.frontier_k < 1 or body.frontier_k > 32:
-        raise HTTPException(400, "frontier_k 必须在 1-32 之间")
+    _validate_search_params(
+        body.date, body.max_legs, body.cross_extra, body.frontier_k,
+        body.prune_level, body.max_total_min, body.detour_ratio,
+    )
     fstations = db.resolve_stations(body.from_station, body.expand_city)
     tstations = db.resolve_stations(body.to_station, body.expand_city)
     if not fstations or not tstations:
@@ -633,6 +792,7 @@ def start_transfers(body: TransferSearchReq):
     total_steps = 6 if body.max_legs < 3 else 5 + (body.max_legs - 1)
     job_id, ev = _create_job({
         "status": "running", "phase": "search", "done": 0, "total": total_steps,
+        "sub_done": 0, "sub_total": 0,
         "current": "正在准备换乘搜索...", "errors": [], "result": {},
     })
     threading.Thread(target=_transfer_search_job, args=(job_id, ev, body), daemon=True).start()

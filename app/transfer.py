@@ -11,6 +11,7 @@ C. 站间余票（tickets）：精确日期的直达补充
 import json
 import math
 import re
+import time
 from datetime import date, datetime, timedelta
 
 from . import db, fare, parsers
@@ -140,7 +141,7 @@ def _enrich(leg: dict, train_no: str, fno, tno, ftc, ttc, dep_date: str,
 
 
 # ---------- 引擎 A：车站大屏（真实日期优先，无当日数据时按每日开行假设平移） ----------
-def _load_screen(train_filter: set[str] | None = None) -> dict:
+def _load_screen(train_filter: set[str] | None = None, cancel_event=None) -> dict:
     trains = {}
     if train_filter is not None:
         if not train_filter:
@@ -152,7 +153,9 @@ def _load_screen(train_filter: set[str] | None = None) -> dict:
             recs = [r for r in db.rows("SELECT * FROM station_trains") if r["train_no"] in train_filter]
     else:
         recs = db.rows("SELECT * FROM station_trains")
-    for r in recs:
+    for r_idx, r in enumerate(recs):
+        if (r_idx & 2047) == 0:
+            _check_cancel(cancel_event)
         tn = r["train_no"]
         if not tn:
             continue
@@ -261,8 +264,10 @@ def _ordered(a: dict, b: dict) -> bool:
     return a.get("no") is None or b.get("no") is None or a["no"] < b["no"]
 
 
-def _dep_keys(key, name, available, cities, exclude=frozenset()):
+def _dep_keys(key, name, available, cities, exclude=frozenset(), allow_cross=True):
     """同站 + 同城异站的候选出发站键（按物理站去重，排除指定站）。"""
+    if not allow_cross:
+        return [key]
     city_of, city_groups, tele_of = cities
     out = [key]
     c = city_of.get(key) or city_of.get(name or "")
@@ -271,6 +276,64 @@ def _dep_keys(key, name, available, cities, exclude=frozenset()):
         out += [x for x in sorted(city_groups[c])
                 if x in available and tele_of.get(x, x) != ck and tele_of.get(x, x) not in exclude]
     return out
+
+
+# ---------- 换乘树枝剪枝工具 ----------
+PRUNE_PRESETS = {
+    "strict":   {"frontier_k": 4,  "max_total_min": 1440, "detour_ratio": 2.0, "prune_dominated": True},
+    "balanced": {"frontier_k": 8,  "max_total_min": 2880, "detour_ratio": 0.0, "prune_dominated": False},
+    "relaxed":  {"frontier_k": 16, "max_total_min": 4320, "detour_ratio": 0.0, "prune_dominated": False},
+}
+
+
+def _train_codes(code: str | None) -> frozenset[str]:
+    """拆分合并车次号（如 G123/G126 -> {'G123', 'G126'}），用于严格判重。"""
+    if not code:
+        return frozenset()
+    return frozenset(p.strip().upper() for p in str(code).split("/") if p.strip())
+
+
+def _parse_tokens(s: str | None) -> list[str]:
+    if not s:
+        return []
+    return [x.strip().upper() for x in re.split(r"[,，\s]+", str(s)) if x.strip()]
+
+
+def _match_prefix(code: str | None, prefixes: list[str]) -> bool:
+    if not prefixes:
+        return True
+    parts = _train_codes(code)
+    return any(part.startswith(px) for part in parts for px in prefixes)
+
+
+def _match_station_tokens(key, name: str | None, city_of: dict, tele_of: dict, tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    tc = str(tele_of.get(key, key) or "").upper()
+    nm = str(name or key or "").upper()
+    ct = str(city_of.get(key) or city_of.get(name or "") or "").upper()
+    for tok in tokens:
+        ct_tok = tok[:-1] if tok.endswith("市") and len(tok) > 1 else tok
+        if tok == tc or (nm and (tok in nm or nm in tok)) or (ct and (ct_tok in ct or ct in ct_tok)):
+            return True
+    return False
+
+
+def _city_of_key(key, name: str | None, city_of: dict, tele_of: dict) -> str:
+    return city_of.get(key) or (city_of.get(name) if name else None) or tele_of.get(key, key)
+
+
+def _code_allowed(code: str | None, inc_pfx: list[str], exc_pfx: list[str]) -> bool:
+    if inc_pfx and not _match_prefix(code, inc_pfx):
+        return False
+    if exc_pfx and _match_prefix(code, exc_pfx):
+        return False
+    return True
+
+
+def _add_prune(stats: dict | None, key: str, delta: int = 1):
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + delta
 
 
 def _fig_valid(t: dict, query_date: str) -> bool:
@@ -285,7 +348,16 @@ def _fig_valid(t: dict, query_date: str) -> bool:
 
 
 def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait,
-                   prices, seats, cal, sno, cities, cross_extra=60, cancel_event=None):
+                   prices, seats, cal, sno, cities, cross_extra=60, cancel_event=None,
+                   prune_cfg=None, prune_stats=None, sub_cb=None):
+    prune_cfg = prune_cfg or {}
+    inc_pfx = prune_cfg.get("allow_prefixes", [])
+    exc_pfx = prune_cfg.get("exclude_prefixes", [])
+    inc_st = prune_cfg.get("include_stations", [])
+    exc_st = prune_cfg.get("exclude_stations", [])
+    allow_cross = prune_cfg.get("allow_cross_station", True)
+    max_total_min = prune_cfg.get("max_total_min", 2880)
+
     by_station = {}
     for tn, t in trains.items():
         for k in t["obs"]:
@@ -298,7 +370,7 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
             to_obs[tn] = hits
 
     at_from = list(dict.fromkeys(tn for k in fkeys for tn in by_station.get(k, ())))
-    tele_of = cities[2]
+    city_of, _, tele_of = cities
     exact = set()
     for tn in at_from:
         for k in fkeys:
@@ -323,8 +395,12 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
 
     direct, transfers = [], []
     sorted_fkeys = sorted(fkeys)
-    for tn in at_from:
+    n_at_from = len(at_from)
+    for f_idx, tn in enumerate(at_from, 1):
         _check_cancel(cancel_event)
+        if sub_cb is not None:
+            sub_cb(f_idx, max(1, n_at_from),
+                   f"计算大屏直达/换乘（{len(trains)} 班次）：始发 {f_idx}/{n_at_from}，候选 {len(direct) + len(transfers)} 个")
         t = trains[tn]
         fo_cands, seen_phys = [], set()
         for k in sorted_fkeys:
@@ -346,11 +422,20 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
                         seen_phys.add(phys)
                         fo_cands.append((o, day_min - (o["dep"] // 1440) * 1440))
         for fo, shift in fo_cands:
+            a_code = fo.get("code") or t["code"]
+            if not _code_allowed(a_code, inc_pfx, exc_pfx):
+                _add_prune(prune_stats, "custom_rule")
+                continue
+            a_codes = _train_codes(a_code)
             a_dep = fo["dep"] + shift
             assumed = (shift != 0) or bool(fo.get("bridged"))
             for _k, to in to_obs.get(tn, ()):
                 if to["arr"] + shift > a_dep and _ordered(fo, to):
-                    direct.append({"total_min": to["arr"] - fo["dep"],
+                    dur = to["arr"] - fo["dep"]
+                    if max_total_min and dur > max_total_min:
+                        _add_prune(prune_stats, "total_time")
+                        continue
+                    direct.append({"total_min": dur,
                                    "date_assumed": assumed or bool(to.get("bridged")),
                                    "source_date": t.get("source_date"),
                                    "legs": [leg(tn, t, fo, to, shift)]})
@@ -358,11 +443,15 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
             if fo.get("no") is not None:
                 before_from |= {k2 for k2, o2 in t["obs"].items()
                                 if o2.get("no") is not None and o2["no"] < fo["no"]}
+            from_city = _city_of_key(fo.get("telecode") or fo.get("name"), fo.get("name"), city_of, tele_of)
             for sk, so in t["obs"].items():
                 if sk in fkeys or sk in tkeys or "arr" not in so or not _ordered(fo, so):
                     continue
                 a_arr_s = so["arr"] + shift
                 if a_arr_s <= a_dep:
+                    continue
+                if exc_st and _match_station_tokens(sk, so.get("name"), city_of, tele_of, exc_st):
+                    _add_prune(prune_stats, "custom_rule")
                     continue
                 forbidden = before_from | {sk}
                 passed_canon = {tele_of.get(k2, k2) for k2 in before_from}
@@ -370,18 +459,37 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
                     passed = {k2 for k2, o2 in t["obs"].items()
                               if o2.get("no") is not None and fo["no"] <= o2["no"] < so["no"]}
                     if passed & tkeys:
+                        _add_prune(prune_stats, "passed_dest")
                         continue  # 换乘前已越过到达站，属于折返
                     forbidden |= passed
                     passed_canon |= {tele_of.get(k2, k2) for k2 in passed}
-                for dk in _dep_keys(sk, so.get("name"), available, cities, exclude=passed_canon):
+                s_city = _city_of_key(sk, so.get("name"), city_of, tele_of)
+                closed_cities = {from_city} if s_city != from_city else set()
+                for dk in _dep_keys(sk, so.get("name"), available, cities, exclude=passed_canon, allow_cross=allow_cross):
                     same = dk == sk
+                    if inc_st and not (
+                        _match_station_tokens(sk, so.get("name"), city_of, tele_of, inc_st)
+                        or _match_station_tokens(dk, None, city_of, tele_of, inc_st)
+                    ):
+                        _add_prune(prune_stats, "custom_rule")
+                        continue
+                    if exc_st and not same and _match_station_tokens(dk, None, city_of, tele_of, exc_st):
+                        _add_prune(prune_stats, "custom_rule")
+                        continue
                     eff_min = min_wait if same else min_wait + cross_extra
                     for bn in by_station.get(dk, ()):
-                        if bn[0] == tn[0]:
+                        if bn not in to_obs:
                             continue
                         b = trains[bn]
                         bs = b["obs"].get(dk)
                         if not bs or "dep" not in bs:
+                            continue
+                        b_code = bs.get("code") or b["code"]
+                        if bn[0] == tn[0] or (a_codes and (a_codes & _train_codes(b_code))):
+                            _add_prune(prune_stats, "repeat_train")
+                            continue
+                        if not _code_allowed(b_code, inc_pfx, exc_pfx):
+                            _add_prune(prune_stats, "custom_rule")
                             continue
                         n = math.ceil((a_arr_s + eff_min - bs["dep"]) / 1440)
                         wait = bs["dep"] + n * 1440 - a_arr_s
@@ -393,16 +501,27 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
                         b_dep = bs["dep"] + n * 1440
                         for tk2, bt in to_obs.get(bn, ()):
                             if tk2 == dk or tk2 in forbidden or not _ordered(bs, bt) or bt["arr"] + n * 1440 <= b_dep:
+                                _add_prune(prune_stats, "loopback")
                                 continue
                             # 第二程重新经过出发站/第一程走过的站 = 无意义折返
                             if bs.get("no") is not None and bt.get("no") is not None:
                                 if any(k2 in forbidden and o2.get("no") is not None
                                        and bs["no"] < o2["no"] <= bt["no"] for k2, o2 in b["obs"].items()):
+                                    _add_prune(prune_stats, "loopback")
                                     continue
+                            # 已离开前面城市后再返回该城市（不含终到恰好为同城站）属于绕圈折返
+                            bt_city = _city_of_key(tk2, bt.get("name"), city_of, tele_of)
+                            if bt_city in closed_cities and tk2 not in tkeys:
+                                _add_prune(prune_stats, "city_loop")
+                                continue
+                            total_min = bt["arr"] + n * 1440 - a_dep
+                            if max_total_min and total_min > max_total_min:
+                                _add_prune(prune_stats, "total_time")
+                                continue
                             is_assumed = (assumed or n != 0 or bool(so.get("bridged"))
                                           or bool(bs.get("bridged")) or bool(bt.get("bridged")))
                             transfers.append({
-                                "total_min": bt["arr"] + n * 1440 - a_dep, "wait_min": wait,
+                                "total_min": total_min, "wait_min": wait,
                                 "transfer_station": so.get("name") or sk, "same_station": same,
                                 "date_assumed": is_assumed,
                                 "source_date": t.get("source_date") or b.get("source_date"),
@@ -422,7 +541,7 @@ class Train:
         self.stops = stops
 
 
-def _load_trains(train_filter: set[str] | None = None) -> list[Train]:
+def _load_trains(train_filter: set[str] | None = None, cancel_event=None, sub_cb=None) -> list[Train]:
     if train_filter is not None:
         if not train_filter:
             return []
@@ -443,7 +562,12 @@ def _load_trains(train_filter: set[str] | None = None) -> list[Train]:
                           FROM train_stops ORDER BY train_no, train_date DESC, station_no""")
     trains, seen = [], set()
     cur_no, cur_date, stops, code = None, None, [], None
-    for r in recs:
+    n_recs = len(recs)
+    for r_idx, r in enumerate(recs, 1):
+        if (r_idx & 2047) == 0 or r_idx == n_recs:
+            _check_cancel(cancel_event)
+            if sub_cb is not None:
+                sub_cb(r_idx, max(1, n_recs), f"加载大屏与时刻表缓存：解析停站 {r_idx}/{n_recs}")
         if (r["train_no"], r["train_date"]) != (cur_no, cur_date):
             if stops and cur_no not in seen:
                 seen.add(cur_no)
@@ -454,7 +578,9 @@ def _load_trains(train_filter: set[str] | None = None) -> list[Train]:
     if stops and cur_no not in seen:
         trains.append(Train(cur_no, code, cur_date, stops))
 
-    for t in trains:
+    for t_idx, t in enumerate(trains):
+        if (t_idx & 511) == 0:
+            _check_cancel(cancel_event)
         day, prev = 0, None
         for s in t.stops:
             arr, dep = _minutes(s["arrive_time"]), _minutes(s["start_time"])
@@ -477,11 +603,45 @@ def _load_trains(train_filter: set[str] | None = None) -> list[Train]:
 
 
 def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, seats, cal, sno, cities,
-                      cross_extra=60, cancel_event=None):
-    available = {s["key"] for t in trains for s in t.stops}
+                      cross_extra=60, cancel_event=None, prune_cfg=None, prune_stats=None,
+                      sub_cb=None, sub_cap: int = 100):
+    prune_cfg = prune_cfg or {}
+    inc_pfx = prune_cfg.get("allow_prefixes", [])
+    exc_pfx = prune_cfg.get("exclude_prefixes", [])
+    inc_st = prune_cfg.get("include_stations", [])
+    exc_st = prune_cfg.get("exclude_stations", [])
+    allow_cross = prune_cfg.get("allow_cross_station", True)
+    max_total_min = prune_cfg.get("max_total_min", 2880)
+    city_of, _, tele_of = cities
 
     def find_idx(t, keys):
         return [i for i, s in enumerate(t.stops) if s["key"] in keys and s["enabled"]]
+
+    # 预建站点与终点倒排索引，避免全量车次下 O(N^2) 扫描
+    available = set()
+    from_cands = []
+    b_at_station = {}
+    n_trains = len(trains)
+    phase1_cap = max(1, (sub_cap * 15) // 100)
+    for t_idx, T in enumerate(trains, 1):
+        if (t_idx & 63) == 0 or t_idx == n_trains:
+            _check_cancel(cancel_event)
+            if sub_cb is not None:
+                sub_cb(int(t_idx * phase1_cap / max(1, n_trains)), 100,
+                       f"计算时刻表直达/换乘（{n_trains} 车次）：建索引 {t_idx}/{n_trains}")
+        for s in T.stops:
+            available.add(s["key"])
+        if not _code_allowed(T.code, inc_pfx, exc_pfx):
+            _add_prune(prune_stats, "custom_rule")
+            continue
+        fi = find_idx(T, fkeys)
+        tj = find_idx(T, tkeys)
+        if fi:
+            from_cands.append((T, fi, tj))
+        if tj:
+            for k, s in enumerate(T.stops):
+                if s["enabled"]:
+                    b_at_station.setdefault(s["key"], []).append((T, k, tj))
 
     def leg(t, i, j, shift):
         a, b = t.stops[i], t.stops[j]
@@ -496,62 +656,93 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
             code=t.code, duration_min=b["arr"] - a["dep"], cal=cal, sno=sno)
 
     direct, transfers = [], []
-    for A in trains:
+    n_from = len(from_cands)
+    phase2_span = max(1, sub_cap - phase1_cap)
+    for a_idx, (A, fi, tj) in enumerate(from_cands, 1):
         _check_cancel(cancel_event)
-        fi = find_idx(A, fkeys)
-        if not fi:
-            continue
-        tj = find_idx(A, tkeys)
+        if sub_cb is not None:
+            sub_cb(phase1_cap + int(a_idx * phase2_span / max(1, n_from)), 100,
+                   f"计算时刻表直达/换乘（{n_trains} 车次）：匹配始发 {a_idx}/{n_from}，候选 {len(direct) + len(transfers)} 个")
+        a_codes = _train_codes(A.code)
         for i in fi:
             shift_a = -(A.stops[i]["dep"] // 1440) * 1440
             a_dep = A.stops[i]["dep"] + shift_a
             for j in tj:
                 if j > i:
                     l = leg(A, i, j, shift_a)
+                    if max_total_min and l["duration_min"] > max_total_min:
+                        _add_prune(prune_stats, "total_time")
+                        continue
                     direct.append({"total_min": l["duration_min"], "date_assumed": True,
                                    "source_date": A.train_date, "legs": [l]})
             for s_idx in range(i + 1, len(A.stops)):
+                _check_cancel(cancel_event)
                 S = A.stops[s_idx]
                 if not S["enabled"]:
                     continue
                 if S["key"] in tkeys:
+                    _add_prune(prune_stats, "passed_dest")
                     break  # 已到到达站，再往后换乘属于折返
+                if exc_st and _match_station_tokens(S["key"], S["station_name"], city_of, tele_of, exc_st):
+                    _add_prune(prune_stats, "custom_rule")
+                    continue
                 forbidden = {A.stops[x]["key"] for x in range(i, s_idx)}
+                s_city = _city_of_key(S["key"], S["station_name"], city_of, tele_of)
+                closed_cities = {
+                    _city_of_key(A.stops[x]["key"], A.stops[x]["station_name"], city_of, tele_of)
+                    for x in range(i, s_idx)
+                } - {s_city}
                 a_arr_s = S["arr"] + shift_a
                 for dk in _dep_keys(S["key"], S["station_name"], available, cities,
-                                    exclude={cities[2].get(x, x) for x in forbidden}):
+                                    exclude={tele_of.get(x, x) for x in forbidden}, allow_cross=allow_cross):
                     same = dk == S["key"]
+                    if inc_st and not (
+                        _match_station_tokens(S["key"], S["station_name"], city_of, tele_of, inc_st)
+                        or _match_station_tokens(dk, None, city_of, tele_of, inc_st)
+                    ):
+                        _add_prune(prune_stats, "custom_rule")
+                        continue
+                    if exc_st and not same and _match_station_tokens(dk, None, city_of, tele_of, exc_st):
+                        _add_prune(prune_stats, "custom_rule")
+                        continue
                     eff_min = min_wait if same else min_wait + cross_extra
-                    for B in trains:
-                        if B.train_no == A.train_no:
+                    for B, k, b_all_to in b_at_station.get(dk, ()):
+                        if B.train_no == A.train_no or (a_codes and (a_codes & _train_codes(B.code))):
+                            _add_prune(prune_stats, "repeat_train")
                             continue
-                        b_s = [k for k, s in enumerate(B.stops) if s["key"] == dk and s["enabled"]]
-                        if not b_s:
+                        b_to = [m for m in b_all_to if m > k]
+                        if not b_to:
                             continue
-                        b_all_to = find_idx(B, tkeys)
-                        if not b_all_to:
+                        dep_base = B.stops[k]["dep"]
+                        n = math.ceil((a_arr_s + eff_min - dep_base) / 1440)
+                        wait = dep_base + n * 1440 - a_arr_s
+                        if wait > max_wait:
                             continue
-                        for k in b_s:
-                            b_to = [m for m in b_all_to if m > k]
-                            if not b_to:
+                        for m in b_to:
+                            # 第二程重新经过出发站/第一程走过的站/再次回到换乘站 = 无意义折返
+                            if any(B.stops[y]["key"] in forbidden or B.stops[y]["key"] == dk
+                                   for y in range(k + 1, m + 1)):
+                                _add_prune(prune_stats, "loopback")
                                 continue
-                            dep_base = B.stops[k]["dep"]
-                            n = math.ceil((a_arr_s + eff_min - dep_base) / 1440)
-                            wait = dep_base + n * 1440 - a_arr_s
-                            if wait > max_wait:
+                            if any(_city_of_key(B.stops[y]["key"], B.stops[y]["station_name"], city_of, tele_of) in closed_cities
+                                   and B.stops[y]["key"] not in tkeys
+                                   for y in range(k + 1, m + 1)):
+                                _add_prune(prune_stats, "city_loop")
                                 continue
-                            for m in b_to:
-                                # 第二程重新经过出发站/第一程走过的站/再次回到换乘站 = 无意义折返
-                                if any(B.stops[y]["key"] in forbidden or B.stops[y]["key"] == dk
-                                       for y in range(k + 1, m + 1)):
-                                    continue
-                                transfers.append({
-                                    "total_min": B.stops[m]["arr"] + n * 1440 - a_dep, "wait_min": wait,
-                                    "transfer_station": S["station_name"], "same_station": same,
-                                    "date_assumed": True,
-                                    "source_date": A.train_date or B.train_date,
-                                    "legs": [leg(A, i, s_idx, shift_a), leg(B, k, m, n * 1440)],
-                                })
+                            total_min = B.stops[m]["arr"] + n * 1440 - a_dep
+                            if max_total_min and total_min > max_total_min:
+                                _add_prune(prune_stats, "total_time")
+                                continue
+                            transfers.append({
+                                "total_min": total_min, "wait_min": wait,
+                                "transfer_station": S["station_name"], "same_station": same,
+                                "date_assumed": True,
+                                "source_date": A.train_date or B.train_date,
+                                "legs": [leg(A, i, s_idx, shift_a), leg(B, k, m, n * 1440)],
+                            })
+    if sub_cb is not None:
+        sub_cb(sub_cap, 100,
+               f"计算时刻表直达/换乘（{n_trains} 车次）：完成，候选 {len(direct) + len(transfers)} 个")
     return direct, transfers
 
 
@@ -560,10 +751,12 @@ MAX_TOTAL_MIN = 2880   # 总行程上限（分钟，48 小时），防止组合�
 FRONTIER_K = 8         # 每个站每层保留的最优到达状态数（剪枝）
 
 
-def _load_services(screen: dict, tt: list) -> list[dict]:
+def _load_services(screen: dict, tt: list, cancel_event=None) -> list[dict]:
     """把大屏与时刻表数据统一成“车次服务”，停站为相对始发的分钟数。"""
     services, seen = [], set()
-    for t in tt:
+    for t_idx, t in enumerate(tt):
+        if (t_idx & 511) == 0:
+            _check_cancel(cancel_event)
         if t.train_no in seen:
             continue
         seen.add(t.train_no)
@@ -572,7 +765,9 @@ def _load_services(screen: dict, tt: list) -> list[dict]:
                   "enabled": s.get("enabled", 1)} for s in t.stops]
         if len(stops) >= 2:
             services.append({"train_no": t.train_no, "code": t.code, "stops": stops})
-    for run, t in screen.items():
+    for r_idx, (run, t) in enumerate(screen.items()):
+        if (r_idx & 511) == 0:
+            _check_cancel(cancel_event)
         tn = run[0]
         if tn in seen:
             continue
@@ -608,19 +803,46 @@ def _load_services(screen: dict, tt: list) -> list[dict]:
 def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs,
                   prices, seats, cal, sno, cities, real_tk=None, n2c=None,
                   cross_extra=60, frontier_k=FRONTIER_K,
-                  cancel_event=None, depth_cb=None) -> list[dict]:
-    """BFS 多程换乘，返回 3..max_legs 程的换乘方案（含换乘段明细）。"""
+                  cancel_event=None, depth_cb=None,
+                  prune_cfg=None, prune_stats=None,
+                  init_sub_cb=None, depth_sub_cb=None) -> list[dict]:
+    """BFS 多程换乘，返回 3..max_legs 程的换乘方案（强制去重车次与折返，并应用自定义剪枝）。"""
     if max_legs < 3:
         return []
+    prune_cfg = prune_cfg or {}
+    inc_pfx = prune_cfg.get("allow_prefixes", [])
+    exc_pfx = prune_cfg.get("exclude_prefixes", [])
+    inc_st = prune_cfg.get("include_stations", [])
+    exc_st = prune_cfg.get("exclude_stations", [])
+    allow_cross = prune_cfg.get("allow_cross_station", True)
+    max_total_min = prune_cfg.get("max_total_min") or MAX_TOTAL_MIN
+    prune_dominated = bool(prune_cfg.get("prune_dominated", False))
+    detour_cap = prune_cfg.get("detour_cap")
+
     real_tk = real_tk or {}
     n2c = n2c or {}
+    city_of, _, tele_of = cities
     by_station = {}
+    to_service_ids = set()
+    n_sv = len(services)
     for si, sv in enumerate(services):
+        if (si & 127) == 0 or si + 1 == n_sv:
+            _check_cancel(cancel_event)
+            if init_sub_cb is not None:
+                init_sub_cb(int((si + 1) * 40 / max(1, n_sv)), 100,
+                            f"构建多程路网（{n_sv} 车次）：建索引 {si + 1}/{n_sv}")
+        if not _code_allowed(sv.get("code"), inc_pfx, exc_pfx):
+            _add_prune(prune_stats, "custom_rule")
+            continue
+        has_to = False
         for i, st in enumerate(sv["stops"]):
             if st["enabled"]:
                 by_station.setdefault(st["key"], []).append((si, i))
+                if st["key"] in tkeys:
+                    has_to = True
+        if has_to:
+            to_service_ids.add(si)
     available = set(by_station)
-    tele_of = cities[2]
 
     def leg_conflict(l: dict) -> bool:
         ftc = l.get("from_telecode") or n2c.get(l.get("from"))
@@ -642,26 +864,53 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
             _fmt_epoch(dep)[:10], prices, seats, code=sv["code"],
             duration_min=b["arr"] - a["dep"], cal=cal, sno=sno)
 
-    # 初始状态：从出发站坐首程，出发日 = 查询日
+    # 初始状态：从出发站坐首程，出发日 = 查询日（禁止把已到终点站或越过终点站的分支送入多程扩展）
     init = []
-    for fk in fkeys:
-        for si, i in by_station.get(fk, ()):
-            sv = services[si]
-            st = sv["stops"][i]
-            if st["key"] not in fkeys:
+    fk_items = [(si, i) for fk in fkeys for si, i in by_station.get(fk, ())]
+    n_fk = len(fk_items)
+    for idx, (si, i) in enumerate(fk_items, 1):
+        _check_cancel(cancel_event)
+        if init_sub_cb is not None:
+            init_sub_cb(40 + int(idx * 60 / max(1, n_fk)), 100,
+                        f"构建多程路网（{n_sv} 车次）：初始化首程 {idx}/{n_fk}，分支 {len(init)} 个")
+        sv = services[si]
+        st = sv["stops"][i]
+        if st["key"] not in fkeys:
+            continue
+        n0 = -(st["dep"] // 1440)
+        sv_codes = _train_codes(sv.get("code"))
+        for j in range(i + 1, len(sv["stops"])):
+            b = sv["stops"][j]
+            if not b["enabled"]:
                 continue
-            n0 = -(st["dep"] // 1440)
-            for j in range(i + 1, len(sv["stops"])):
-                b = sv["stops"][j]
-                if not b["enabled"]:
-                    continue
-                leg = make_leg(sv, i, j, n0)
-                if leg_conflict(leg):
-                    continue
-                passed = frozenset(sv["stops"][k]["key"] for k in range(i, j + 1))
-                init.append({"arr": _epoch(leg["arrive"]), "station": b["key"], "name": b["name"],
-                             "passed": passed, "legs": [leg], "transfers": [],
-                             "start": _epoch(leg["depart"]), "has_seats": "seats" in leg})
+            if b["key"] in tkeys or any(sv["stops"][k]["key"] in tkeys for k in range(i + 1, j)):
+                _add_prune(prune_stats, "passed_dest")
+                break  # 已到达或越过终点站，无需再走 3 程以上绕行
+            if exc_st and _match_station_tokens(b["key"], b["name"], city_of, tele_of, exc_st):
+                _add_prune(prune_stats, "custom_rule")
+                continue
+            leg = make_leg(sv, i, j, n0)
+            if max_total_min and leg["duration_min"] > max_total_min:
+                _add_prune(prune_stats, "total_time")
+                continue
+            if detour_cap and leg["duration_min"] > detour_cap:
+                _add_prune(prune_stats, "custom_rule")
+                continue
+            if leg_conflict(leg):
+                continue
+            passed = frozenset(tele_of.get(sv["stops"][k]["key"], sv["stops"][k]["key"]) for k in range(i, j + 1))
+            b_city = _city_of_key(b["key"], b["name"], city_of, tele_of)
+            closed_cities = frozenset(
+                _city_of_key(sv["stops"][k]["key"], sv["stops"][k]["name"], city_of, tele_of)
+                for k in range(i, j)
+            ) - frozenset((b_city,))
+            init.append({
+                "arr": _epoch(leg["arrive"]), "station": b["key"], "name": b["name"],
+                "passed": passed, "closed_cities": closed_cities,
+                "used_trains": frozenset((sv["train_no"],)), "used_codes": sv_codes,
+                "legs": [leg], "transfers": [],
+                "start": _epoch(leg["depart"]), "has_seats": "seats" in leg,
+            })
 
     results, frontier = [], init
     for depth in range(2, max_legs + 1):
@@ -669,18 +918,33 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
         if depth_cb is not None:
             depth_cb(depth, len(frontier))
         nxt = {}
-        for state in frontier:
+        n_front = len(frontier)
+        is_last = (depth == max_legs)
+        for s_idx, state in enumerate(frontier, 1):
             _check_cancel(cancel_event)
+            if depth_sub_cb is not None:
+                depth_sub_cb(depth, s_idx, max(1, n_front), len(results))
             t = state["arr"]
-            if t - state["start"] > MAX_TOTAL_MIN:
+            if t - state["start"] > max_total_min:
+                _add_prune(prune_stats, "total_time")
                 continue
-            exclude = frozenset(tele_of.get(x, x) for x in state["passed"])
-            for dk in _dep_keys(state["station"], state["name"], available, cities, exclude=exclude):
+            cur_city = _city_of_key(state["station"], state["name"], city_of, tele_of)
+            for dk in _dep_keys(state["station"], state["name"], available, cities,
+                                exclude=state["passed"], allow_cross=allow_cross):
                 same = dk == state["station"]
+                if exc_st and _match_station_tokens(dk, None, city_of, tele_of, exc_st):
+                    _add_prune(prune_stats, "custom_rule")
+                    continue
+                dk_city = _city_of_key(dk, None, city_of, tele_of)
                 eff_min = min_wait if same else min_wait + cross_extra
                 for si, i in by_station.get(dk, ()):
+                    if is_last and si not in to_service_ids:
+                        continue
                     sv = services[si]
-                    if sv["train_no"] == state["legs"][-1]["train_no"]:
+                    sv_codes = _train_codes(sv.get("code"))
+                    # 硬剪枝：同一方案内绝对禁止重复乘坐同 train_no 或同车次号
+                    if sv["train_no"] in state["used_trains"] or (sv_codes and (sv_codes & state["used_codes"])):
+                        _add_prune(prune_stats, "repeat_train")
                         continue
                     st_i = sv["stops"][i]
                     n = math.ceil((t + eff_min - (base_min + st_i["dep"])) / 1440)
@@ -688,16 +952,54 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                     wait = dep - t
                     if wait > max_wait:
                         continue
+                    left_dk_city = False
                     for j in range(i + 1, len(sv["stops"])):
                         b = sv["stops"][j]
-                        if not b["enabled"] or b["key"] in state["passed"]:
+                        if not b["enabled"]:
                             continue
-                        if any(sv["stops"][k]["key"] in state["passed"] for k in range(i + 1, j)):
+                        b_is_dest = b["key"] in tkeys
+                        b_city = _city_of_key(b["key"], b["name"], city_of, tele_of)
+                        if is_last and not b_is_dest:
+                            if b_city != dk_city:
+                                left_dk_city = True
                             continue
+                        b_canon = tele_of.get(b["key"], b["key"])
+                        if b_canon in state["passed"]:
+                            _add_prune(prune_stats, "loopback")
+                            continue
+                        if any(tele_of.get(sv["stops"][k]["key"], sv["stops"][k]["key"]) in state["passed"]
+                               for k in range(i + 1, j)):
+                            _add_prune(prune_stats, "loopback")
+                            continue
+                        if b_city != dk_city:
+                            left_dk_city = True
+                        # 禁止回到已离开的历史城市，也禁止离开当前换乘城市后在同一程内折返该城市
+                        if b_city in state["closed_cities"] and not b_is_dest:
+                            _add_prune(prune_stats, "city_loop")
+                            continue
+                        if left_dk_city and b_city == dk_city and not b_is_dest:
+                            _add_prune(prune_stats, "city_loop")
+                            continue
+                        if any(sv["stops"][k]["key"] in tkeys for k in range(i + 1, j)):
+                            _add_prune(prune_stats, "passed_dest")
+                            break  # 已途经到达站，再往后继续换乘属于无效绕行
                         leg = make_leg(sv, i, j, n)
+                        total = _epoch(leg["arrive"]) - state["start"]
+                        if total > max_total_min:
+                            _add_prune(prune_stats, "total_time")
+                            continue
+                        if detour_cap and total > detour_cap:
+                            _add_prune(prune_stats, "custom_rule")
+                            continue
                         if leg_conflict(leg):
                             continue
-                        new_passed = state["passed"] | frozenset(sv["stops"][k]["key"] for k in range(i, j + 1))
+                        new_passed = state["passed"] | frozenset(
+                            tele_of.get(sv["stops"][k]["key"], sv["stops"][k]["key"]) for k in range(i, j + 1)
+                        )
+                        new_closed = (state["closed_cities"] | frozenset((cur_city, dk_city)) | frozenset(
+                            _city_of_key(sv["stops"][k]["key"], sv["stops"][k]["name"], city_of, tele_of)
+                            for k in range(i, j)
+                        )) - frozenset((b_city,))
                         new_legs = state["legs"] + [leg]
                         new_transfers = state["transfers"] + [{
                             "station": state["name"],
@@ -705,21 +1007,46 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                             "same": same,
                             "wait_min": wait,
                         }]
-                        total = _epoch(leg["arrive"]) - state["start"]
-                        if total > MAX_TOTAL_MIN:
-                            continue
-                        if b["key"] in tkeys and len(new_legs) >= 3:
+                        if b_is_dest and len(new_legs) >= 3:
+                            if inc_st and not any(
+                                _match_station_tokens(tr.get("telecode") or tr["station"], tr["station"], city_of, tele_of, inc_st)
+                                for tr in new_transfers
+                            ):
+                                _add_prune(prune_stats, "custom_rule")
+                                continue
                             results.append({"total_min": total, "date_assumed": True,
                                             "legs": new_legs, "transfers": new_transfers})
-                        else:
-                            nxt.setdefault(b["key"], []).append(
-                                {"arr": _epoch(leg["arrive"]), "station": b["key"], "name": b["name"],
-                                 "passed": new_passed, "legs": new_legs, "transfers": new_transfers,
-                                 "start": state["start"],
-                                 "has_seats": state["has_seats"] and ("seats" in leg)})
+                        elif not b_is_dest:
+                            if exc_st and _match_station_tokens(b["key"], b["name"], city_of, tele_of, exc_st):
+                                _add_prune(prune_stats, "custom_rule")
+                                continue
+                            nxt.setdefault(b["key"], []).append({
+                                "arr": _epoch(leg["arrive"]), "station": b["key"], "name": b["name"],
+                                "passed": new_passed, "closed_cities": new_closed,
+                                "used_trains": state["used_trains"] | frozenset((sv["train_no"],)),
+                                "used_codes": state["used_codes"] | sv_codes,
+                                "legs": new_legs, "transfers": new_transfers,
+                                "start": state["start"],
+                                "has_seats": state["has_seats"] and ("seats" in leg),
+                            })
+        if is_last:
+            break
         frontier = []
         for bucket in nxt.values():
-            bucket.sort(key=lambda s: (0 if s["has_seats"] else 1, s["arr"]))
+            if prune_dominated and len(bucket) > 1:
+                # 帕累托时间劣势剪枝：同站下若存在出发不早、到达不晚且程数不少的分支，直接剪除
+                bucket.sort(key=lambda s: (len(s["legs"]), s["arr"], -s["start"]))
+                kept = []
+                for s in bucket:
+                    if any(len(k["legs"]) <= len(s["legs"]) and k["start"] >= s["start"] and k["arr"] <= s["arr"]
+                           for k in kept):
+                        _add_prune(prune_stats, "dominated")
+                        continue
+                    kept.append(s)
+                bucket = kept
+            bucket.sort(key=lambda s: (0 if s["has_seats"] else 1, s["arr"], s["arr"] - s["start"]))
+            if len(bucket) > frontier_k:
+                _add_prune(prune_stats, "frontier", len(bucket) - frontier_k)
             frontier.extend(bucket[:frontier_k])
         if not frontier:
             break
@@ -780,14 +1107,62 @@ def _load_sno(target_date: str | None = None) -> dict:
 def search(from_q: str, to_q: str, date: str,
            min_wait: int = 30, max_wait: int = 360, limit: int = 0,
            max_legs: int = 2, expand_city: bool = True,
-           cross_extra: int = 60, frontier_k: int = FRONTIER_K,
-           progress_cb=None, cancel_event=None) -> dict:
+           cross_extra: int = 60, frontier_k: int | None = None,
+           prune_level: str = "balanced",
+           max_total_min: int | None = None,
+           detour_ratio: float | None = None,
+           prune_dominated: bool | None = None,
+           allow_cross_station: bool = True,
+           allow_prefixes: str = "",
+           exclude_prefixes: str = "",
+           include_stations: str = "",
+           exclude_stations: str = "",
+           progress_cb=None, cancel_event=None, sub_cb=None) -> dict:
+    preset = PRUNE_PRESETS.get(prune_level, PRUNE_PRESETS["balanced"])
+    eff_fk = frontier_k if frontier_k is not None else preset["frontier_k"]
+    eff_max_total = max_total_min if max_total_min is not None else preset["max_total_min"]
+    eff_detour = float(detour_ratio if detour_ratio is not None else preset["detour_ratio"])
+    eff_dom = bool(prune_dominated if prune_dominated is not None else preset["prune_dominated"])
+    inc_pfx = _parse_tokens(allow_prefixes)
+    exc_pfx = _parse_tokens(exclude_prefixes)
+    inc_st = _parse_tokens(include_stations)
+    exc_st = _parse_tokens(exclude_stations)
+
+    prune_stats = {
+        "repeat_train": 0, "loopback": 0, "city_loop": 0, "passed_dest": 0,
+        "total_time": 0, "dominated": 0, "frontier": 0, "custom_rule": 0,
+    }
+    prune_cfg = {
+        "prune_level": prune_level,
+        "frontier_k": eff_fk,
+        "max_total_min": eff_max_total,
+        "detour_ratio": eff_detour,
+        "prune_dominated": eff_dom,
+        "allow_cross_station": bool(allow_cross_station),
+        "allow_prefixes": inc_pfx,
+        "exclude_prefixes": exc_pfx,
+        "include_stations": inc_st,
+        "exclude_stations": exc_st,
+        "detour_cap": None,
+    }
+
     total_steps = 6 if max_legs < 3 else 5 + (max_legs - 1)
+    last_sub_ts = [0.0]
 
     def step(done: int, msg: str):
         _check_cancel(cancel_event)
+        last_sub_ts[0] = 0.0
         if progress_cb is not None:
             progress_cb(done, total_steps, msg)
+
+    def sub_step(s_done: int, s_total: int, text: str, force: bool = False):
+        _check_cancel(cancel_event)
+        if sub_cb is None:
+            return
+        now = time.monotonic()
+        if force or s_done >= s_total or (now - last_sub_ts[0]) >= 0.15:
+            last_sub_ts[0] = now
+            sub_cb(s_done, s_total, text)
 
     step(1, "解析车站与价格/余票索引")
     fstations = db.resolve_stations(from_q, expand_city)
@@ -819,16 +1194,19 @@ def search(from_q: str, to_q: str, date: str,
 
     step(2, "加载大屏与时刻表缓存")
     cand = _candidate_trains(fkeys, tkeys) if max_legs <= 2 else None
-    screen = _load_screen(cand)
-    tt = _load_trains(cand)
+    screen = _load_screen(cand, cancel_event=cancel_event)
+    tt = _load_trains(cand, cancel_event=cancel_event, sub_cb=sub_step)
     step(3, f"计算大屏直达/换乘（{len(screen)} 班次）")
     d1, t1 = _search_screen(screen, fkeys, tkeys, day_min, date, min_wait, max_wait,
                             prices, seats, cal, sno, cities, cross_extra=cross_extra,
-                            cancel_event=cancel_event)
+                            cancel_event=cancel_event, prune_cfg=prune_cfg, prune_stats=prune_stats,
+                            sub_cb=sub_step)
     step(4, f"计算时刻表直达/换乘（{len(tt)} 车次）")
+    tt_sub_cap = 70 if max_legs >= 3 else 100
     d2, t2 = _search_timetable(tt, fkeys, tkeys, base, min_wait, max_wait,
                                prices, seats, cal, sno, cities, cross_extra=cross_extra,
-                               cancel_event=cancel_event)
+                               cancel_event=cancel_event, prune_cfg=prune_cfg, prune_stats=prune_stats,
+                               sub_cb=sub_step, sub_cap=tt_sub_cap)
 
     def rank(p):
         return (0 if any("prices" in l for l in p["legs"]) else 1,
@@ -858,14 +1236,22 @@ def search(from_q: str, to_q: str, date: str,
 
     # 引擎 D：多程换乘（3 程及以上，每日开行假设）
     if max_legs >= 3:
-        services = _load_services(screen, tt)
+        if eff_detour > 0 and (direct or transfers):
+            prune_cfg["detour_cap"] = min(p["total_min"] for p in direct + transfers) * eff_detour
+        sub_step(70, 100, f"合并时刻表服务（{len(tt)} 车次）…", force=True)
+        services = _load_services(screen, tt, cancel_event=cancel_event)
         transfers.extend(_search_multi(
             services, fkeys, tkeys, day_min, min_wait, max_wait,
             max_legs, prices, seats, cal, sno, cities,
             real_tk=real_tk, n2c=n2c,
-            cross_extra=cross_extra, frontier_k=frontier_k,
+            cross_extra=cross_extra, frontier_k=eff_fk,
             cancel_event=cancel_event,
             depth_cb=lambda d, n_st: step(4 + (d - 1), f"多程 BFS 搜索第 {d}/{max_legs} 程（状态 {n_st}）"),
+            prune_cfg=prune_cfg, prune_stats=prune_stats,
+            init_sub_cb=lambda sd, st, txt: sub_step(70 + int(sd * 30 / max(1, st)), 100, txt),
+            depth_sub_cb=lambda d, sd, st, hits: sub_step(
+                sd, st, f"多程 BFS 搜索第 {d}/{max_legs} 程：分支 {sd}/{st}，已命中 {hits} 方案"
+            ),
         ))
 
     step(total_steps, "汇总余票直达并校验冲突")
@@ -882,12 +1268,18 @@ def search(from_q: str, to_q: str, date: str,
                 if tkey in have or tkey in seen_tk:
                     continue
                 seen_tk.add(tkey)
+                if not _code_allowed(r["station_train_code"], inc_pfx, exc_pfx):
+                    _add_prune(prune_stats, "custom_rule")
+                    continue
                 dep, arr = _minutes(r["start_time"]), _minutes(r["arrive_time"])
                 if dep is None or arr is None:
                     continue
                 dur = arr - dep
                 if dur < 0:
                     dur += 1440
+                if eff_max_total and dur > eff_max_total:
+                    _add_prune(prune_stats, "total_time")
+                    continue
                 direct.append({"total_min": dur, "source_date": date, "legs": [_enrich({
                     "train": r["station_train_code"], "train_no": r["train_no"],
                     "from": fst["name"], "to": tst["name"],
@@ -915,6 +1307,39 @@ def search(from_q: str, to_q: str, date: str,
     direct = [p for p in direct if not _assumed_conflict(p)]
     transfers = [p for p in transfers if not _assumed_conflict(p)]
 
+    # 汇总期绕行倍率剪枝与时间劣势支配剪枝（对 2 程及多程换乘统一生效）
+    if eff_detour > 0 and (direct or transfers):
+        best_min = min(p["total_min"] for p in direct + transfers)
+        detour_limit = best_min * eff_detour
+        kept_t = []
+        for p in transfers:
+            if p["total_min"] > detour_limit:
+                _add_prune(prune_stats, "custom_rule")
+            else:
+                kept_t.append(p)
+        transfers = kept_t
+
+    if eff_dom and len(transfers) > 1:
+        groups: dict[tuple, list] = {}
+        for p in transfers:
+            groups.setdefault((p["legs"][0]["from"], p["legs"][-1]["to"]), []).append(p)
+        kept_t = []
+        for grp in groups.values():
+            grp.sort(key=lambda p: (len(p["legs"]), _epoch(p["legs"][-1]["arrive"]), -_epoch(p["legs"][0]["depart"])))
+            accepted = []
+            for p in grp:
+                p_start = _epoch(p["legs"][0]["depart"])
+                p_arr = _epoch(p["legs"][-1]["arrive"])
+                if any(len(k["legs"]) <= len(p["legs"])
+                       and _epoch(k["legs"][0]["depart"]) >= p_start
+                       and _epoch(k["legs"][-1]["arrive"]) <= p_arr
+                       for k in accepted):
+                    _add_prune(prune_stats, "dominated")
+                    continue
+                accepted.append(p)
+            kept_t.extend(accepted)
+        transfers = kept_t
+
     cn_now_str = db.cn_now().strftime("%Y-%m-%d %H:%M")
     for p in direct + transfers:
         p["departed"] = any(l["depart"] <= cn_now_str for l in p["legs"])
@@ -936,6 +1361,19 @@ def search(from_q: str, to_q: str, date: str,
         "from_station_labels": [f"{s['name']}({s['telecode']})" for s in fstations],
         "to_station_labels": [f"{s['name']}({s['telecode']})" for s in tstations],
         "screen_trains": len(screen), "timetable_trains": len(tt),
+        "prune_config": {
+            "prune_level": prune_level,
+            "frontier_k": eff_fk,
+            "max_total_min": eff_max_total,
+            "detour_ratio": eff_detour,
+            "prune_dominated": eff_dom,
+            "allow_cross_station": bool(allow_cross_station),
+            "allow_prefixes": inc_pfx,
+            "exclude_prefixes": exc_pfx,
+            "include_stations": inc_st,
+            "exclude_stations": exc_st,
+        },
+        "prune_stats": prune_stats,
         "note": f"时间基准：北京时间(UTC+8) · 异站换乘默认额外预留{cross_extra}分钟 · 无当日数据时按最近日期与 running_fig 校验推算并剔除余票冲突车次",
         "direct": direct[:limit] if limit > 0 else direct,
         "transfers": transfers[:limit] if limit > 0 else transfers,

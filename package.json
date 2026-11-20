@@ -1,0 +1,10 @@
+{
+  "name": "chinarailway-transferplan",
+  "private": true,
+  "scripts": {
+    "dev": "python3 -m app.server --port 3000",
+    "start": "python3 -m app.server --port 3000",
+    "lint": "python3 -m unittest discover -s tests",
+    "build": "python3 -m compileall -q app tests"
+  }
+}

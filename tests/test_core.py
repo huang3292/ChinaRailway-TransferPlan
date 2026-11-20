@@ -260,81 +260,106 @@ class TestTransferFixes(TempDBTestCase):
         self.assertEqual(deleted["tickets"], 1)
         self.assertEqual(deleted["train_stops"], 0)
 
+    def test_pruning_hard_rules_and_multi_level_custom(self):
+        self._seed_stations([
+            ("A01", "甲东", "jd", "jd", "甲市"),
+            ("A02", "甲西", "jx", "jx", "甲市"),
+            ("B01", "乙站", "yz", "yz", "乙市"),
+            ("B02", "乙南", "yn", "yn", "乙市"),
+            ("C01", "丙站", "bz", "bz", "丙市"),
+            ("D01", "丁站", "dz", "dz", "丁市"),
+            ("D02", "丁东", "dd", "dd", "丁市"),
+        ])
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    # G1: 甲东(08:00) -> 乙站(09:00) -> 丁站(11:30)（可直达丁站，用于检验 detour_ratio 与过终点剪枝）
+                    ("T_G1", "G1", "2026-11-20", 1, "甲东", "A01", "----", "08:00"),
+                    ("T_G1", "G1", "2026-11-20", 2, "乙站", "B01", "09:00", "09:05"),
+                    ("T_G1", "G1", "2026-11-20", 3, "丁站", "D01", "11:30", "11:30"),
+                    # G2: 乙站(09:40) -> 丙站(10:30)
+                    ("T_G2", "G2", "2026-11-20", 1, "乙站", "B01", "----", "09:40"),
+                    ("T_G2", "G2", "2026-11-20", 2, "丙站", "C01", "10:30", "10:30"),
+                    # T_G1_DUP 与 G1 同车次号（模拟第3程再坐回同名车次 G1，即使 train_no 不同也应按 repeat_train 剪掉）
+                    ("T_G1_DUP", "G1", "2026-11-20", 1, "丙站", "C01", "----", "11:05"),
+                    ("T_G1_DUP", "G1", "2026-11-20", 2, "丁东", "D02", "12:00", "12:00"),
+                    # G3: 丙站(11:10) -> 丁东(12:10)（合法3程：G1 -> G2 -> G3）
+                    ("T_G3", "G3", "2026-11-20", 1, "丙站", "C01", "----", "11:10"),
+                    ("T_G3", "G3", "2026-11-20", 2, "丁东", "D02", "12:10", "12:10"),
+                    # G4: 乙站(09:50) -> 甲西(10:40) -> 丙站(11:30)（经过已离城市甲市，应触发 city_loop 剪枝）
+                    ("T_G4", "G4", "2026-11-20", 1, "乙站", "B01", "----", "09:50"),
+                    ("T_G4", "G4", "2026-11-20", 2, "甲西", "A02", "10:35", "10:40"),
+                    ("T_G4", "G4", "2026-11-20", 3, "丙站", "C01", "11:30", "11:30"),
+                    # G5: 丁站(12:10) -> 丁东(12:30)（若前程已到终点丁站，不得继续向丁东换乘绕行）
+                    ("T_G5", "G5", "2026-11-20", 1, "丁站", "D01", "----", "12:10"),
+                    ("T_G5", "G5", "2026-11-20", 2, "丁东", "D02", "12:30", "12:30"),
+                    # K9: 慢车 2 程方案 甲东(08:00)->乙南(10:00) + K10 乙南(11:00)->丁站(17:00)（总耗时 540 分钟 > G1 直达 210 分钟的 2.0 倍）
+                    ("T_K9", "K9", "2026-11-20", 1, "甲东", "A01", "----", "08:00"),
+                    ("T_K9", "K9", "2026-11-20", 2, "乙南", "B02", "10:00", "10:00"),
+                    ("T_K10", "K10", "2026-11-20", 1, "乙南", "B02", "----", "11:00"),
+                    ("T_K10", "K10", "2026-11-20", 2, "丁站", "D01", "17:00", "17:00"),
+                    # D8: 甲东(08:10) -> 乙站(09:10) + D9 乙站(09:45) -> 丁站(12:30)（被 G1+G2/直达等对比，且比另一同站早到方案慢时用于检验支配剪枝）
+                    ("T_D8", "D8", "2026-11-20", 1, "甲东", "A01", "----", "08:10"),
+                    ("T_D8", "D8", "2026-11-20", 2, "乙站", "B01", "09:10", "09:10"),
+                    ("T_D9", "D9", "2026-11-20", 1, "乙站", "B01", "----", "09:45"),
+                    ("T_D9", "D9", "2026-11-20", 2, "丁站", "D01", "12:30", "12:30"),
+                    # 另一更优同站换乘：甲东(08:20) -> 乙站(09:10) + D9(09:45 -> 12:30) 晚发同到，支配 D8+D9
+                    ("T_D7", "D7", "2026-11-20", 1, "甲东", "A01", "----", "08:20"),
+                    ("T_D7", "D7", "2026-11-20", 2, "乙站", "B01", "09:10", "09:10"),
+                ],
+            )
+
+        # 1) 均衡模式下：校验 3 程硬剪枝（禁止同车次 G1 重复、禁止经过甲市绕回、禁止过终点丁站再转）
+        res_bal = transfer.search("甲市", "丁市", "2026-11-20", min_wait=30, max_wait=120, max_legs=3, prune_level="balanced")
+        self.assertGreater(res_bal["prune_stats"]["repeat_train"], 0)
+        self.assertGreater(res_bal["prune_stats"]["city_loop"], 0)
+        self.assertGreater(res_bal["prune_stats"]["passed_dest"], 0)
+        for p in res_bal["transfers"]:
+            codes = [l["train"] for l in p["legs"]]
+            self.assertEqual(len(codes), len(set(codes)), "同一方案内不得出现重复车次")
+            self.assertNotIn("G4", codes, "不得出现绕回甲市的方案")
+            self.assertNotIn("G5", codes, "不得出现已到丁站再转丁东的方案")
+        self.assertTrue(any([l["train"] for l in p["legs"]] == ["G1", "G2", "G3"] for p in res_bal["transfers"]))
+
+        # 2) 严格级别：detour_ratio=2.0 应剪除 540 分钟的 K9+K10，prune_dominated=True 应剪除被 D7+D9 支配的 D8+D9
+        res_strict = transfer.search("甲市", "丁市", "2026-11-20", min_wait=30, max_wait=120, max_legs=3, prune_level="strict")
+        self.assertEqual(res_strict["prune_config"]["frontier_k"], 4)
+        self.assertGreater(res_strict["prune_stats"]["dominated"], 0)
+        strict_chains = {[l["train"] for l in p["legs"]].__str__() for p in res_strict["transfers"]}
+        self.assertNotIn("['K9', 'K10']", strict_chains)
+        self.assertNotIn("['D8', 'D9']", strict_chains)
+        self.assertIn("['D7', 'D9']", strict_chains)
+
+        # 3) 自定义剪枝组合：排除丙站中转 + 剪除 K 字头 + 禁止同城异站换乘
+        res_custom = transfer.search(
+            "甲市", "丁市", "2026-11-20", min_wait=30, max_wait=120, max_legs=3,
+            prune_level="custom", exclude_stations="丙站", exclude_prefixes="K", allow_cross_station=False,
+        )
+        for p in res_custom["transfers"]:
+            self.assertTrue(all(tr["same"] for tr in p["transfers"]))
+            for l in p["legs"]:
+                self.assertFalse(l["train"].startswith("K"))
+            for tr in p["transfers"]:
+                self.assertNotIn("丙", tr["station"])
+
+        # 4) 必经中转站 + 只含车型头（仅保留含丙站且只乘 G 字头的方案）
+        res_inc = transfer.search(
+            "甲市", "丁市", "2026-11-20", min_wait=30, max_wait=120, max_legs=3,
+            prune_level="custom", allow_prefixes="G", include_stations="丙站",
+        )
+        self.assertTrue(res_inc["transfers"])
+        for p in res_inc["transfers"]:
+            self.assertTrue(all(l["train"].startswith("G") for l in p["legs"]))
+            self.assertTrue(any("丙" in tr["station"] for tr in p["transfers"]))
+
+
 
 class TestCrawlerAndMainStubbed(TempDBTestCase):
     @classmethod
     def setUpClass(cls):
-        # 为容器内缺失的三方库注入轻量桩模块，以便离线测试爬虫与主流程逻辑
-        if "requests" not in sys.modules:
-            req_mod = types.ModuleType("requests")
-
-            class RequestException(Exception):
-                pass
-
-            class Session:
-                def __init__(self):
-                    self.headers = {}
-
-                def request(self, *args, **kwargs):
-                    raise RequestException("stub")
-
-            req_mod.RequestException = RequestException
-            req_mod.Session = Session
-            sys.modules["requests"] = req_mod
-
-        if "fastapi" not in sys.modules:
-            fa = types.ModuleType("fastapi")
-            fa_resp = types.ModuleType("fastapi.responses")
-            fa_stat = types.ModuleType("fastapi.staticfiles")
-            pyd = types.ModuleType("pydantic")
-
-            class HTTPException(Exception):
-                def __init__(self, status_code, detail=""):
-                    super().__init__(detail)
-                    self.status_code = status_code
-                    self.detail = detail
-
-            class FastAPI:
-                def __init__(self, *a, **kw):
-                    pass
-
-                def on_event(self, *a, **kw):
-                    return lambda f: f
-
-                def get(self, *a, **kw):
-                    return lambda f: f
-
-                def post(self, *a, **kw):
-                    return lambda f: f
-
-                def delete(self, *a, **kw):
-                    return lambda f: f
-
-                def mount(self, *a, **kw):
-                    pass
-
-            class UploadFile:
-                pass
-
-            class BaseModel:
-                def __init__(self, **kw):
-                    for k, v in kw.items():
-                        setattr(self, k, v)
-
-                def model_dump(self, exclude=None):
-                    ex = exclude or set()
-                    return {k: v for k, v in self.__dict__.items() if k not in ex}
-
-            fa.FastAPI = FastAPI
-            fa.HTTPException = HTTPException
-            fa.UploadFile = UploadFile
-            fa_resp.FileResponse = lambda *a, **kw: None
-            fa_stat.StaticFiles = lambda *a, **kw: None
-            pyd.BaseModel = BaseModel
-            sys.modules["fastapi"] = fa
-            sys.modules["fastapi.responses"] = fa_resp
-            sys.modules["fastapi.staticfiles"] = fa_stat
-            sys.modules["pydantic"] = pyd
+        # app.crawler 与 app.main 已内置无三方库兼容层，无需注入临时桩模块
+        pass
 
     def test_crawler_cancel_and_maint_hint(self):
         from app import crawler as crawler_mod
@@ -750,6 +775,177 @@ class TestCrawlerAndMainStubbed(TempDBTestCase):
         self.assertEqual(st_err["status"], "done")
         self.assertEqual(st_err["result"]["TN1|BJP|SHH|2099-02-01"]["ticket_updated"], "2099-02-01 10:30")
         self.assertIn("余票请求失败：网络超时", st_err["result"]["TN2|BJP|TJP|2099-02-01"]["error"])
+
+        # 6) 验证非法剪枝参数在接口层被拦截并返回 400
+        with self.assertRaises(main_mod.HTTPException) as ctx_p:
+            main_mod.transfers("北京", "上海", "2026-11-20", prune_level="bad_level")
+        self.assertEqual(ctx_p.exception.status_code, 400)
+        with self.assertRaises(main_mod.HTTPException) as ctx_t:
+            main_mod.start_transfers(
+                main_mod.TransferSearchReq(from_station="北京", to_station="上海", date="2026-11-20", max_total_min=10)
+            )
+        self.assertEqual(ctx_t.exception.status_code, 400)
+
+    def test_search_sub_progress_and_large_timetable_index(self):
+        import time
+        from app import main as main_mod
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [
+                    ("BJP", "北京", "bj", "bj", "北京"),
+                    ("M01", "中一", "zy", "zy", "中一市"),
+                    ("M02", "中二", "ze", "ze", "中二市"),
+                    ("SHH", "上海", "sh", "sh", "上海"),
+                    ("X01", "旁站甲", "pxa", "pxa", "旁甲市"),
+                    ("X02", "旁站乙", "pxb", "pxb", "旁乙市"),
+                ],
+            )
+            rows = [
+                ("L1", "G101", "2026-11-20", 1, "北京", "BJP", "----", "08:00"),
+                ("L1", "G101", "2026-11-20", 2, "中一", "M01", "09:00", "09:05"),
+                ("L2", "G102", "2026-11-20", 1, "中一", "M01", "----", "09:40"),
+                ("L2", "G102", "2026-11-20", 2, "中二", "M02", "10:40", "10:45"),
+                ("L3", "G103", "2026-11-20", 1, "中二", "M02", "----", "11:20"),
+                ("L3", "G103", "2026-11-20", 2, "上海", "SHH", "12:30", "12:30"),
+            ]
+            # 构造 1,500 趟不经过终点或旁路车次，检验倒排索引优化与子进度回调（避免全量下 O(N^2) 卡死）
+            for i in range(1500):
+                tn = f"NOISE_{i:04d}"
+                cd = f"K{1000 + i}"
+                if i < 60:
+                    # 部分从北京始发但不到上海的列车，确保触发外层匹配并需走索引过滤
+                    rows.append((tn, cd, "2026-11-20", 1, "北京", "BJP", "----", "07:00"))
+                    rows.append((tn, cd, "2026-11-20", 2, "旁站甲", "X01", "08:00", "08:00"))
+                else:
+                    rows.append((tn, cd, "2026-11-20", 1, "旁站甲", "X01", "----", "08:00"))
+                    rows.append((tn, cd, "2026-11-20", 2, "旁站乙", "X02", "09:30", "09:30"))
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                rows,
+            )
+
+        prog_steps, sub_steps = [], []
+        t0 = time.monotonic()
+        sr = transfer.search(
+            "北京", "上海", "2026-11-20",
+            min_wait=30, max_wait=120, max_legs=3, expand_city=False,
+            progress_cb=lambda d, tot, m: prog_steps.append((d, tot, m)),
+            sub_cb=lambda sd, st, m: sub_steps.append((sd, st, m)),
+        )
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 5.0, f"全量索引搜索耗时过长: {elapsed:.2f}s")
+        self.assertEqual(len(sr["transfers"]), 1)
+        self.assertEqual([l["train"] for l in sr["transfers"][0]["legs"]], ["G101", "G102", "G103"])
+        self.assertTrue(any("计算时刻表直达/换乘" in m for _, _, m in sub_steps))
+        self.assertTrue(any("多程 BFS" in m or "构建多程路网" in m for _, _, m in sub_steps))
+        for sd, st, _ in sub_steps:
+            self.assertGreaterEqual(sd, 0)
+            self.assertGreater(st, 0)
+            self.assertLessEqual(sd, st)
+
+        # 验证 _transfer_search_job 正确维护与重置 sub_done / sub_total
+        req = main_mod.TransferSearchReq(from_station="北京", to_station="上海", date="2026-11-20", max_legs=3, expand_city=False)
+        jid, ev = main_mod._create_job({"status": "running", "phase": "search", "done": 0, "total": 7, "sub_done": 0, "sub_total": 0, "current": "", "errors": [], "result": {}})
+        main_mod._transfer_search_job(jid, ev, req)
+        st_job = main_mod.job_status(jid)
+        self.assertEqual(st_job["status"], "done")
+        self.assertEqual(st_job["sub_done"], 0)
+        self.assertEqual(st_job["sub_total"], 0)
+        self.assertEqual(len(st_job["result"]["transfers"]), 1)
+
+
+class TestStdlibHTTPServer(TempDBTestCase):
+    def test_http_routes_multipart_and_nested_models(self):
+        import json
+        import threading
+        import time
+        import urllib.error
+        import urllib.request
+        from app import server as server_mod
+
+        srv = server_mod.create_server("127.0.0.1", 0)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        base = f"http://127.0.0.1:{port}"
+
+        def req(method, path, body=None, headers=None):
+            h = dict(headers or {})
+            data = body
+            if isinstance(body, (dict, list)):
+                data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                h.setdefault("Content-Type", "application/json")
+            r = urllib.request.Request(base + path, data=data, headers=h, method=method)
+            try:
+                with urllib.request.urlopen(r, timeout=5) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        try:
+            # 1) 首页与统计接口
+            st, raw = req("GET", "/")
+            self.assertEqual(st, 200)
+            self.assertIn("12306 智能中转", raw.decode("utf-8"))
+
+            st, raw = req("GET", "/api/stats")
+            self.assertEqual(st, 200)
+            stats = json.loads(raw)
+            self.assertIn("stations", stats)
+
+            # 2) multipart/form-data 文件导入站点并校验入库
+            boundary = "----TestBoundary123"
+            stations_js = "var station_names ='@bjp|北京|BJP|beijing|bj|0|0357|北京|||@shh|上海|SHH|shanghai|sh|1|0712|上海|||';".encode("utf-8")
+            mp_body = (
+                f"--{boundary}\r\n"
+                f"Content-Disposition: form-data; name=\"api_type\"\r\n\r\n"
+                f"stations\r\n"
+                f"--{boundary}\r\n"
+                f"Content-Disposition: form-data; name=\"file\"; filename=\"station_name.js\"\r\n"
+                f"Content-Type: application/javascript\r\n\r\n"
+            ).encode("utf-8") + stations_js + f"\r\n--{boundary}--\r\n".encode("utf-8")
+            st, raw = req("POST", "/api/import/file", body=mp_body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            self.assertEqual(st, 200, raw.decode("utf-8", errors="replace"))
+            self.assertGreaterEqual(json.loads(raw)["saved"], 2)
+
+            # 3) 异步换乘搜索与参数校验（400 / 422）
+            st, raw = req("POST", "/api/transfers/start", {
+                "from_station": "北京", "to_station": "上海", "date": "2026-11-20",
+                "max_legs": 2, "expand_city": False, "prune_level": "balanced",
+            })
+            self.assertEqual(st, 200)
+            jid = json.loads(raw)["job_id"]
+            for _ in range(40):
+                st_j, raw_j = req("GET", f"/api/jobs/{jid}")
+                self.assertEqual(st_j, 200)
+                jobj = json.loads(raw_j)
+                if jobj.get("status") != "running":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(jobj["status"], "done")
+
+            st_bad, _ = req("POST", "/api/transfers/start", {
+                "from_station": "北京", "to_station": "上海", "date": "2026-11-20", "prune_level": "invalid"
+            })
+            self.assertEqual(st_bad, 400)
+
+            # 4) 嵌套 BaseModel (list[PlanLeg]) 校验
+            with mock.patch("app.main.crawler.crawl_tickets"):
+                st_p, raw_p = req("POST", "/api/plan_tickets", {
+                    "legs": [{"train_no": "T1", "train": "G1", "date": "2099-01-01", "from_telecode": "BJP", "to_telecode": "SHH"}]
+                })
+                self.assertEqual(st_p, 200)
+                self.assertEqual(json.loads(raw_p)["legs"], 1)
+
+            # 5) DELETE 清理缓存路由
+            st_d, raw_d = req("DELETE", "/api/cache?before_date=2099-01-01&include_raw=false")
+            self.assertEqual(st_d, 200)
+            self.assertIn("deleted", json.loads(raw_d))
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":
