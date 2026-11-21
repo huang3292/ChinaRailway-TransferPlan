@@ -1074,8 +1074,15 @@ class TestInMemoryCacheAndBatching(TempDBTestCase):
                     ("T2", "G2", "2026-11-21", 2, "南平市", "NOS", "11:00", "11:00"),
                 ],
             )
-        # 刷出一次检查点后，模拟不同搜索线程结束时调用 close_conn()，确认只读关闭不会误失效缓存
+        # 刷出一次检查点后，确认单线程只读 close_conn() 后下一次搜索仍命中内存缓存
         db.close_conn()
+        r0 = transfer.search("厦门北", "南平市", "2026-11-21", max_legs=2)
+        self.assertFalse(r0["cache_hit"])
+        db.close_conn()
+        r0_hit = transfer.search("厦门北", "南平市", "2026-11-21", max_legs=2)
+        self.assertTrue(r0_hit["cache_hit"])
+        db.close_conn()
+        transfer.invalidate_cache()
 
         # 1) 并发冷启动检索应安全完成
         with ThreadPoolExecutor(max_workers=3) as pool:

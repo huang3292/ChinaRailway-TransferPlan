@@ -22,9 +22,11 @@ def bump_data_version() -> int:
         return _data_gen
 
 
-def _file_sig(p: Path) -> tuple:
+def _file_sig(p: Path, ignore_empty: bool = False) -> tuple:
     try:
         st = p.stat()
+        if ignore_empty and st.st_size == 0:
+            return (0, 0)
         return (st.st_mtime_ns, st.st_size)
     except OSError:
         return (0, 0)
@@ -35,7 +37,7 @@ def data_version() -> tuple:
     with _gen_lock:
         gen = _data_gen
     wal_path = Path(f"{DB_PATH}-wal")
-    return (str(DB_PATH), gen, _file_sig(DB_PATH), _file_sig(wal_path))
+    return (str(DB_PATH), gen, _file_sig(DB_PATH), _file_sig(wal_path, ignore_empty=True))
 
 
 def cn_now() -> datetime:
