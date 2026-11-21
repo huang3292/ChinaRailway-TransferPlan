@@ -1137,5 +1137,508 @@ class TestInMemoryCacheAndBatching(TempDBTestCase):
         self.assertEqual({p["legs"][0]["train"] for p in r_after_ext["direct"]}, {"G3", "G4"})
 
 
+class TestAuditFixesAndIncludeModes(TempDBTestCase):
+    def _seed_stations(self, items):
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode, name, pinyin, short, city) VALUES(?,?,?,?,?)",
+                items,
+            )
+
+    def test_cross_midnight_timetable_screen_and_terminal_quirk(self):
+        self._seed_stations([
+            ("AAA", "甲站", "jz", "jz", "甲市"),
+            ("MID", "夜转站", "yzz", "yzz", "夜市"),
+            ("BBB", "乙站", "yz", "yz", "乙市"),
+        ])
+        with db.tx() as conn:
+            # 1) 时刻表在 夜转站 23:55 到达、00:05 发车：到达应在 Day0，发车应在 Day1
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("TT_MID", "K100", "2026-11-20", 1, "甲站", "AAA", "----", "20:00"),
+                    ("TT_MID", "K100", "2026-11-20", 2, "夜转站", "MID", "23:55", "00:05"),
+                    ("TT_MID", "K100", "2026-11-20", 3, "乙站", "BBB", "04:05", "04:05"),
+                ],
+            )
+            # 2) 大屏缺 day_diff 时的 23:55/00:05 午夜跨天（应回退 arr） + 终到站 13:06/13:00 小幅倒挂（不应回退 1440）
+            conn.executemany(
+                """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                     station_train_date,start_train_date,station_no,arrive_time,start_time,arrive_day_diff,start_day_diff,
+                     start_station_name,start_station_telecode,end_station_name,end_station_telecode)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    ("AAA", "甲站", "2026-11-20", "Z88", "SCR_M", "2026-11-20", "2026-11-20", 1, "----", "20:00", None, None, "甲站", "AAA", "乙站", "BBB"),
+                    ("MID", "夜转站", "2026-11-21", "Z88", "SCR_M", "2026-11-21", "2026-11-20", 2, "23:55", "00:05", None, None, "甲站", "AAA", "乙站", "BBB"),
+                    ("BBB", "乙站", "2026-11-21", "Z88", "SCR_M", "2026-11-21", "2026-11-20", 3, "13:06", "13:00", None, None, "甲站", "AAA", "乙站", "BBB"),
+                ],
+            )
+
+        res = transfer.search("甲站", "乙站", "2026-11-20", max_legs=1, expand_city=False)
+        by_tn = {p["legs"][0]["train_no"]: p for p in res["direct"]}
+        self.assertEqual(by_tn["TT_MID"]["total_min"], 485)
+        self.assertEqual(by_tn["TT_MID"]["legs"][0]["arrive"], "2026-11-21 04:05")
+        # 终到站 13:06/13:00 不应被误减 1440 分钟；次日 13:06 - 前日 20:00 = 1026 分钟
+        self.assertEqual(by_tn["SCR_M"]["total_min"], 1026)
+
+        # 验证大屏夜转站观测 arr 早于 dep（11-20 23:55 vs 11-21 00:05）
+        scr_loaded = transfer._load_screen()
+        obs_mid = scr_loaded[("SCR_M", "2026-11-20")]["obs"]["MID"]
+        self.assertEqual(obs_mid["dep"] - obs_mid["arr"], 10)
+
+    def test_exact_station_filtering_no_spread_and_include_or_and(self):
+        from app import main as main_mod
+
+        self._seed_stations([
+            ("ORG", "起点站", "qd", "qd", "起点市"),
+            ("BJP", "北京", "bj", "bj", "北京"),
+            ("VNP", "北京南", "bjn", "bjn", "北京"),
+            ("FZS", "福州", "fz", "fz", "福州"),
+            ("FYS", "福州南", "fzn", "fzn", "福州"),
+            ("NCG", "南昌", "nc", "nc", "南昌"),
+            ("YPS", "延平", "yp", "yp", "南平"),
+            ("NOS", "南平市", "nps", "nps", "南平"),
+            ("DST", "终点站", "zd", "zd", "终点市"),
+        ])
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    # 经北京(BJP)换乘 vs 经北京南(VNP)换乘
+                    ("T1", "G1", "2026-11-20", 1, "起点站", "ORG", "----", "08:00"),
+                    ("T1", "G1", "2026-11-20", 2, "北京", "BJP", "09:00", "09:00"),
+                    ("T2", "G2", "2026-11-20", 1, "北京", "BJP", "----", "09:40"),
+                    ("T2", "G2", "2026-11-20", 2, "终点站", "DST", "11:00", "11:00"),
+                    ("T3", "G3", "2026-11-20", 1, "起点站", "ORG", "----", "08:10"),
+                    ("T3", "G3", "2026-11-20", 2, "北京南", "VNP", "09:10", "09:10"),
+                    ("T4", "G4", "2026-11-20", 1, "北京南", "VNP", "----", "09:50"),
+                    ("T4", "G4", "2026-11-20", 2, "终点站", "DST", "11:10", "11:10"),
+                    # 延平(YPS, 所属城市“南平”) 与 南平市(NOS, 所属城市“南平”)
+                    ("T5", "G5", "2026-11-20", 1, "起点站", "ORG", "----", "08:20"),
+                    ("T5", "G5", "2026-11-20", 2, "延平", "YPS", "09:20", "09:20"),
+                    ("T6", "G6", "2026-11-20", 1, "延平", "YPS", "----", "10:00"),
+                    ("T6", "G6", "2026-11-20", 2, "终点站", "DST", "11:20", "11:20"),
+                    # 3 程方案（异站 福州->福州南，再经 南昌 转 终点站），以及仅过南昌的 2 程方案
+                    ("TA1", "D10", "2026-11-20", 1, "起点站", "ORG", "----", "07:00"),
+                    ("TA1", "D10", "2026-11-20", 2, "福州", "FZS", "08:00", "08:00"),
+                    ("TA2", "D11", "2026-11-20", 1, "福州南", "FYS", "----", "09:30"),
+                    ("TA2", "D11", "2026-11-20", 2, "南昌", "NCG", "11:00", "11:00"),
+                    ("TA3", "D12", "2026-11-20", 1, "南昌", "NCG", "----", "11:40"),
+                    ("TA3", "D12", "2026-11-20", 2, "终点站", "DST", "13:00", "13:00"),
+                    ("TB1", "D20", "2026-11-20", 1, "起点站", "ORG", "----", "07:30"),
+                    ("TB1", "D20", "2026-11-20", 2, "南昌", "NCG", "09:00", "09:00"),
+                ],
+            )
+
+        # 1) 排除“北京南”不得扩散到“北京”，排除“南平市”不得扩散到同城“延平”
+        r_exc = transfer.search(
+            "起点站", "终点站", "2026-11-20",
+            min_wait=30, max_wait=180, max_legs=2, expand_city=False,
+            prune_level="custom", exclude_stations="北京南,南平市",
+        )
+        tr_stations = {tr["station"] for p in r_exc["transfers"] for tr in p["transfers"]}
+        self.assertIn("北京", tr_stations)
+        self.assertIn("延平", tr_stations)
+        self.assertNotIn("北京南", tr_stations)
+
+        # 2) OR 模式与 AND 模式 + 引擎 D 异站下车站“福州南”命中 include_stations
+        r_or = transfer.search(
+            "起点站", "终点站", "2026-11-20",
+            min_wait=30, max_wait=180, max_legs=3, expand_city=False,
+            prune_level="custom", include_stations="福州南,南昌", include_stations_mode="or",
+        )
+        or_chains = {tuple(l["train"] for l in p["legs"]) for p in r_or["transfers"]}
+        self.assertIn(("D20", "D12"), or_chains)
+        self.assertIn(("D10", "D11", "D12"), or_chains)
+
+        r_and = transfer.search(
+            "起点站", "终点站", "2026-11-20",
+            min_wait=30, max_wait=180, max_legs=3, expand_city=False,
+            prune_level="custom", include_stations="福州南,南昌", include_stations_mode="and",
+        )
+        and_chains = {tuple(l["train"] for l in p["legs"]) for p in r_and["transfers"]}
+        self.assertEqual(and_chains, {("D10", "D11", "D12")})
+        self.assertEqual(r_and["prune_config"]["include_stations_mode"], "and")
+
+        with self.assertRaises(main_mod.HTTPException) as ctx_mode:
+            main_mod.transfers("起点站", "终点站", "2026-11-20", include_stations_mode="xor")
+        self.assertEqual(ctx_mode.exception.status_code, 400)
+
+    def test_multi_leg_dedup_mid_depth_dest_and_max_legs_1(self):
+        self._seed_stations([
+            ("A1", "甲北", "jb", "jb", "甲市"),
+            ("A2", "甲南", "jn", "jn", "甲市"),
+            ("M1", "中一", "zy", "zy", "中一市"),
+            ("M2", "中二", "ze", "ze", "中二市"),
+            ("B1", "乙南", "yn", "yn", "乙市"),
+            ("B2", "乙北", "yb", "yb", "乙市"),
+        ])
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    # G10：同城停 甲北(08:00) -> 甲南(08:15) -> 中一(09:10) -> 乙南(13:00 亦可直达)
+                    ("T10", "G10", "2026-11-20", 1, "甲北", "A1", "----", "08:00"),
+                    ("T10", "G10", "2026-11-20", 2, "甲南", "A2", "08:12", "08:15"),
+                    ("T10", "G10", "2026-11-20", 3, "中一", "M1", "09:10", "09:15"),
+                    # G20：中一(09:50) -> 中二(10:50)
+                    ("T20", "G20", "2026-11-20", 1, "中一", "M1", "----", "09:50"),
+                    ("T20", "G20", "2026-11-20", 2, "中二", "M2", "10:50", "10:50"),
+                    # G30：中二(11:30) -> 同城双终到 乙南(12:20) -> 乙北(12:40)
+                    ("T30", "G30", "2026-11-20", 1, "中二", "M2", "----", "11:30"),
+                    ("T30", "G30", "2026-11-20", 2, "乙南", "B1", "12:15", "12:20"),
+                    ("T30", "G30", "2026-11-20", 3, "乙北", "B2", "12:40", "12:40"),
+                    # G31：中二(11:35) -> 乙南(12:25) -> 之后过头折返 中一(13:10)，在 max_legs=4 (not is_last) 下必须被 loopback 剔除
+                    ("T31", "G31", "2026-11-20", 1, "中二", "M2", "----", "11:35"),
+                    ("T31", "G31", "2026-11-20", 2, "乙南", "B1", "12:20", "12:25"),
+                    ("T31", "G31", "2026-11-20", 3, "中一", "M1", "13:10", "13:10"),
+                    # 直达对比用
+                    ("TD", "G99", "2026-11-20", 1, "甲北", "A1", "----", "07:00"),
+                    ("TD", "G99", "2026-11-20", 2, "乙北", "B2", "10:00", "10:00"),
+                ],
+            )
+
+        # 1) max_legs=4 时 depth=3 (not is_last)：必须枚举出同车 乙南/乙北 双终到、保留 甲北/甲南 双始发去重分支，并剔除过头折返 G31
+        res4 = transfer.search("甲市", "乙市", "2026-11-20", min_wait=30, max_wait=120, max_legs=4, expand_city=True)
+        g30_od = {(p["legs"][0]["from"], p["legs"][-1]["to"])
+                  for p in res4["transfers"]
+                  if tuple(l["train"] for l in p["legs"]) == ("G10", "G20", "G30")}
+        self.assertEqual(g30_od, {("甲北", "乙南"), ("甲北", "乙北"), ("甲南", "乙南"), ("甲南", "乙北")})
+        self.assertFalse(any("G31" in [l["train"] for l in p["legs"]] for p in res4["transfers"]))
+
+        # 2) max_legs=1 仅直达，不生成换乘方案
+        res1 = transfer.search("甲市", "乙市", "2026-11-20", max_legs=1, expand_city=True)
+        self.assertEqual(len(res1["direct"]), 1)
+        self.assertEqual(res1["transfers"], [])
+
+    def test_engine_c_long_duration_engine_a_city_loop_and_price_zfill(self):
+        from app import main as main_mod
+
+        self._seed_stations([
+            ("A1", "甲东", "jd", "jd", "甲市"),
+            ("A2", "甲西", "jx", "jx", "甲市"),
+            ("B1", "乙站", "yz", "yz", "乙市"),
+            ("C1", "丙站", "bz", "bz", "丙市"),
+        ])
+        with db.tx() as conn:
+            # 1) 引擎 C 超 24 小时余票直达（duration='28:30' -> 1710 分钟）
+            conn.execute(
+                """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
+                     from_station_no,to_station_no,start_time,arrive_time,duration,seats,can_web_buy)
+                   VALUES('TC_LONG','Z28','2026-11-20','A1','C1','1','5','08:00','12:30','28:30','{"yz":"有"}','Y')"""
+            )
+            # 2) 引擎 A 城际环绕剪枝：G1 甲东(08:00)->乙站(09:00)；G2 乙站(09:40)->经甲西(10:20)->丙站(11:30)
+            conn.executemany(
+                """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                     station_train_date,start_train_date,station_no,arrive_time,start_time,
+                     start_station_name,start_station_telecode,end_station_name,end_station_telecode)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    ("A1", "甲东", "2026-11-20", "G1", "TA1", "2026-11-20", "2026-11-20", 1, "----", "08:00", "甲东", "A1", "乙站", "B1"),
+                    ("B1", "乙站", "2026-11-20", "G1", "TA1", "2026-11-20", "2026-11-20", 2, "09:00", "09:00", "甲东", "A1", "乙站", "B1"),
+                    ("B1", "乙站", "2026-11-20", "G2", "TA2", "2026-11-20", "2026-11-20", 1, "----", "09:40", "乙站", "B1", "丙站", "C1"),
+                    ("A2", "甲西", "2026-11-20", "G2", "TA2", "2026-11-20", "2026-11-20", 2, "10:15", "10:20", "乙站", "B1", "丙站", "C1"),
+                    ("C1", "丙站", "2026-11-20", "G2", "TA2", "2026-11-20", "2026-11-20", 3, "11:30", "11:30", "乙站", "B1", "丙站", "C1"),
+                ],
+            )
+
+        res = transfer.search("甲东", "丙站", "2026-11-20", min_wait=30, max_wait=120, max_legs=2, expand_city=False)
+        z28 = [p for p in res["direct"] if p["legs"][0]["train_no"] == "TC_LONG"]
+        self.assertEqual(len(z28), 1)
+        self.assertEqual(z28[0]["total_min"], 1710)
+        self.assertEqual(res["transfers"], [])
+        self.assertGreater(res["prune_stats"]["city_loop"], 0)
+
+        # 3) importer 价格站序零填充（非空 "1"->"01"，空串保持 ""）+ _route_job zfill 查重跳过已缓存票价
+        importer.ingest(
+            json.dumps({"data": {"liveBeijing": False, "OT": [], "O": "300.0"}}),
+            "price",
+            ctx={"train_no": "TC_LONG", "station_train_code": "Z28", "date": "2026-11-20",
+                 "from_station_no": "1", "to_station_no": "5"},
+            source="test",
+        )
+        importer.ingest(
+            json.dumps({"data": {"O": "100.0"}}),
+            "price",
+            ctx={"train_no": "TC_EMPTY", "date": "2026-11-20", "from_station_no": "", "to_station_no": ""},
+            source="test",
+        )
+        p_rows = db.rows("SELECT from_station_no, to_station_no FROM prices WHERE train_no='TC_LONG'")
+        self.assertEqual((p_rows[0]["from_station_no"], p_rows[0]["to_station_no"]), ("01", "05"))
+        pe_rows = db.rows("SELECT from_station_no, to_station_no FROM prices WHERE train_no='TC_EMPTY'")
+        self.assertEqual((pe_rows[0]["from_station_no"], pe_rows[0]["to_station_no"]), ("", ""))
+
+        jid, ev = main_mod._create_job({"status": "running", "done": 0, "total": 0, "phase": "init",
+                                       "current": "", "truncated": 0, "log": [], "errors": [], "result": {}})
+        with mock.patch.object(main_mod.crawler, "crawl_station_trains"), \
+             mock.patch.object(main_mod.crawler, "crawl_timetable"), \
+             mock.patch.object(main_mod.crawler, "crawl_tickets"), \
+             mock.patch.object(main_mod.crawler, "crawl_price") as m_cp:
+            main_mod._route_job(jid, ev, "甲东", "丙站", "2026-11-20", True)
+            m_cp.assert_not_called()
+
+    def test_unbounded_hub_narrowing_engine_d_guards_and_post_filter(self):
+        from app import main as main_mod
+
+        self._seed_stations([
+            ("ORG", "起点站", "qd", "qd", "起点市"),
+            ("BJS", "北京", "bj", "bj", "北京"),
+            ("VNP", "北京南", "bjn", "bjn", "北京"),
+            ("TJP", "天津", "tj", "tj", "天津"),
+            ("JNK", "济南", "jn", "jn", "济南"),
+            ("NCG", "南昌", "nc", "nc", "南昌"),
+            ("XHZ", "小站", "xz", "xz", "小市"),
+            ("DST", "终点站", "zd", "zd", "终点市"),
+        ])
+        with db.tx() as conn:
+            # 1) 测试城内中转同城空转跳过但不阻断后续出城（起点->北京 -> 北京南 -> 济南 -> 终点站）
+            #    以及超过48h(50h)的多程车次验证 unbounded(0=不限) 不回退到 48h
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("L1", "G10", "2026-11-20", 1, "起点站", "ORG", "----", "08:00"),
+                    ("L1", "G10", "2026-11-20", 2, "北京", "BJS", "09:00", "09:00"),
+                    # L2 同城先停 北京 再停 北京南，之后出城到 济南：应跳过 北京南 换乘落点，但放行 济南
+                    ("L2", "G20", "2026-11-20", 1, "北京", "BJS", "----", "09:40"),
+                    ("L2", "G20", "2026-11-20", 2, "北京南", "VNP", "09:55", "10:00"),
+                    ("L2", "G20", "2026-11-20", 3, "济南", "JNK", "11:30", "11:30"),
+                    # 若误在 北京南 换乘可接 D21->终点站，应被 intra-city 规则剪除
+                    ("L2_BAD", "D21", "2026-11-20", 1, "北京南", "VNP", "----", "10:35"),
+                    ("L2_BAD", "D21", "2026-11-20", 2, "终点站", "DST", "12:00", "12:00"),
+                    ("L3", "G30", "2026-11-20", 1, "济南", "JNK", "----", "12:10"),
+                    ("L3", "G30", "2026-11-20", 2, "终点站", "DST", "13:30", "13:30"),
+                    # L_DUR0: 零耗时脏数据（09:00 -> 09:00），在 3 程引擎应被 dur<=0 防护忽略
+                    ("L_DUR0", "K99", "2026-11-20", 1, "济南", "JNK", "----", "12:15"),
+                    ("L_DUR0", "K99", "2026-11-20", 2, "终点站", "DST", "12:15", "12:15"),
+                    # 2) 超 48 小时慢车链（总历时约 51 小时 > 2880m，仅 unbounded 与 relaxed(96h) 保留，balanced(48h) 剪除）
+                    #    注：走“小站 -> 南昌 -> 终点站”3 程
+                    ("SL1", "K101", "2026-11-20", 1, "起点站", "ORG", "----", "06:00"),
+                    ("SL1", "K101", "2026-11-20", 2, "小站", "XHZ", "18:00", "18:00"),
+                    ("SL2", "K102", "2026-11-20", 1, "小站", "XHZ", "----", "19:00"),
+                    ("SL2", "K102", "2026-11-20", 2, "起点前", "PRE", "23:00", "23:10"),
+                    ("SL2", "K102", "2026-11-20", 3, "南昌", "NCG", "07:00", "07:00"),
+                    ("SL3", "K103", "2026-11-20", 1, "南昌", "NCG", "----", "07:40"),
+                    ("SL3", "K103", "2026-11-20", 2, "中继", "ZJB", "23:55", "00:05"),
+                    ("SL3", "K103", "2026-11-20", 3, "终点站", "DST", "09:00", "09:00"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [("PRE", "起点前", "qdq", "qdq", "前市"), ("ZJB", "中继", "zj", "zj", "中市")],
+            )
+            # 大屏 A：起点站->小站(XHZ)->终点站 与 起点站->南昌(NCG)->终点站（验证引擎 A 的 hub_only 裁剪）
+            conn.executemany(
+                """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                     station_train_date,start_train_date,station_no,arrive_time,start_time,
+                     start_station_name,start_station_telecode,end_station_name,end_station_telecode)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    ("ORG", "起点站", "2026-11-20", "D50", "SA1", "2026-11-20", "2026-11-20", 1, "----", "08:00", "起点站", "ORG", "小站", "XHZ"),
+                    ("XHZ", "小站", "2026-11-20", "D50", "SA1", "2026-11-20", "2026-11-20", 2, "09:00", "09:00", "起点站", "ORG", "小站", "XHZ"),
+                    ("XHZ", "小站", "2026-11-20", "D51", "SA2", "2026-11-20", "2026-11-20", 1, "----", "09:40", "小站", "XHZ", "终点站", "DST"),
+                    ("DST", "终点站", "2026-11-20", "D51", "SA2", "2026-11-20", "2026-11-20", 2, "10:40", "10:40", "小站", "XHZ", "终点站", "DST"),
+                    ("ORG", "起点站", "2026-11-20", "G60", "SA3", "2026-11-20", "2026-11-20", 1, "----", "08:10", "起点站", "ORG", "南昌", "NCG"),
+                    ("NCG", "南昌", "2026-11-20", "G60", "SA3", "2026-11-20", "2026-11-20", 2, "09:10", "09:10", "起点站", "ORG", "南昌", "NCG"),
+                    ("NCG", "南昌", "2026-11-20", "G61", "SA4", "2026-11-20", "2026-11-20", 1, "----", "09:50", "南昌", "NCG", "终点站", "DST"),
+                    ("DST", "终点站", "2026-11-20", "G61", "SA4", "2026-11-20", "2026-11-20", 2, "10:50", "10:50", "南昌", "NCG", "终点站", "DST"),
+                ],
+            )
+
+        # 1) balanced (48h=2880m) 会剪掉 51h 的 K101+K102+K103，同时放行 G10+G20+G30（跳过北京南、不留K99零耗时）
+        r_bal = transfer.search("起点站", "终点站", "2026-11-20", min_wait=30, max_wait=120, max_legs=3, prune_level="balanced", expand_city=False)
+        bal_chains = {tuple(l["train"] for l in p["legs"]) for p in r_bal["transfers"]}
+        self.assertIn(("G10", "G20", "G30"), bal_chains)
+        self.assertNotIn(("G10", "G20", "D21"), bal_chains)
+        self.assertNotIn(("G10", "G20", "K99"), bal_chains)
+        self.assertNotIn(("K101", "K102", "K103"), bal_chains)
+        self.assertIn("station_cities", r_bal)
+        self.assertIn("city_suffix_stations", r_bal)
+
+        # 2) unbounded (frontier_k=0, max_total_min=0) 不触发 48h 剪枝，K101+K102+K103 保留
+        r_unb = transfer.search("起点站", "终点站", "2026-11-20", min_wait=30, max_wait=120, max_legs=3, prune_level="unbounded", expand_city=False)
+        unb_chains = {tuple(l["train"] for l in p["legs"]) for p in r_unb["transfers"]}
+        self.assertIn(("K101", "K102", "K103"), unb_chains)
+        self.assertEqual(r_unb["prune_config"]["frontier_k"], 0)
+        self.assertEqual(r_unb["prune_config"]["max_total_min"], 0)
+
+        # 3) hub_only=True 默认省会大枢纽：引擎 A 仅保留 南昌(G60+G61)，引擎 D 仅保留 北京+济南(G10+G20+G30)
+        #    并跳过非枢纽“小站”相关的 2 程与 3 程换乘
+        r_hub = transfer.search("起点站", "终点站", "2026-11-20", min_wait=30, max_wait=120, max_legs=3,
+                                prune_level="unbounded", hub_only=True, expand_city=False)
+        hub_chains = {tuple(l["train"] for l in p["legs"]) for p in r_hub["transfers"]}
+        self.assertIn(("G60", "G61"), hub_chains)
+        self.assertIn(("G10", "G20", "G30"), hub_chains)
+        self.assertNotIn(("D50", "D51"), hub_chains)
+        self.assertNotIn(("K101", "K102", "K103"), hub_chains)
+        self.assertGreater(r_hub["prune_stats"]["hub_filter"], 0)
+
+        # 自定义枢纽列表增删（只保留 北京,济南 且禁异站 -> 连 南昌 与 北京->北京南 也被排除，仅剩 G10+G20+G30）
+        r_custom_hub = transfer.search("起点站", "终点站", "2026-11-20", min_wait=30, max_wait=120, max_legs=3,
+                                       hub_only=True, hub_stations="北京,济南", allow_cross_station=False, expand_city=False)
+        self.assertEqual({tuple(l["train"] for l in p["legs"]) for p in r_custom_hub["transfers"]},
+                         {("G10", "G20", "G30")})
+
+        # 4) 独立后置过滤 filter_plans()：无需重跑 search 即可按车型头和换乘站过滤
+        post_g = transfer.filter_plans(r_unb["transfers"], allow_prefixes="G")
+        self.assertEqual({tuple(l["train"] for l in p["legs"]) for p in post_g},
+                         {("G60", "G61"), ("G10", "G20", "G30")})
+        post_and = transfer.filter_plans(r_unb["transfers"], include_stations="北京,济南", include_stations_mode="and")
+        self.assertEqual({tuple(l["train"] for l in p["legs"]) for p in post_and},
+                         {("G10", "G20", "G30")})
+
+        # 5) /api/hubs 与接口参数 unbounded(0) 支持
+        hubs_res = main_mod.hubs()
+        self.assertIn("北京", hubs_res["hubs"])
+        self.assertIn("三明北", hubs_res["hubs"])
+        api_res = main_mod.transfers("起点站", "终点站", "2026-11-20", max_legs=3,
+                                     prune_level="unbounded", frontier_k=0, max_total_min=0,
+                                     hub_only=True, hub_stations="南昌", expand_city=False)
+        self.assertEqual([tuple(l["train"] for l in p["legs"]) for p in api_res["transfers"]],
+                         [("G60", "G61")])
+
+
+class TestNationwideTimetablesAndTicketsAPI(TempDBTestCase):
+    def test_tickets_api_enriches_prices_with_zfill2_and_date_isolation(self):
+        from app import main as main_mod
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [("BJP", "北京", "bj", "bj", "北京"), ("SHH", "上海", "sh", "sh", "上海")],
+            )
+            conn.execute(
+                """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
+                     from_station_no,to_station_no,start_time,arrive_time,duration,seats,can_web_buy)
+                   VALUES('T_G1','G1','2026-11-21','BJP','SHH','1','5','08:00','12:30','04:30','{"ze":"有"}','Y')"""
+            )
+            conn.execute(
+                """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
+                     from_station_no,to_station_no,start_time,arrive_time,duration,seats,can_web_buy)
+                   VALUES('T_G2','G2','2026-11-21','BJP','SHH','01','06','09:00','13:30','04:30','{"ze":"5"}','Y')"""
+            )
+            conn.executemany(
+                """INSERT INTO prices(train_no,station_train_code,train_date,from_station_no,to_station_no,seat_type,seat_name,price)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                [
+                    ("T_G1", "G1", "2026-11-20", "01", "05", "ze", "二等座", 530.0),
+                    ("T_G1", "G1", "2026-11-21", "01", "05", "ze", "二等座", 553.0),
+                    ("T_G2", "G2", "2026-11-19", "01", "06", "ze", "二等座", 510.0),
+                ],
+            )
+
+        res = main_mod.tickets("北京", "上海", "2026-11-21")
+        self.assertEqual(len(res), 2)
+        by_no = {r["train_no"]: r for r in res}
+        # T_G1 站序 '1'->'01'/'5'->'05' 对齐且只取当日 2026-11-21 实测价
+        self.assertEqual(by_no["T_G1"]["from_name"], "北京")
+        self.assertEqual(by_no["T_G1"]["to_name"], "上海")
+        self.assertEqual(len(by_no["T_G1"]["prices"]), 1)
+        self.assertEqual(by_no["T_G1"]["prices"][0]["price"], 553.0)
+        self.assertFalse(by_no["T_G1"]["price_stale"])
+        # T_G2 无当日价时回退最近快照并标记 price_stale=True
+        self.assertEqual(by_no["T_G2"]["prices"][0]["price"], 510.0)
+        self.assertTrue(by_no["T_G2"]["price_stale"])
+
+    def test_crawl_all_timetables_script_workflow_resume_and_ui_defaults(self):
+        from datetime import timedelta
+        import crawl_all_timetables as cat
+
+        expected_tomorrow = (db.cn_today() + timedelta(days=1)).isoformat()
+        self.assertEqual(cat.default_tomorrow(), expected_tomorrow)
+
+        state_file = Path(self._tmp.name) / "cat_state.json"
+        log_file = Path(self._tmp.name) / "cat.log"
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [
+                    ("BJP", "北京", "bj", "bj", "北京"),
+                    ("SHH", "上海", "sh", "sh", "上海"),
+                    ("XHZ", "小站", "xz", "xz", "小市"),
+                ],
+            )
+            # T_EXIST 已有完整时刻表，非 force 模式应自动跳过
+            conn.execute(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) "
+                "VALUES('T_EXIST','G999',?,1,'北京','BJP','----','07:00',1)",
+                (expected_tomorrow,),
+            )
+
+        fail_once = {"SHH": True}
+        seen_screens, seen_tts = [], []
+
+        def fake_crawl_stations():
+            return {"parsed": 3, "saved": 0}
+
+        def fake_crawl_screen(tc, d):
+            seen_screens.append((tc, d))
+            if tc == "SHH" and fail_once.pop("SHH", False):
+                raise RuntimeError("临时超时")
+            if tc == "XHZ":
+                raise cat.crawler.CrawlError("暂无数据") if hasattr(cat.crawler, "CrawlError") else RuntimeError("暂无数据")
+            with db.tx() as conn:
+                conn.executemany(
+                    """INSERT OR REPLACE INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                         station_train_date,start_train_date,station_no,start_station_telecode,end_station_telecode)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    [
+                        (tc, tc, d, "G101", "T_G101", d, d, 1, "BJP", "SHH"),
+                        (tc, tc, d, "G999", "T_EXIST", d, d, 1, "BJP", "SHH"),
+                    ],
+                )
+            return {"saved": 2}
+
+        def fake_crawl_tt(tn, d, f, t):
+            seen_tts.append((tn, d, f, t))
+            with db.tx() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) "
+                    "VALUES(?,?,?,1,'北京','BJP','----','08:00',1)",
+                    (tn, "G101", d),
+                )
+            return {"saved": 1}
+
+        with mock.patch.object(cat.crawler, "crawl_stations", side_effect=fake_crawl_stations), \
+             mock.patch.object(cat.crawler, "crawl_station_trains", side_effect=fake_crawl_screen), \
+             mock.patch.object(cat.crawler, "crawl_timetable", side_effect=fake_crawl_tt), \
+             mock.patch.object(cat.crawler, "set_rate"):
+            # 第1次运行：SHH 报临时超时进入 failed_stations；XHZ 暂无数据记为 done；T_EXIST 跳过；T_G101 抓取
+            s1 = cat.run_crawl(
+                ignore_maintenance=True,
+                report_sec=999,
+                state_path=state_file,
+                log_path=log_file,
+            )
+            self.assertEqual(s1["date"], expected_tomorrow)
+            self.assertEqual(s1["screens_crawled"], 2)
+            self.assertEqual(s1["screens_failed"], 1)
+            self.assertEqual(s1["timetables_crawled"], 1)
+            self.assertEqual([x[0] for x in seen_tts], ["T_G101"])
+
+            # 第2次运行（--retry-errors）：仅重抓上次失败的 SHH，其余已完成车站与已有时刻表均跳过
+            seen_screens.clear()
+            seen_tts.clear()
+            s2 = cat.run_crawl(
+                retry_errors=True,
+                ignore_maintenance=True,
+                report_sec=999,
+                state_path=state_file,
+                log_path=log_file,
+            )
+            self.assertEqual([x[0] for x in seen_screens], ["SHH"])
+            self.assertEqual(s2["screens_crawled"], 1)
+            self.assertEqual(s2["screens_failed"], 0)
+            self.assertEqual(seen_tts, [])
+
+        # 校验前端页面包含默认明天(+1天)与国铁 12306 席别网格及展开方法
+        html_text = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("const tomorrow=new Date(Date.now()+8*3600e3+86400e3).toISOString().slice(0,10)", html_text)
+        self.assertIn("SEAT_COLS", html_text)
+        self.assertIn("priceDrawerHtml", html_text)
+        self.assertIn("toggleTT", html_text)
+
+
 if __name__ == "__main__":
     unittest.main()
+

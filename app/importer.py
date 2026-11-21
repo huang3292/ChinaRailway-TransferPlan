@@ -66,11 +66,14 @@ def _save_with_conn(conn, api_type: str, records: list[dict], raw_id: int) -> in
                  duration=:duration,can_web_buy=:can_web_buy,seat_types=:seat_types,seats=:seats,raw_id=:raw_id""",
             rows_data)
     elif api_type == "price":
-        # 唯一键列不允许 NULL，否则 SQLite 视为互不相同导致重复
+        # 唯一键列不允许 NULL，否则 SQLite 视为互不相同导致重复；非空站序统一 zfill(2) 对齐票价表口径
+        def _norm_sno(v):
+            s = str(v).strip() if v is not None else ""
+            return s.zfill(2) if s else ""
         rows_data = [
             dict(r, train_date=r["train_date"] or "",
-                 from_station_no=r["from_station_no"] or "",
-                 to_station_no=r["to_station_no"] or "",
+                 from_station_no=_norm_sno(r.get("from_station_no")),
+                 to_station_no=_norm_sno(r.get("to_station_no")),
                  raw_id=raw_id)
             for r in records
         ]

@@ -10,20 +10,21 @@
 
 ## 1. 技术栈与启动
 
-- 后端：Python + FastAPI + Uvicorn，SQLite（WAL 模式，线程局部连接；连接建好即设
+- 后端：Python（FastAPI + Uvicorn，并内置基于标准库 `http.server` 的无三方依赖兜底服务端 `app/server.py`），SQLite（WAL 模式，线程局部连接；连接建好即设
   `synchronous=NORMAL`、`temp_store=MEMORY`、`cache_size=-131072`≈128MB 页缓存、
   `mmap_size=512MB` 只读内存映射）。写入统一走 `db.tx()`，事务内实际变更后会
   `bump_data_version()` 让 §6.1 的内存缓存失效重建。
 - 前端：单文件原生 HTML/JS（`static/index.html`），无构建步骤。
-- 依赖：`fastapi`、`uvicorn`、`requests`、`python-multipart`（见 `requirements.txt`）。
+- 依赖：`fastapi`、`uvicorn`、`requests`、`python-multipart`（见 `requirements.txt`）；离线/精简环境也可直接用标准库运行 `app/server.py`。
 
 ```bash
 pip install -r requirements.txt
+python -m app.server --port 3000
+# 或直接使用 uvicorn（需端口自定义时调整 --port）：
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8306
-# 浏览器打开 http://127.0.0.1:8306/
 ```
 
-开发时建议加 `--reload`，否则改后端代码需手动重启进程才会生效：
+开发时若用 uvicorn 建议加 `--reload`，否则改后端代码需手动重启进程才会生效：
 
 ```bash
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8306 --reload
@@ -37,18 +38,24 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8306 --reload
 
 ```
 app/
-  main.py      FastAPI 路由 + 后台任务（jobs）调度
-  crawler.py   12306 抓取 + 自适应/手动限速
-  parsers.py   各接口原始返回 -> 结构化记录（字段索引与官方一致）
-  importer.py  留档(raw_payloads) + 解析 + 入库（爬虫与手动导入共用）
-  db.py        SQLite 连接/事务/建表/车站与城市解析/设置
-  transfer.py  换乘搜索引擎（A 大屏 / B 时刻表 / C 余票 / D 多程）
-  fare.py      本地票价估算 + 用实际票价反推费率校准
+  main.py            路由定义 + 参数校验 + 后台任务（jobs）调度（含无 FastAPI 兼容层）
+  server.py          标准库 ThreadedHTTPServer 入口（优先 uvicorn，无三方库时兜底启动）
+  crawler.py         12306 抓取 + 自适应/手动限速
+  parsers.py         各接口原始返回 -> 结构化记录（字段索引与官方一致）
+  importer.py        留档(raw_payloads) + 解析 + 入库（爬虫与手动导入共用）
+  db.py              SQLite 连接/事务/建表/车站与城市解析/设置
+  transfer.py        换乘搜索引擎（A 大屏 / B 时刻表 / C 余票 / D 多程）
+  fare.py            本地票价估算 + 用实际票价反推费率校准
 static/
-  index.html   前端单页（换乘搜索 / 爬取数据 / 导入数据 / 数据浏览 四个页签）
-data/rail.db   本地数据库
-samples/       示例原始返回（可用于手动导入测试）
-diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不入库，见 §13）
+  index.html         前端单页（换乘搜索 / 爬取数据 / 导入数据 / 数据浏览 四个页签）
+tests/
+  test_core.py       核心单元测试（解析、剪枝、缓存失效、HTTP 路由回归）
+crawl_nationwide.py     全国全量离线爬取脚本（旧版简洁版）
+crawl_all_timetables.py  全国全量车站经由车次 + 去重全车次时刻表爬取脚本（默认明天、支持分阶段/按站筛选/已有时刻表跳过/断点重试）
+package.json             dev/start 启动脚本（调用 python3 -m app.server --port 3000）
+data/rail.db         本地数据库
+samples/             示例原始返回（可用于手动导入测试）
+diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略，不入库，见 §13）
 ```
 
 数据流总览：
@@ -131,12 +138,14 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 - `detect_type(text)`：自动识别 `stations / left_ticket / price / station_screen / train_stops`。
 - `parse_left_ticket`：竖线分隔字段，索引见 `LT` 字典；席别余票索引见 `SEAT_FIELDS`。
   **乘车日期以查询日期 `ctx.date` 为准**（`start_train_date` 是始发发车日，长途车会早一两天）。
+- `parse_left_ticket_prices`：从 `leftTicket` 字段 `[39]`（`yp_info_new`）每 10 字符一段解析实时票价与无座等嵌入价格，与余票同步写入 `prices`（`from_station_no`/`to_station_no` 非空时在入库阶段统一 `zfill(2)`）。
 - `parse_price`：键映射见 `PRICE_KEYS`（如 `O→二等座 ze`、`M→一等座 zy`、`A9/9→商务座 swz`）。
   `_price_value`：纯整数单位为**角**（÷10），带小数点为**元**；`--`/`无` 视为 None。
 - `parse_train_stops`：`_find_stop_list` 兼容 `data.data / stop_stations / stations / result` 多种嵌套；
   `train_no` 取自 `ctx`（抓取时注入），电报码缺失时用站名表回填。
 - `parse_station_screen`：解析大屏字段，含 `distance`（累计里程）、`running_time`（始发至本站历时）、
-  `start_start_time`/`end_arrive_time`（始发发车/终到到达时刻）——这些是引擎 A 推导始发终到与里程的关键。
+  `arrive_day_diff`/`start_day_diff`（相对始发日跨天偏移）、`start_start_time`/`end_arrive_time`（始发发车/终到到达时刻）——这些是引擎 A 推导始发终到与里程的关键。
+- `running_fig_allows(fig, target_date)`：解析运行图区段（`起始#周期#步长#截止`）校验某日是否开行。
 - 席别中文名统一在 `SEAT_NAMES`。
 
 > 12306 改版时优先改这里：字段索引 `LT`/`SEAT_FIELDS`、价格键 `PRICE_KEYS`、`_find_stop_list`。
@@ -145,7 +154,7 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 
 ## 6. 换乘搜索引擎（`app/transfer.py`，核心）
 
-入口 `search(from_q, to_q, date, min_wait=30, max_wait=360, limit=0, max_legs=2, expand_city=True)`。
+入口 `search(from_q, to_q, date, min_wait=30, max_wait=360, limit=0, max_legs=2, expand_city=True, cross_extra=60, frontier_k=None, prune_level="balanced", max_total_min=None, detour_ratio=None, prune_dominated=None, allow_cross_station=True, hub_only=False, hub_stations="", allow_prefixes="", exclude_prefixes="", include_stations="", exclude_stations="", include_stations_mode="or", progress_cb=None, cancel_event=None, sub_cb=None)`；独立后置过滤器 `filter_plans(...)`。
 
 ### 6.1 准备
 
@@ -170,34 +179,34 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 ### 6.2 四个引擎（结果合并去重）
 
 - **A 车站大屏 `_search_screen`**：`_load_screen` 把大屏按 `(train_no, 开行日)` 聚合成"开行实例"，
-  每站观测含到/发时刻（绝对分钟）、station_no、累计里程；并用 `running_time`+`end_arrive_time`
-  推导始发/终到时刻。**真实开行日期优先**；无当日数据时取最近班次按"每日开行假设"平移到查询日
-  （`shift`，`date_assumed=True`）。
-- **B 车次时刻表 `_search_timetable`**：`_load_trains` 读 `train_stops`，按到发时刻递增推算跨天，
-  统一为相对始发的分钟数。全程按"每日开行假设"推算日期（`date_assumed=True`）。
-- **C 站间余票**：仅有余票数据、A/B 未覆盖的直达，按精确日期补充（`search` 末段）。
+  每站观测含到/发时刻（优先按 `start_train_date + arrive_day_diff / start_day_diff` 计算绝对分钟，缺 `day_diff` 时仅对 `>12h` 倒挂回退跨天，并按 `running_time`+`end_arrive_time` 推导始发/终到时刻）。**真实开行日期优先**；无当日数据时取最近班次按"每日开行假设"平移到查询日（`shift`，`date_assumed=True`）。
+- **B 车次时刻表 `_search_timetable`**：`_load_trains` 读 `train_stops`，先记录 `arr_day` 再判断是否过午夜翻日计算 `dep`，统一为相对始发的分钟数（解决跨零点停站如 `23:55` 到、`00:05` 发同日错位）。全程按"每日开行假设"推算日期（`date_assumed=True`）。
+- **C 站间余票**：仅有余票数据、A/B 未覆盖的直达，按精确日期补充（`search` 末段）；耗时优先用 `_colon_dur(r["duration"])` 解析 `HH:MM`（兼容超过 24h 的长途直达）。
 - **D 多程换乘 `_search_multi`**（`max_legs>=3` 时启用）：`_load_services` 把大屏+时刻表统一成
-  "车次服务"，BFS 逐层扩展，`FRONTIER_K=4` 每站每层保留最早到达的 4 个状态剪枝，
-  `MAX_TOTAL_MIN=2880`（48h）总行程上限防组合爆炸。
-  未开启支配剪枝时走"入桶即截断"的有界桶：每个中转站只维护"最快到达/最低费用"两维 top-K，
-  落选分支立即释放，结果与"整层建完再排序截断"一致（稳定排序的平局用插入序号还原），只为压内存峰值。
+  "车次服务"，BFS 逐层扩展。支持四档预设 `PRUNE_PRESETS`：
+  - `unbounded`（无限制，仅防死循环）：`frontier_k=0 / max_total_min=0 / detour_ratio=0 / prune_dominated=False`；
+  - `relaxed`（高度宽松）：`frontier_k=16 / max_total_min=5760(96h) / detour_ratio=0 / prune_dominated=False`；
+  - `balanced`（均衡默认）：`frontier_k=8 / max_total_min=2880(48h) / detour_ratio=0 / prune_dominated=False`；
+  - `strict`（严格精简）：`frontier_k=4 / max_total_min=2160(36h) / detour_ratio=2.0 / prune_dominated=True`。
+  另有 `DETOUR_FLOOR_MIN=480`（8 小时保底上限，防短途高铁误杀普速与低价中转）与 `SAFE_WAIT_MIN=30`（安全缓冲支配保护）；`frontier_k>0` 时每站每层保留"最快到达 + 最低费用"双路 top-`frontier_k`（未开启支配剪枝时走"入桶即截断"的有界桶压内存峰值）。非末程与末程统一按 `not is_last` / `is_last` 做过终点折返（`loopback`）、城市绕回、同城空转（如 `北京→北京南` 再换乘）与 `dur<=0` 防护校验，同时允许同车多个目的站展开。
+- 当 `max_legs=1` 时，`need_transfers=False` 跳过所有 2 程与多程扩展，仅返回直达方案（`transfers=[]`）。
 
-### 6.3 换乘约束与剪枝
+### 6.3 换乘约束、搜前枢纽收窄与后置过滤
 
-- 换乘等待 `wait` 须满足 `min_wait <= wait <= max_wait`；**同城异站换乘额外 +30 分钟**
-  （`eff_min = min_wait if same else min_wait+30`，见 `_dep_keys`）。
+- 换乘等待 `wait` 须满足 `min_wait <= wait <= max_wait`；**同城异站换乘额外加时 `cross_extra`（默认 +60 分钟）**
+  （`eff_min = min_wait if same else min_wait + cross_extra`），也可设 `allow_cross_station=False` 禁绝异站。
 - 跨天：`n = ceil((到达 + eff_min - 第二程发车) / 1440)` 自动取下一班。
-- **剔除折返/绕回**：第二程重新经过出发站、第一程走过的站、或再次回到换乘站 → 丢弃。
-  **过头折返**同计入 `loopback`：第二程/末程在最后一个目的站**之后**又停到第一程已走过的站
-  （全程成环），A/B/D 三个引擎都判这一条。
+- **防死循环与无意义分支硬剪枝**：重复车次（`repeat_train`）、重访出发/已乘车站及过终点后再绕回已乘车站的**过头折返**（`loopback`）、绕回已离开城市（`city_loop`）、刚上车未出城即在同城下一站换乘的**同城内耗空转**（`city_loop` / 首程 `loopback`）、已到目的站后再继续换乘（`passed_dest`）、以及 `dur <= 0` 脏停站边。
+- **指定枢纽站搜前收窄（`hub_only` / `hub_stations`）**：独立开关，开启后在图搜索阶段（引擎 A/B/D）仅允许经 `MAJOR_HUBS`（31 个直辖市/省会/首府 + 23 个重要干线铁路枢纽，共 54 处）或用户增删后的 `hub_stations` 换乘，拦截数计入 `prune_stats["hub_filter"]`。
+- **车次头与换乘站精确后置过滤（`filter_plans()`）**：`allow_prefixes`/`exclude_prefixes` 按车次头过滤；`include_stations`/`exclude_stations` 通过 `_match_station_tokens` 精确匹配**电报码、完整站名（含可选单后缀`站`）或所属城市名**（不做子串扩散，例如排除「北京南」不扩散到全北京，「南平市」不匹配同城「延平」），多个 `include_stations` 支持 `or`/`and`。该过滤已与图搜索解耦：前端在返回结果后即时本地执行，修改无需重搜；`search()` 响应附带 `station_cities` 与 `city_suffix_stations` 供前端精准复用。
 - `_assumed_conflict`：推算方案（`date_assumed`）若其任一程的 OD+日期已有权威余票、但该车次不在
   当日余票里（即当日不开行）→ 剔除，以实际余票为准。
 
 ### 6.4 合并与排序
 
-- 直达按 `(首程train_no, 首程depart)` 去重；换乘按 `(首程no, 二程no, 换乘站, 二程from, 首程depart)` 去重。
+- 直达按 `(首程train_no, 首程from, 首程to, 首程depart)` 去重；2 程换乘按 `(首程no, 二程no, 换乘站, 二程from, 首程from, 二程to, 首程depart)` 去重；多程按 `(完整train_no元组, 各换乘站名元组, 首程from, 末程to, 首程depart)` 去重，保留同站与异站或同城不同起讫站的合法分支。
 - `rank(p)`：**有真实票价的优先**，其次非推算（真实日期）优先。
-- 最终按 `total_min` 升序。返回含 `direct`/`transfers`/`screen_trains`/`timetable_trains`/`cache_hit`/`note`。
+- 最终按 `total_min` 升序。返回含 `direct`/`transfers`/`screen_trains`/`timetable_trains`/`cache_hit`/`prune_config`/`prune_stats`/`note`。
 
 ### 6.5 票价/余票富化 `_enrich`
 
@@ -206,8 +215,7 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 2. 无真实票价 → `fare.estimate` 得 `price_est`（估算区间）。
 3. 查 `_seat_map`（train_no+OD+日期）得 `seats`/`can_web_buy`。
 
-> 修改换乘行为的关键参数：`min_wait/max_wait`（API 传入）、异站 +30（`_search_screen`/`_search_timetable`/
-> `_search_multi` 的 `eff_min`）、`MAX_TOTAL_MIN`、`FRONTIER_K`、`MAX_TIMETABLES`（main.py 向导封顶）。
+> 修改换乘行为的关键参数：`min_wait/max_wait/cross_extra`（API 传入，异站默认 +60）、`PRUNE_PRESETS`、`DETOUR_FLOOR_MIN`、`SAFE_WAIT_MIN`、`MAX_TIMETABLES`（main.py 向导封顶）。
 
 ---
 
@@ -235,6 +243,7 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 - **`_route_job`**（一键导入/在线模式）：`/api/import/route` 触发，阶段
   `screen→timetable→tickets→price`。先抓出发/到达全部车站大屏；`deep` 时再抓最多
   `MAX_TIMETABLES=200` 个车次时刻表、各 OD 余票、各车次票价。
+- **`_transfer_search_job`**（异步换乘搜索）：`POST /api/transfers/start` 触发，支持实时进度/子进度（`sub_done`/`sub_total`）与中断。
 - **`_plan_tickets_job`**（方案实时查价/余票）：`/api/plan_tickets` 触发，见下节。
 
 ### 方案票价/余票实时查询 `/api/plan_tickets`
@@ -244,10 +253,9 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 2. 对每个唯一 OD+日期：**日期 >= 今天**才实时 `crawl_tickets`（过去日期只用缓存）。
 3. 从入库 tickets 取余票；station_no 优先用 tickets 的 `from/to_station_no`，缺失用 `sno` 回填。
 4. 票价：已有缓存跳过，否则 `crawl_price`（同样仅未来日期）。
-5. 输出 `result[key] = {seats, can_web_buy, prices:[{seat,price}]}`；无余票则 `error`。
+5. 输出 `result[key] = {seats, can_web_buy, prices:[{seat,price}]}`；无余票或失败则 `error`。
 
-> 前端 `autoQuery()` 取**当前排序+筛选后**的前 50 个未发车方案的腿，POST 后轮询，
-> `applyTickets()` 按 key 回填。切换排序/筛选会 `refreshAutoQuery()` 防抖 900ms 重查。
+> 前端 `autoQuery()` 取**当前页**（`sortPlans(filterPlans(...)).slice((page-1)*size, page*size).filter(!departed)`）的行程段，POST 后轮询，`applyTickets()` 按 key 回填。切换排序/筛选/翻页会 `refreshAutoQuery()` 防抖 900ms 重查。
 
 ---
 
@@ -276,7 +284,9 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 | `GET /` | 前端页面 |
 | `GET /api/stats` | 各表计数 |
 | `GET /api/stations?q=&limit=` | 车站搜索（站名/电报码/拼音/简拼） |
+| `GET /api/hubs` | 默认全国核心枢纽清单（`MAJOR_HUBS`，31 省会直辖市 + 干线大枢纽） |
 | `GET/POST /api/rate` | 读取/设置限速 |
+| `POST /api/crawler/reset` | 重置 12306 会话与动态查询 URL |
 | `POST /api/import` | 手动导入原始文本（可指定 api_type 与 ctx） |
 | `POST /api/import/file` | 上传文件导入 |
 | `POST /api/crawl/stations` | 抓站名表 |
@@ -285,13 +295,16 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 | `POST /api/crawl/tickets` | 抓站间余票 `{from_station,to_station,date,with_prices?}` |
 | `POST /api/crawl/price` | 抓单票价 `{train_no,from_station_no,to_station_no,seat_types,date}` |
 | `POST /api/import/route` | 一键导入向导 `{from_city,to_city,date,deep}` → job |
-| `GET /api/jobs/{id}` | 任务进度 |
+| `GET /api/jobs/{id}` | 任务进度（含子进度 `sub_done`/`sub_total`） |
+| `POST /api/jobs/{id}/cancel` | 中断运行中的后台任务 |
 | `GET /api/station_trains?station=&date=` | 浏览大屏车次 |
 | `GET /api/timetable?train_no=` | 时刻表（含大屏退回） |
 | `GET /api/trains?q=&limit=` | 按车次号搜时刻表 |
-| `GET /api/tickets?from_station=&to_station=&date=` | 浏览余票 |
+| `GET /api/tickets?from_station=&to_station=&date=` | 浏览余票（批量附带匹配实测票价 `prices`/`price_date`/`price_stale`） |
 | `GET /api/prices?train_no=` | 浏览票价 |
-| `GET /api/transfers?...` | 换乘搜索（见 §6 参数） |
+| `DELETE /api/cache` | 清理过期数据与内存缓存（`?before_date=&include_raw=`） |
+| `GET /api/transfers?...` | 同步换乘搜索（见 §6 参数） |
+| `POST /api/transfers/start` | 异步换乘搜索 → job（支持进度查询与中断） |
 | `POST /api/plan_tickets` | 方案实时查价/余票 → job |
 
 ---
@@ -300,25 +313,18 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 
 四个页签：换乘搜索 / 爬取数据 / 导入数据 / 数据浏览。核心 JS：
 
-- 搜索：`#s-go` → （在线模式先 `runRouteImport`）→ `GET /api/transfers` → 给方案打 `_k/_type` → `render()`。
+- 搜索：`#s-go` → （在线模式先 `runRouteImport`）→ `POST /api/transfers/start` + 轮询 `/api/jobs/{id}` → 给方案打 `_k/_type` → `render()`。
 - `legKey(l)`：`train_no|from_telecode|to_telecode|depart[:10]`，与后端 `_leg_ident` 对齐。
-- `priceKey(p)`：返回 `[miss?1:0, est?1:0, sum]`——**实际价优先**（有真实价排前，按实际价升序），
-  其次有估价，最后按金额。`sortPlans` 价格模式据此排序。
-- `filterPlans`：方案类型/仅换乘/席位/换乘站/换乘类型/车次包含/车次头/出发到达时间等筛选。
-  （"直达 0"通常是开了"仅换乘"或换乘站筛选所致，非 bug。）
-- 服务端剪枝可发现性：`refreshPruneToggleBadge()` 把仍生效的筛选值**直接写在折叠的"自定义规则"按钮上**
-  （`自定义规则 ▾ ⚠生效1：Z,D`，超 34 字截断，完整口径在 `title`），并给面板里非空的那四个框描红边、
-  淡红底（`customFilterRaw` 是这四个值的唯一来源，`customFilterParts`/按钮/明细都从它取）；输入时
-  `input` 事件即时刷新，不用等失焦。`pruneBreakdownItems`/`appliedFilterParts` 把拦截明细写成
-  `自定义规则 N（已生效：只含车型头「Z,D」…）`，取值优先用响应里的 `prune_config` 回显；
-  只要有筛选生效，诊断区就给"清除自定义筛选并重搜"（`clearCustomFilters`）。
-  注意可见的"车次筛选"`#s-filter` 是**前端显示过滤**（支持 `Z126` 这类完整车次号、任一腿命中即保留），
-  与面板里的服务端 `#s-inc-pfx`（只认车型头前缀、搜索期逐腿剪枝）是两个不同的框。
-- `autoQuery()`：`sortPlans(filterPlans(...)).filter(!departed).slice(0,50)` → flatMap 腿 →
+- `priceKey(p)`：返回 `[miss?1:0, est?1:0, sum, waitlist?1:0, allSoldOut?1:0]`——**实际价优先**（有真实价排前，按实际价升序；同价位优先有票而非候补），其次有估价。`sortPlans` 价格模式据此排序。
+- `filterPlans`：统一后置本地过滤（即时生效、不重跑图搜索）——只含/排除车型头（`#s-inc-pfx`/`#s-exc-pfx`）、车次包含（`#s-filter`）、必经/排除换乘站（`#s-inc-tst` + `#s-inc-mode` OR/AND、`#s-exc-tst`，利用响应附带的 `station_cities` 与 `city_suffix_stations` 复现精确站名/城市匹配）、换乘类型（`#s-same`）、席位（`#s-seat`）、出发到达时间等。
+  （"直达 0"通常是开了"仅换乘"、"同/异站换乘"或"必经换乘站"筛选所致，非 bug。）
+- 剪枝与指定枢纽收窄（搜前）：`#s-prune` 提供均衡 / 严格 / 高度宽松 / 无限制（仅防死循环） / 自定义五种策略，`#s-hub-only` 与 `#s-hubs`（可点「填入省会+大枢纽预设」自由增删）控制搜前仅经指定枢纽换乘；`#s-prune-panel` 仅保留纯数值/图参数（束宽 0=不限、总历时 0=不限、绕行倍率、异站分支、支配剪枝），不再混入后置过滤框。`pruneDiagHtml` 按需提供扩展 3 程、放宽至高度宽松/无限制、关闭仅枢纽重搜，以及一键 `清除后置筛选`（0ms 本地生效）。
+- **日期与国铁 12306 样式展示**：所有查询/爬取日期输入项默认取北京时间**明天（+1 天）**（缓存清理基线维持今天避免误清）。结果区与「站间余票」表采用仿国铁 12306 样式：固定 12 席别列同行对齐展示余票状态与实时/估算票价，支持点击**车次**或**时刻表 ▾ / 票价详情 ▾ / 席别单元格**原地展开国铁经停时刻表与全部席别余票/票价明细条，并在实时轮询回填期间保留展开状态。
+- `autoQuery()`：`sortPlans(filterPlans(...)).slice((page-1)*size, page*size).filter(!departed)` → flatMap 腿 →
   `POST /api/plan_tickets` → `pollPlanJob` → `applyTickets` 按 key 回填真实价/余票。
-- `refreshAutoQuery()`：排序/筛选变化后防抖 900ms 重查（仅勾选"自动查询票价/余票"时）。
-- 时刻表展开：`toggleTT`/`renderTT`/`ttTable`/`crawlTTPlan`（见 §9）。
-- 爬取页：`crawlTT`/`showTimetable`（模态框）、`renderTickets` 等。
+- `refreshAutoQuery()`：排序/筛选/翻页变化后防抖 900ms 重查（仅勾选"自动查询票价/余票"时）。
+- 时刻表与票价展开：`toggleTT`/`renderTT`/`ttTable`/`crawlTTPlan` 与 `togglePriceRow`/`priceDrawerHtml`（见 §9）。
+- 爬取页：`crawlTT`/`showTimetable`（模态框）、`renderTickets`/`drawTicketsTable`（国铁席别+票价网格与行内展开）等。
 
 > 改前端排序/筛选/自动查询逻辑都在 `index.html` 的 `priceKey/sortPlans/filterPlans/autoQuery` 几处。
 
@@ -330,8 +336,8 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 |---|---|
 | 12306 字段/接口改版 | `parsers.py`（`LT`/`SEAT_FIELDS`/`PRICE_KEYS`/`_find_stop_list`）、`crawler.py`（URL/参数） |
 | 限速快慢/风控策略 | `crawler.py`（`MIN_FLOOR/MAX_CEIL`、`_note_ok/_note_throttled`） |
-| 换乘最短/最长等待、异站预留 | API `min_wait/max_wait`；`transfer.py` 各处 `eff_min`（异站 +30） |
-| 多程剪枝/总时长上限 | `transfer.py`（`FRONTIER_K`、`MAX_TOTAL_MIN`）；`main.py`（`MAX_TIMETABLES`） |
+| 换乘最短/最长等待、异站预留 | API `min_wait/max_wait/cross_extra`（异站默认 +60）；`transfer.py` 各引擎 `eff_min` |
+| 多程剪枝/总时长上限/预设/核心枢纽 | `transfer.py`（`PRUNE_PRESETS`、`MAJOR_HUBS`、`DETOUR_FLOOR_MIN`、`SAFE_WAIT_MIN`、`filter_plans`）；`main.py`（`MAX_TIMETABLES`） |
 | 票价估算费率/速度 | `fare.py`（`RATES`/`SPEED`/`load_calibration`） |
 | 城市展开/别名 | `db.py`（`city_stations`、`CITY_PROPER`） |
 | 常驻路网/日期缓存、候选筛选 | `transfer.py`（`_build_graph_cache`/`_get_graph_cache`/`_get_date_cache`、`screen_key_to_tn`/`tt_key_to_tn`）、`db.py`（`data_version`/`bump_data_version`） |
@@ -347,20 +353,17 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 3. 余票乘车日期以**查询日期**为准，勿用 `start_train_date`（始发日）。
 4. 大屏/时刻表入库是"先删后插"的整份覆盖；余票/票价是按唯一键 upsert。
 5. 推算方案 `date_assumed=True`，会被 `_assumed_conflict` 用当日权威余票校验剔除。
-6. 改后端代码后需重启 uvicorn（或启用 `--reload`）；前端改 `index.html` 刷新浏览器即可。
+6. 改后端代码后需重启服务（uvicorn 可启用 `--reload`）；前端改 `index.html` 刷新浏览器即可。
 7. 所有抓取原始返回都进 `raw_payloads`，排查解析问题先查留档（`source` 区分 crawl/import/test）。
 8. 一个 `train_no` = 一趟物理车次的**单一方向**，途中会换显示车次码（厦门北→兰州记 `Z126/Z127`，
    兰州→厦门北是另一个 `train_no`，记 `Z125/Z128`，且停站表不同）。因此"大屏车次码与时刻表车次码
    不一致"**不能**当作反向证据剔除，反向/缺站只能靠 `train_no` 与 `station_no` 顺序判断。
-9. "自定义规则"面板折叠后，`搜索只含车型头`/`剪除车型头`/`必经中转站`/`排除中转站` 四个文本框
-   **仍然生效**，且切换剪枝预设（严格/均衡/宽松）不会清空它们。现在这四个值会同时出现在三处：按钮上
-   `⚠生效N：Z,D`、展开时框体的红边淡红底、拦截明细 `自定义规则 N（已生效：…）`；结果异常少时先看这三处，
-   别急着怀疑算法或数据。尤其别把可见的"车次筛选"框（前端显示过滤）当成它——那个是空的也可能有生效值。
+9. **搜前与后置边界**：仅`仅经枢纽/指定站换乘`（`hub_only`/`hub_stations`）、防死循环硬规则与`unbounded/relaxed/balanced/strict`剪枝参数参与搜前裁剪；车型头与必经/排除换乘站已全部后置到主面板可见区，前端修改即时过滤且不再隐藏于折叠面板，排查结果偏少时先区分「剪枝拦截明细（如 `非枢纽剪除`/`总耗时超限`）」与「后置过滤条」。
 10. `screen_all`/`tt_all`/`services_all` 和两张倒排索引是**进程内跨请求共享**的缓存对象，只读：
     不要在 `search()` 里原地改写（会污染下一个查询），也别指望 `del screen, tt` 省内存（删的只是
     本地引用，删早了末尾统计就取不到值）。要调整停靠站口径就改 `_build_graph_cache`，一次构建全生效。
 11. 缓存过期只看 `db.data_version()`：进程内 `db.tx()` 写入代数 + `data/rail.db` 与 `-wal` 的
-    mtime/size。用外部脚本直接改库文件而没动这两项时，需重启 uvicorn 才会重建。
+    `mtime_ns`/`size`。外部脚本正常写库会改变这两项并在下次查询时自动触发缓存重建；仅当文件元数据未变化时才需重启服务。
 
 ---
 

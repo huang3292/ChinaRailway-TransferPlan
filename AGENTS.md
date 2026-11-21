@@ -27,8 +27,8 @@
 - 返程车次停站表不一定一样（Z126 停莆田、Z125 不停），车次码不一致**不能**当反向证据。
 - `screen_all`/`tt_all`/`services_all` 与两张倒排索引是跨请求共享的只读缓存对象：
   别在 `search()` 里原地改，也别 `del screen, tt`。
-- 缓存失效只看 `db.data_version()`（进程内写入代数 + db/-wal 的 mtime/size）；
-  外部脚本直接改库后需重启服务才重建。
+- 缓存失效只看 `db.data_version()`（进程内写入代数 + db/-wal 的 `mtime_ns`/`size`）；
+  外部脚本正常写入 SQLite 会改变文件元数据并在下次查询时自动重建缓存（仅文件签名未变时才需手动重启）。
 
 ## Git 与运维
 - 高危操作（push、reset、删除、覆盖）前先备份、验证零丢失、展示差异。

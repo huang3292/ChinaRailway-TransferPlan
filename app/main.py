@@ -274,6 +274,11 @@ def stations(q: str = "", limit: int = 30):
     return db.rows("SELECT * FROM stations LIMIT ?", (limit,))
 
 
+@app.get("/api/hubs")
+def hubs():
+    return {"hubs": list(transfer.MAJOR_HUBS), "text": ",".join(transfer.MAJOR_HUBS)}
+
+
 # ---------- 请求速率 ----------
 @app.get("/api/rate")
 def get_rate():
@@ -560,17 +565,26 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
 
         if deep:
             phf, pht = ",".join("?" * len(ftcs)), ",".join("?" * len(ttcs))
-            tk = db.rows(
-                f"""SELECT t.train_no,t.station_train_code,t.from_station_no,t.to_station_no,t.seat_types
-                    FROM tickets t
-                    WHERE t.from_telecode IN ({phf}) AND t.to_telecode IN ({pht}) AND t.train_date=?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM prices p WHERE p.train_no=t.train_no
-                            AND p.from_station_no=t.from_station_no
-                            AND p.to_station_no=t.to_station_no
-                            AND p.train_date=t.train_date
-                      )""",
-                (*ftcs, *ttcs, date))
+            have_prices = {
+                (r["train_no"], str(r["from_station_no"] or "").zfill(2), str(r["to_station_no"] or "").zfill(2))
+                for r in db.rows(
+                    "SELECT train_no,from_station_no,to_station_no FROM prices WHERE train_date=?",
+                    (date,),
+                )
+            }
+            tk = [
+                r for r in db.rows(
+                    f"""SELECT train_no,station_train_code,from_station_no,to_station_no,seat_types
+                        FROM tickets
+                        WHERE from_telecode IN ({phf}) AND to_telecode IN ({pht}) AND train_date=?""",
+                    (*ftcs, *ttcs, date),
+                )
+                if (
+                    r["train_no"],
+                    str(r["from_station_no"] or "").zfill(2),
+                    str(r["to_station_no"] or "").zfill(2),
+                ) not in have_prices
+            ]
             with _jobs_lock:
                 cur_total = jobs[job_id]["total"]
             _job_update(job_id, phase="price", total=cur_total + len(tk))
@@ -671,8 +685,51 @@ def trains(q: str = "", limit: int = 50):
 def tickets(from_station: str, to_station: str, date: str):
     _check_date(date)
     f, t = _station_or_400(from_station), _station_or_400(to_station)
-    return db.rows("""SELECT * FROM tickets WHERE from_telecode=? AND to_telecode=? AND train_date=?
-                      ORDER BY start_time""", (f["telecode"], t["telecode"], date))
+    tk_rows = db.rows(
+        """SELECT * FROM tickets WHERE from_telecode=? AND to_telecode=? AND train_date=?
+           ORDER BY start_time""",
+        (f["telecode"], t["telecode"], date),
+    )
+    if not tk_rows:
+        return tk_rows
+    tns = list({r["train_no"] for r in tk_rows if r.get("train_no")})
+    price_buckets: dict[tuple[str, str, str], dict[str, list[dict]]] = {}
+    if tns:
+        ph = ",".join("?" * len(tns))
+        for pr in db.rows(
+            f"""SELECT train_no,from_station_no,to_station_no,train_date,seat_type,seat_name,price
+                FROM prices WHERE train_no IN ({ph})
+                ORDER BY train_date DESC, price ASC""",
+            tuple(tns),
+        ):
+            fno_s = str(pr.get("from_station_no") or "").zfill(2)
+            tno_s = str(pr.get("to_station_no") or "").zfill(2)
+            key = (pr["train_no"], fno_s, tno_s)
+            d_str = pr.get("train_date") or ""
+            price_buckets.setdefault(key, {}).setdefault(d_str, []).append({
+                "seat_type": pr["seat_type"],
+                "seat": pr.get("seat_name") or pr["seat_type"],
+                "price": pr["price"],
+            })
+    for r in tk_rows:
+        r["from_name"] = f["name"]
+        r["to_name"] = t["name"]
+        fno_s = str(r.get("from_station_no") or "").zfill(2)
+        tno_s = str(r.get("to_station_no") or "").zfill(2)
+        by_date = price_buckets.get((r["train_no"], fno_s, tno_s), {})
+        if date in by_date:
+            r["prices"] = by_date[date]
+            r["price_date"] = date
+            r["price_stale"] = False
+        elif by_date:
+            # 优先最新实测单日快照，与 _plan_tickets_job / transfer._price_map 口径一致
+            latest_d = max(by_date)
+            r["prices"] = by_date[latest_d]
+            r["price_date"] = latest_d
+            r["price_stale"] = bool(latest_d)
+        else:
+            r["prices"] = []
+    return tk_rows
 
 
 @app.get("/api/prices")
@@ -690,20 +747,23 @@ def clear_cache(before_date: str | None = None, include_raw: bool = False):
 # ---------- 换乘搜索 ----------
 def _validate_search_params(date: str, max_legs: int, cross_extra: int,
                             frontier_k: int | None, prune_level: str,
-                            max_total_min: int | None, detour_ratio: float | None):
+                            max_total_min: int | None, detour_ratio: float | None,
+                            include_stations_mode: str = "or"):
     _check_date(date)
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
     if cross_extra < 0 or cross_extra > 360:
         raise HTTPException(400, "cross_extra 必须在 0-360 之间")
-    if frontier_k is not None and (frontier_k < 1 or frontier_k > 32):
-        raise HTTPException(400, "frontier_k 必须在 1-32 之间")
-    if prune_level not in ("strict", "balanced", "relaxed", "custom"):
-        raise HTTPException(400, "prune_level 必须为 strict / balanced / relaxed / custom")
-    if max_total_min is not None and (max_total_min < 60 or max_total_min > 10080):
-        raise HTTPException(400, "max_total_min 必须在 60-10080 分钟之间")
+    if frontier_k is not None and (frontier_k < 0 or frontier_k > 64):
+        raise HTTPException(400, "frontier_k 必须在 0-64 之间（0 表示不限束宽）")
+    if prune_level not in ("unbounded", "relaxed", "balanced", "strict", "custom"):
+        raise HTTPException(400, "prune_level 必须为 unbounded / relaxed / balanced / strict / custom")
+    if max_total_min is not None and max_total_min != 0 and (max_total_min < 60 or max_total_min > 20160):
+        raise HTTPException(400, "max_total_min 必须为 0（不限）或在 60-20160 分钟之间")
     if detour_ratio is not None and (detour_ratio < 0 or detour_ratio > 20):
         raise HTTPException(400, "detour_ratio 必须在 0-20 之间")
+    if (include_stations_mode or "or").strip().lower() not in ("or", "and"):
+        raise HTTPException(400, "include_stations_mode 必须为 or 或 and")
 
 
 @app.get("/api/transfers")
@@ -716,17 +776,24 @@ def transfers(from_station: str, to_station: str, date: str,
               detour_ratio: float | None = None,
               prune_dominated: bool | None = None,
               allow_cross_station: bool = True,
+              hub_only: bool = False,
+              hub_stations: str = "",
               allow_prefixes: str = "",
               exclude_prefixes: str = "",
               include_stations: str = "",
-              exclude_stations: str = ""):
-    _validate_search_params(date, max_legs, cross_extra, frontier_k, prune_level, max_total_min, detour_ratio)
+              exclude_stations: str = "",
+              include_stations_mode: str = "or"):
+    _validate_search_params(
+        date, max_legs, cross_extra, frontier_k, prune_level,
+        max_total_min, detour_ratio, include_stations_mode,
+    )
     return _run(
         transfer.search, from_station, to_station, date,
         min_wait, max_wait, limit, max_legs, expand_city, cross_extra, frontier_k,
         prune_level, max_total_min, detour_ratio, prune_dominated,
-        allow_cross_station, allow_prefixes, exclude_prefixes,
-        include_stations, exclude_stations,
+        allow_cross_station, hub_only, hub_stations,
+        allow_prefixes, exclude_prefixes,
+        include_stations, exclude_stations, include_stations_mode,
     )
 
 
@@ -746,10 +813,13 @@ class TransferSearchReq(BaseModel):
     detour_ratio: float | None = None
     prune_dominated: bool | None = None
     allow_cross_station: bool = True
+    hub_only: bool = False
+    hub_stations: str = ""
     allow_prefixes: str = ""
     exclude_prefixes: str = ""
     include_stations: str = ""
     exclude_stations: str = ""
+    include_stations_mode: str = "or"
 
 
 def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchReq):
@@ -770,10 +840,13 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
             detour_ratio=body.detour_ratio,
             prune_dominated=body.prune_dominated,
             allow_cross_station=body.allow_cross_station,
+            hub_only=body.hub_only,
+            hub_stations=body.hub_stations,
             allow_prefixes=body.allow_prefixes,
             exclude_prefixes=body.exclude_prefixes,
             include_stations=body.include_stations,
             exclude_stations=body.exclude_stations,
+            include_stations_mode=body.include_stations_mode,
             progress_cb=on_prog, cancel_event=ev, sub_cb=on_sub,
         )
         if ev.is_set():
@@ -794,6 +867,7 @@ def start_transfers(body: TransferSearchReq):
     _validate_search_params(
         body.date, body.max_legs, body.cross_extra, body.frontier_k,
         body.prune_level, body.max_total_min, body.detour_ratio,
+        body.include_stations_mode,
     )
     fstations = db.resolve_stations(body.from_station, body.expand_city)
     tstations = db.resolve_stations(body.to_station, body.expand_city)
