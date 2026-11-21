@@ -17,6 +17,10 @@ env/
 _db_backup/
 _dbcheck/
 
+# 本地一次性诊断/基准脚本：只在本机复现问题用，不入库
+# 内含 *_scratch（脚本输出、临时服务日志）与 _premove_backup（从仓库根搬来的原件）
+/diagnostics/
+
 # 日志
 *.log
 
