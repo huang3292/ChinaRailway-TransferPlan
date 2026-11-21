@@ -10,7 +10,10 @@
 
 ## 1. 技术栈与启动
 
-- 后端：Python + FastAPI + Uvicorn，SQLite（WAL 模式，线程局部连接）。
+- 后端：Python + FastAPI + Uvicorn，SQLite（WAL 模式，线程局部连接；连接建好即设
+  `synchronous=NORMAL`、`temp_store=MEMORY`、`cache_size=-131072`≈128MB 页缓存、
+  `mmap_size=512MB` 只读内存映射）。写入统一走 `db.tx()`，事务内实际变更后会
+  `bump_data_version()` 让 §6.1 的内存缓存失效重建。
 - 前端：单文件原生 HTML/JS（`static/index.html`），无构建步骤。
 - 依赖：`fastapi`、`uvicorn`、`requests`、`python-multipart`（见 `requirements.txt`）。
 
@@ -149,13 +152,20 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 - `db.resolve_stations` 把出发/到达解析为车站列表；`expand_city=True` 时城市名展开为同城车站
   （`db.city_stations`：站名以城市名开头 + `CITY_PROPER` 别名，如武汉=武昌/汉口）。
 - `fkeys`/`tkeys`：出发/到达站的**电报码与站名集合**（兼容不同数据源用码或用名）。
-- 预加载：`_price_map()`（票价）、`_seat_map()`（余票）、`fare.load_calibration()`（费率校准）、
-  `sno`（train_no+电报码→station_no）、`cities`（城市分组，用于同城异站换乘）。
+- 常驻缓存（`_get_graph_cache` / `_get_date_cache`）：全量路网只建一次并跨请求复用——
+  `_build_graph_cache` 装入 `n2c`、`cities`（城市分组，用于同城异站换乘）、`cal`
+  （`fare.load_calibration()` 费率校准）、`sno_base`（train_no+电报码→station_no）、`screen_all`
+  （大屏）、`tt_all`（时刻表）、`services_all`（引擎 D 车次服务），并为每次查询附
+  `screen_key_to_tn`/`tt_key_to_tn` 两张「站→车次」倒排索引，`search()` 靠它挑候选，
+  不再遍历无关车次；`_get_date_cache` 再按日期缓存 `_price_map`（票价）、`_seat_map`（余票）、
+  `real_tk` 与当日 `sno` 覆盖。失效口径为 `db.data_version()`（进程内写入代数 + 库文件与
+  `-wal` 的 mtime/size），变更后自动重建；响应里的 `cache_hit` 标明本次是否复用。
 - `real_tk`：当日已爬到的权威余票 OD→车次集合，用于剔除与实际冲突的推算方案。
 - `_complete_screen_from_tt(screen, tt)`：大屏只记录"那天拍到的几个站"，行残缺。用 `train_no`
   （匹配不到再退回 `(车次码, 始发站, 终到站)`）找到停站更全的时刻表班次，把大屏缺的站补进 `obs`
   并标 `bridged`，票价/余票仍各自按大屏保留。缺站会让"已越过目的站""过头折返"这类按 `station_no`
-  的剪枝失明，补全后才会正确触发（反向判定见 §12 第 8 条）。
+  的剪枝失明，补全后才会正确触发（反向判定见 §12 第 8 条）。因 `screen_all` 是跨请求共享的缓存对象，
+  补全放在 `_build_graph_cache` 里、且在倒排索引与 `services_all` 构建**之前**只做一次。
 
 ### 6.2 四个引擎（结果合并去重）
 
@@ -187,7 +197,7 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 
 - 直达按 `(首程train_no, 首程depart)` 去重；换乘按 `(首程no, 二程no, 换乘站, 二程from, 首程depart)` 去重。
 - `rank(p)`：**有真实票价的优先**，其次非推算（真实日期）优先。
-- 最终按 `total_min` 升序。返回含 `direct`/`transfers`/`screen_trains`/`timetable_trains`/`note`。
+- 最终按 `total_min` 升序。返回含 `direct`/`transfers`/`screen_trains`/`timetable_trains`/`cache_hit`/`note`。
 
 ### 6.5 票价/余票富化 `_enrich`
 
@@ -320,6 +330,8 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 | 多程剪枝/总时长上限 | `transfer.py`（`FRONTIER_K`、`MAX_TOTAL_MIN`）；`main.py`（`MAX_TIMETABLES`） |
 | 票价估算费率/速度 | `fare.py`（`RATES`/`SPEED`/`load_calibration`） |
 | 城市展开/别名 | `db.py`（`city_stations`、`CITY_PROPER`） |
+| 常驻路网/日期缓存、候选筛选 | `transfer.py`（`_build_graph_cache`/`_get_graph_cache`/`_get_date_cache`、`screen_key_to_tn`/`tt_key_to_tn`）、`db.py`（`data_version`/`bump_data_version`） |
+| SQLite 读盘性能（页缓存/mmap/同步级别） | `db.py` 连接初始化处的 `PRAGMA` |
 | 排序"实际价优先"口径 | 前端 `priceKey`；后端 `transfer.rank` |
 | 时刻表退回/完整性 | `main.py` `/api/timetable`；前端 `renderTT` |
 | 新增一类接口 | `parsers.parse_x` + `importer.ingest/_save` + `crawler.crawl_x` + `main` 路由 + `db` 建表 |
@@ -339,6 +351,11 @@ diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不�
 9. "自定义规则"面板折叠后，`搜索只含车型头`/`剪除车型头`/`必经中转站`/`排除中转站` 四个文本框
    **仍然生效**，且切换剪枝预设（严格/均衡/宽松）不会清空它们。结果异常少时先看拦截明细里的
    `自定义规则 N（已生效：…）`，别急着怀疑算法或数据。
+10. `screen_all`/`tt_all`/`services_all` 和两张倒排索引是**进程内跨请求共享**的缓存对象，只读：
+    不要在 `search()` 里原地改写（会污染下一个查询），也别指望 `del screen, tt` 省内存（删的只是
+    本地引用，删早了末尾统计就取不到值）。要调整停靠站口径就改 `_build_graph_cache`，一次构建全生效。
+11. 缓存过期只看 `db.data_version()`：进程内 `db.tx()` 写入代数 + `data/rail.db` 与 `-wal` 的
+    mtime/size。用外部脚本直接改库文件而没动这两项时，需重启 uvicorn 才会重建。
 
 ---
 

@@ -10,6 +10,32 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "rail.db"
 CN_TZ = ZoneInfo("Asia/Shanghai")
 
 _local = threading.local()
+_gen_lock = threading.Lock()
+_data_gen = 0
+
+
+def bump_data_version() -> int:
+    """递增进程内数据变更代数，触发内存检索缓存失效重建。"""
+    global _data_gen
+    with _gen_lock:
+        _data_gen += 1
+        return _data_gen
+
+
+def _file_sig(p: Path) -> tuple:
+    try:
+        st = p.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (0, 0)
+
+
+def data_version() -> tuple:
+    """返回兼顾进程内写入、跨进程文件修改与库路径切换的缓存版本键。"""
+    with _gen_lock:
+        gen = _data_gen
+    wal_path = Path(f"{DB_PATH}-wal")
+    return (str(DB_PATH), gen, _file_sig(DB_PATH), _file_sig(wal_path))
 
 
 def cn_now() -> datetime:
@@ -138,6 +164,13 @@ def get_conn() -> sqlite3.Connection:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-131072")  # 128MB 内存页缓存，减少全表扫描换页读盘
+        try:
+            conn.execute("PRAGMA mmap_size=536870912")  # 512MB 内存映射只读加速
+        except sqlite3.Error:
+            pass
         conn.execute("PRAGMA foreign_keys=ON")
         _local.conn = conn
     return conn
@@ -154,11 +187,14 @@ def close_conn():
 
 
 @contextmanager
-def tx():
+def tx(bump: bool = True):
     conn = get_conn()
+    before = conn.total_changes
     try:
         yield conn
         conn.commit()
+        if bump and conn.total_changes != before:
+            bump_data_version()
     except Exception:
         conn.rollback()
         raise
@@ -174,6 +210,7 @@ def init_db():
             conn.execute(f"ALTER TABLE station_trains ADD COLUMN {c} {typ}")
     if added:
         _backfill_screen()
+    bump_data_version()
 
 
 def _backfill_screen():
@@ -291,7 +328,7 @@ def get_setting(key: str, default=None):
 
 
 def set_setting(key: str, value):
-    with tx() as conn:
+    with tx(bump=False) as conn:
         conn.execute(
             "INSERT INTO settings(key,value) VALUES(?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
