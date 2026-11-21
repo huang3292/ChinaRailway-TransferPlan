@@ -217,6 +217,55 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 > 修改换乘行为的关键参数：`min_wait/max_wait/cross_extra`（API 传入，异站默认 +60）、`PRUNE_PRESETS`、`DETOUR_FLOOR_MIN`、`SAFE_WAIT_MIN`、`MAX_TIMETABLES`（main.py 向导封顶）。
 
+### 6.6 缓存与过期策略
+
+**三层缓存（无 TTL，只随「数据版本键」失效）**
+
+1. 常驻路网缓存 `_MEM_CACHE`（`_get_graph_cache`）—— 全量 `n2c`/`cities`/`cal`/`sno_base`/
+   `screen_all`/`tt_all`/`services_all` 与两张倒排索引，进程内只建一次、跨请求复用；`_BUILD_LOCK`
+   加双检锁保证并发下只构建一份。
+2. 按日期缓存 `_DATE_CACHE`（`_get_date_cache`）—— 每查询日期缓存 `prices`/`seats`/`real_tk`/
+   当日 `sno` 覆盖；最多 `_MAX_DATE_CACHE=8` 个日期，超限按插入序淘汰最早的一个。
+3. 票价/余票本身落库（`prices`/`tickets`），`_price_map`/`_seat_map` 每次按需查库后塞进日期缓存。
+
+**失效版本键 `db.data_version()`**
+
+返回 `(str(DB_PATH), 进程内写入代数, _file_sig(db), _file_sig("-wal", ignore_empty=True))`，
+综合覆盖三类变化：
+
+- 进程内写入代数 `_data_gen`：`db.tx()` 提交后若 `total_changes` 有变就 `bump_data_version()` 自增
+  （写库即失效）；`init_db()` 结束也自增一次。
+- `_file_sig(p) = (st_mtime_ns, st_size)`：探测 db 主文件与 `-wal` 的**跨进程**修改；空文件在
+  `ignore_empty=True` 下恒记 `(0,0)`——即**空的 `-wal` 不计入版本**，避免其 mtime 抖动误触发重建。
+- 库路径切换：`DB_PATH` 变化直接体现在键首项。
+
+**失效时机（惰性，读时校验）**
+
+- `_get_graph_cache`：每次取 `data_version()` 与缓存内 `version` 比对，不一致才重建；
+  响应里的 `cache_hit` 标明本次是否复用。
+- `_get_date_cache`：版本号变化即整清空；日期超 8 个做淘汰。
+
+**手动失效**
+
+- `transfer.invalidate_cache()`：显式清空 `_MEM_CACHE` + `_DATE_CACHE`（测试用；正常写库已自动失效）。
+- `DELETE /api/cache`（`main.py` → `db.clear_cache`）：删的是**库表数据**（`station_trains`/
+  `train_stops`/`tickets`/`prices`，可选 `raw_payloads`），经 `tx()` 提交触发 `bump_data_version()`，
+  缓存随版本键自动重建。
+
+**「过期」的两层含义（易混淆）**
+
+- **缓存过期**：即上面的版本键失效——跟时间无关，只跟数据是否变化有关。
+- **票价「历史缓存」stale**：`_price_map(target_date)` 无目标日票价时回退到库内最新日期并置
+  `stale`，落到 leg 上即 `price_stale`/`price_date`，前端显示「旧/（历史缓存）/价日」。
+  这是数据兜底，不是缓存键过期。
+
+**约束**
+
+- `screen_all`/`tt_all`/`services_all` 与两张倒排索引是进程内跨请求共享的**只读**对象，别在
+  `search()` 里原地改（见 §12 第 10 条）。
+- 外部脚本正常写库会改变 db 文件签名并在下次查询自动重建；仅当文件 `mtime_ns`/`size` 恰好未变时
+  才漏检，需重启或 `invalidate_cache()` 兜底（见 §12 第 11 条）。
+
 ---
 
 ## 7. 票价估算与校准（`app/fare.py`）
