@@ -483,12 +483,13 @@ const PRUNE_PRESETS={
   balanced:{fk:8,maxh:48,detour:0,dom:false},
   relaxed:{fk:16,maxh:72,detour:0,dom:false},
 };
-function customFilterParts(){
+function customFilterRaw(){
   return [['s-inc-pfx','只含车型头'],['s-exc-pfx','剪除车型头'],['s-inc-tst','必经中转站'],['s-exc-tst','排除中转站']]
-    .map(([id,label])=>{
-      const v=$(id)?String($(id).value||'').trim():'';
-      return v?`${label}「${v}」`:'';
-    }).filter(Boolean);
+    .map(([id,label])=>[label,String($(id)?$(id).value||'':'').trim()])
+    .filter(([,v])=>v);
+}
+function customFilterParts(){
+  return customFilterRaw().map(([label,v])=>`${label}「${v}」`);
 }
 function appliedFilterParts(cfg){
   const c=cfg||{};
@@ -502,10 +503,20 @@ function appliedFilterParts(cfg){
   return parts.length?parts:customFilterParts();
 }
 function refreshPruneToggleBadge(){
-  const parts=customFilterParts();
+  const raw=customFilterRaw();
+  const parts=raw.map(([label,v])=>`${label}「${v}」`);
   const open=$('s-prune-panel').style.display!=='none';
-  $('s-prune-toggle').textContent=(open?'收起规则 ▴':'自定义规则 ▾')+(parts.length?` ⚠生效${parts.length}`:'');
-  $('s-prune-toggle').title=parts.length?`面板已折叠但筛选仍在生效：${parts.join('，')}`:'';
+  let hint=raw.length?` ⚠生效${raw.length}：${raw.map(([,v])=>v).join(' / ')}`:'';
+  if(hint.length>34)hint=hint.slice(0,33)+'…';
+  $('s-prune-toggle').textContent=(open?'收起规则 ▴':'自定义规则 ▾')+hint;
+  $('s-prune-toggle').title=parts.length?`面板折叠后这些筛选仍在服务端生效：${parts.join('，')}`:'';
+  // 折叠时看不到的四个框，用红框把“正在生效”标出来，避免“框是空的却生效”
+  ['s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'].forEach(id=>{
+    const el=$(id);if(!el)return;
+    const on=String(el.value||'').trim()!=='';
+    el.style.borderColor=on?'#dc2626':'';
+    el.style.background=on?'#fef2f2':'';
+  });
 }
 function clearCustomFilters(){
   ['s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'].forEach(id=>{if($(id))$(id).value='';});
@@ -529,7 +540,7 @@ $('s-prune').onchange=()=>{
   refreshPruneToggleBadge();
 };
 ['s-fk','s-maxh','s-detour','s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst','s-allow-cross','s-dom'].forEach(id=>{
-  $(id).addEventListener('change',()=>{$('s-prune').value='custom';refreshPruneToggleBadge();});
+  ['change','input'].forEach(ev=>$(id).addEventListener(ev,()=>{$('s-prune').value='custom';refreshPruneToggleBadge();}));
 });
 const PRUNE_LEVEL_NAMES={strict:'严格精简',balanced:'均衡剪枝',relaxed:'宽松探索',custom:'自定义剪枝'};
 function numVal(id,def){
