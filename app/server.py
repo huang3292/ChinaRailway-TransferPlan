@@ -9,6 +9,7 @@ import asyncio
 import email.parser
 import email.policy
 import inspect
+import io
 import json
 import mimetypes
 import os
@@ -22,6 +23,27 @@ from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from . import db, main
+
+
+def _collect_mounts():
+    """收集静态挂载。兜底 FastAPI 存在 app.mounts；真 FastAPI 的 app.mount
+    注册为 routes 里的 Starlette Mount（无 mounts 属性），需从 routes 里捡出。"""
+    mounts = list(getattr(main.app, "mounts", []) or [])
+    for r in getattr(main.app, "routes", []) or []:
+        app_obj = getattr(r, "app", None)
+        if app_obj is not None and hasattr(app_obj, "directory"):
+            mounts.append((getattr(r, "path", "/static"), app_obj))
+    return mounts
+
+
+def _make_upload_file(filename: str, content: bytes):
+    """兼容两种 UploadFile 构造签名：main 兜底类为 (filename, content)，
+    真 fastapi.UploadFile 为 (file, *, size, headers, filename)。"""
+    UF = main.UploadFile
+    try:
+        return UF(filename=filename, content=content)
+    except TypeError:
+        return UF(io.BytesIO(content), filename=filename)
 
 
 def _compile_routes():
@@ -112,7 +134,7 @@ def create_server(host: str = "0.0.0.0", port: int = 3000) -> ThreadingHTTPServe
         main.startup()
 
     routes = _compile_routes()
-    mounts = list(getattr(main.app, "mounts", []))
+    mounts = _collect_mounts()
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -194,7 +216,7 @@ def create_server(host: str = "0.0.0.0", port: int = 3000) -> ThreadingHTTPServe
                             self._send_json(400, {"detail": f"缺少上传文件字段 {pname}"})
                             return
                         fname, fbytes = files_map[pname]
-                        kwargs[pname] = main.UploadFile(filename=fname, content=fbytes)
+                        kwargs[pname] = _make_upload_file(fname, fbytes)
                     elif isinstance(base_tp, type) and issubclass(base_tp, main.BaseModel):
                         data_dict = json_body if isinstance(json_body, dict) else {}
                         try:

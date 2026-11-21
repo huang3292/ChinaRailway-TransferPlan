@@ -2357,6 +2357,10 @@ def search(from_q: str, to_q: str, date: str,
 
     direct.sort(key=lambda x: x["total_min"])
     transfers.sort(key=lambda x: x["total_min"])
+    if limit > 0:
+        # limit 为直达与换乘的合计上限，直达优先占用额度（此前两者各自截断会翻倍返回）
+        direct = direct[:limit]
+        transfers = transfers[:max(0, limit - len(direct))]
     return {
         "from": from_q, "to": to_q, "date": date,
         "max_legs": max_legs,
@@ -2382,6 +2386,6 @@ def search(from_q: str, to_q: str, date: str,
         },
         "prune_stats": prune_stats,
         "note": f"时间基准：北京时间(UTC+8) · 异站换乘默认额外预留{cross_extra}分钟 · 无当日数据时按最近日期与 running_fig 校验推算并剔除余票冲突车次",
-        "direct": direct[:limit] if limit > 0 else direct,
-        "transfers": transfers[:limit] if limit > 0 else transfers,
+        "direct": direct,
+        "transfers": transfers,
     }
