@@ -141,7 +141,16 @@ MAX_JOBS = 100
 def _create_job(initial: dict) -> tuple[str, threading.Event]:
     job_id = uuid.uuid4().hex[:8]
     ev = threading.Event()
-    initial = dict(initial, created_at=time.time())
+    now = time.time()
+    initial = dict(
+        initial,
+        created_at=now,
+        finished_at=None,
+        phase_started_at=now,
+        phase_done_base=int(initial.get("done") or 0),
+        sub_started_at=None,
+        sub_key=None,
+    )
     with _jobs_lock:
         if len(jobs) >= MAX_JOBS:
             done_ids = [jid for jid, j in jobs.items() if j.get("status") != "running"]
@@ -155,9 +164,28 @@ def _create_job(initial: dict) -> tuple[str, threading.Event]:
 
 
 def _job_update(job_id: str, **kwargs):
+    now = time.time()
     with _jobs_lock:
-        if job_id in jobs:
-            jobs[job_id].update(kwargs)
+        j = jobs.get(job_id)
+        if not j:
+            return
+        # 切换 phase 时重置阶段计时基准，避免“前一轻量阶段耗时”污染后续重量级请求预估
+        if "phase" in kwargs and kwargs["phase"] != j.get("phase"):
+            j["phase_started_at"] = now
+            j["phase_done_base"] = int(kwargs.get("done", j.get("done") or 0))
+        j.update(kwargs)
+        st = int(j.get("sub_total") or 0)
+        if st > 0:
+            sk = (int(j.get("done") or 0), st)
+            # 每个子阶段(如 BFS 第 2 程 / 第 3 程)独立计时，不拿前 4 步缓存初始化耗时去外推重循环
+            if sk != j.get("sub_key"):
+                j["sub_key"] = sk
+                j["sub_started_at"] = now
+        else:
+            j["sub_key"] = None
+            j["sub_started_at"] = None
+        if j.get("status") in ("done", "cancelled", "error") and not j.get("finished_at"):
+            j["finished_at"] = now
 
 
 def _job_inc(job_id: str, field: str, delta: int = 1):
@@ -421,23 +449,47 @@ def _price_job(job_id, ev: threading.Event, f_tc, t_tc, date):
         db.close_conn()
 
 
+_JOB_INTERNAL_KEYS = {
+    "created_at",
+    "finished_at",
+    "phase_started_at",
+    "phase_done_base",
+    "sub_started_at",
+    "sub_key",
+}
+
+
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str):
+    now = time.time()
     with _jobs_lock:
         if job_id not in jobs:
             raise HTTPException(404, "任务不存在")
         j = jobs[job_id]
-        out = {k: (list(v) if isinstance(v, list) else v) for k, v in j.items() if k != "created_at"}
+        snap = dict(j)
+        out = {k: (list(v) if isinstance(v, list) else v) for k, v in j.items() if k not in _JOB_INTERNAL_KEYS}
+    end_t = snap.get("finished_at") or now
+    created_t = snap.get("created_at") or end_t
+    out["elapsed_sec"] = round(max(0.0, end_t - created_t), 1)
     if out.get("status") == "running":
-        total = out.get("total") or 0
-        frac = float(out.get("done") or 0)
-        sub_total = out.get("sub_total") or 0
-        if sub_total > 0 and frac < total:
-            frac += min(0.99, max(0.0, (out.get("sub_done") or 0) / sub_total))
-        elapsed = time.time() - (j.get("created_at") or time.time())
-        out["elapsed_sec"] = round(elapsed, 1)
-        if total > 0 and frac > 0:
-            out["eta_sec"] = round(elapsed / frac * (total - frac), 1)
+        total = int(out.get("total") or 0)
+        done = int(out.get("done") or 0)
+        sub_total = int(out.get("sub_total") or 0)
+        sub_done = int(out.get("sub_done") or 0)
+        sub_t0 = snap.get("sub_started_at")
+        if sub_total > 0 and 0 < sub_done < sub_total and sub_t0:
+            sub_elapsed = max(0.0, now - sub_t0)
+            if sub_done >= 5 or sub_elapsed >= 0.8:
+                out["sub_eta_sec"] = round(sub_elapsed / sub_done * (sub_total - sub_done), 1)
+        # 换乘搜索前几步为毫秒级内存构图，后续 BFS 为秒级重分支，禁止跨步骤线性外推总体剩余时间；
+        # 仅同类请求队列（票价/余票/导入阶段）按当前 phase 的单步均速估算剩余时间。
+        if out.get("phase") != "search" and total > done:
+            phase_base = int(snap.get("phase_done_base") or 0)
+            phase_done = done - phase_base
+            phase_t0 = snap.get("phase_started_at") or created_t
+            phase_elapsed = max(0.0, now - phase_t0)
+            if phase_done >= 2 and phase_elapsed >= 0.8:
+                out["eta_sec"] = round(phase_elapsed / phase_done * (total - done), 1)
     return out
 
 
@@ -451,6 +503,8 @@ def cancel_job(job_id: str):
             ev.set()
         if jobs[job_id].get("status") == "running":
             jobs[job_id]["status"] = "cancelled"
+            if not jobs[job_id].get("finished_at"):
+                jobs[job_id]["finished_at"] = time.time()
         return {"job_id": job_id, "status": jobs[job_id]["status"]}
 
 

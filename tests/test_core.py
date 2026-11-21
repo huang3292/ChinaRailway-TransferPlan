@@ -1637,8 +1637,70 @@ class TestNationwideTimetablesAndTicketsAPI(TempDBTestCase):
         self.assertIn("SEAT_COLS", html_text)
         self.assertIn("priceDrawerHtml", html_text)
         self.assertIn("toggleTT", html_text)
+        self.assertIn('id="tab-display"', html_text)
+        self.assertIn("KNOWN_COEXIST_PAIRS", html_text)
+        self.assertIn("'swz|tz'", html_text)
+        self.assertIn("computeEffectiveColumns", html_text)
+        self.assertIn("renderMobileLegHtml", html_text)
+        self.assertIn("tt-track", html_text)
+        self.assertIn("actualDurTxt", html_text)
+
+    def test_job_status_stage_local_eta_and_frozen_elapsed(self):
+        from app import main as main_mod
+
+        fake_now = [1000.0]
+        with mock.patch.object(main_mod.time, "time", side_effect=lambda: fake_now[0]):
+            # 1) 搜索任务：前 4 步仅用 0.1s，第 5 步 BFS 进入重循环后不得用前 4 步外推全局 eta_sec
+            jid, _ = main_mod._create_job({
+                "status": "running", "phase": "search", "done": 0, "total": 7,
+                "sub_done": 0, "sub_total": 0, "current": "", "errors": [], "result": {},
+            })
+            fake_now[0] = 1000.1
+            main_mod._job_update(jid, done=5, total=7, sub_done=0, sub_total=2000, current="BFS 2/3")
+            st0 = main_mod.job_status(jid)
+            self.assertEqual(st0["elapsed_sec"], 0.1)
+            self.assertNotIn("eta_sec", st0)
+            self.assertNotIn("sub_eta_sec", st0)
+
+            # 第 5 步跑了 10s 完成 500/2000 -> 阶段局部 sub_eta_sec 应约为 30.0s
+            fake_now[0] = 1010.1
+            main_mod._job_update(jid, sub_done=500, sub_total=2000)
+            st1 = main_mod.job_status(jid)
+            self.assertEqual(st1["elapsed_sec"], 10.1)
+            self.assertAlmostEqual(st1["sub_eta_sec"], 30.0, places=1)
+            self.assertNotIn("eta_sec", st1)
+
+            # 完成后 elapsed_sec 冻结在 finish 时刻，不再随后续时间推进变化
+            fake_now[0] = 1015.5
+            main_mod._job_update(jid, status="done", phase="done", done=7, total=7, sub_done=0, sub_total=0)
+            fake_now[0] = 1099.0
+            st_done = main_mod.job_status(jid)
+            self.assertEqual(st_done["status"], "done")
+            self.assertEqual(st_done["elapsed_sec"], 15.5)
+
+            # 2) 多阶段抓包任务：切换 phase 后重置阶段测速基准，不被前序轻量阶段污染
+            fake_now[0] = 2000.0
+            jid2, _ = main_mod._create_job({
+                "status": "running", "phase": "screen", "done": 0, "total": 2,
+                "current": "", "errors": [], "result": {},
+            })
+            fake_now[0] = 2000.2
+            main_mod._job_update(jid2, done=2)
+            # 切入慢速 price 阶段（2 条已完成耗时 4.0s，还剩 6 条 -> 约 12.0s）
+            main_mod._job_update(jid2, phase="price", total=10)
+            fake_now[0] = 2004.2
+            main_mod._job_update(jid2, done=4)
+            st_p = main_mod.job_status(jid2)
+            self.assertAlmostEqual(st_p["eta_sec"], 12.0, places=1)
+            fake_now[0] = 2006.0
+            main_mod.cancel_job(jid2)
+            fake_now[0] = 2050.0
+            st_can = main_mod.job_status(jid2)
+            self.assertEqual(st_can["status"], "cancelled")
+            self.assertAlmostEqual(st_can["elapsed_sec"], 6.0, places=1)
 
 
 if __name__ == "__main__":
     unittest.main()
+
 

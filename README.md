@@ -237,7 +237,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 ## 8. 后台任务（`app/main.py` 的 `jobs`）
 
 `jobs: dict[job_id, dict]`，线程执行，前端轮询 `GET /api/jobs/{id}`。任务字典含
-`status/done/total/errors/phase/current/log/result` 等。
+`status/done/total/errors/phase/current/log/result` 等，响应实时附带 `elapsed_sec`（已完成/取消/报错时冻结为总实际用时）；`running` 时针对子阶段附带局部 `sub_eta_sec`（如搜索 BFS 各深度独立计时），非搜索的同类抓包阶段按当前 `phase` 均速附带 `eta_sec`。
 
 - **`_price_job`**：`/api/crawl/tickets?with_prices=true` 触发，按已入库 tickets 逐车次抓票价。
 - **`_route_job`**（一键导入/在线模式）：`/api/import/route` 触发，阶段
@@ -311,20 +311,22 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ## 11. 前端逻辑（`static/index.html`）
 
-四个页签：换乘搜索 / 爬取数据 / 导入数据 / 数据浏览。核心 JS：
+五个页签：换乘搜索 / 爬取数据 / 导入数据 / 数据浏览 / 显示设置。核心 JS：
 
-- 搜索：`#s-go` → （在线模式先 `runRouteImport`）→ `POST /api/transfers/start` + 轮询 `/api/jobs/{id}` → 给方案打 `_k/_type` → `render()`。
+- 搜索：`#s-go` → （在线模式先 `runRouteImport`）→ `POST /api/transfers/start` + 轮询 `/api/jobs/{id}` → 给方案打 `_k/_type` → `render()`；任务运行中实时展示 `已用` 与阶段 `预计剩余`（`sub_eta_sec`/`eta_sec`），结束后固定展示 `实际用时`（同时写入搜索结果顶栏）。
 - `legKey(l)`：`train_no|from_telecode|to_telecode|depart[:10]`，与后端 `_leg_ident` 对齐。
 - `priceKey(p)`：返回 `[miss?1:0, est?1:0, sum, waitlist?1:0, allSoldOut?1:0]`——**实际价优先**（有真实价排前，按实际价升序；同价位优先有票而非候补），其次有估价。`sortPlans` 价格模式据此排序。
 - `filterPlans`：统一后置本地过滤（即时生效、不重跑图搜索）——只含/排除车型头（`#s-inc-pfx`/`#s-exc-pfx`）、车次包含（`#s-filter`）、必经/排除换乘站（`#s-inc-tst` + `#s-inc-mode` OR/AND、`#s-exc-tst`，利用响应附带的 `station_cities` 与 `city_suffix_stations` 复现精确站名/城市匹配）、换乘类型（`#s-same`）、席位（`#s-seat`）、出发到达时间等。
   （"直达 0"通常是开了"仅换乘"、"同/异站换乘"或"必经换乘站"筛选所致，非 bug。）
 - 剪枝与指定枢纽收窄（搜前）：`#s-prune` 提供均衡 / 严格 / 高度宽松 / 无限制（仅防死循环） / 自定义五种策略，`#s-hub-only` 与 `#s-hubs`（可点「填入省会+大枢纽预设」自由增删）控制搜前仅经指定枢纽换乘；`#s-prune-panel` 仅保留纯数值/图参数（束宽 0=不限、总历时 0=不限、绕行倍率、异站分支、支配剪枝），不再混入后置过滤框。`pruneDiagHtml` 按需提供扩展 3 程、放宽至高度宽松/无限制、关闭仅枢纽重搜，以及一键 `清除后置筛选`（0ms 本地生效）。
-- **日期与国铁 12306 样式展示**：所有查询/爬取日期输入项默认取北京时间**明天（+1 天）**（缓存清理基线维持今天避免误清）。结果区与「站间余票」表采用仿国铁 12306 样式：固定 12 席别列同行对齐展示余票状态与实时/估算票价，支持点击**车次**或**时刻表 ▾ / 票价详情 ▾ / 席别单元格**原地展开国铁经停时刻表与全部席别余票/票价明细条，并在实时轮询回填期间保留展开状态。
+- **日期、双端视图与动态席位设置（`#tab-display`）**：所有查询/爬取日期输入项默认取北京时间**明天（+1 天）**（缓存清理基线维持今天避免误清）。结果区支持**国铁 12306 网页多列席别表格**与**铁路 12306 手机紧凑卡片**切换/自适应（`viewMode`）；第 5 页签「显示设置」支持配置：
+  - **整页无数据冷门席位自动折叠**（`foldEmpty`）及手动单席位隐藏（支持在结果栏一键临时展开全部列）；
+  - **互斥席位合并**（预设 `硬座-二等座`、`软座-一等座`、`动卧-二等卧(硬卧)`、`高级软卧-商务座` 及自定义合并），其中 **`商务座` 与 `特等座` 强制拆分为独立席位**；`KNOWN_COEXIST_PAIRS` 与 `computeEffectiveColumns()` 双重防线会在配置与渲染阶段拦截或自动拆分任何同车并存的席位组合。
 - `autoQuery()`：`sortPlans(filterPlans(...)).slice((page-1)*size, page*size).filter(!departed)` → flatMap 腿 →
   `POST /api/plan_tickets` → `pollPlanJob` → `applyTickets` 按 key 回填真实价/余票。
 - `refreshAutoQuery()`：排序/筛选/翻页变化后防抖 900ms 重查（仅勾选"自动查询票价/余票"时）。
-- 时刻表与票价展开：`toggleTT`/`renderTT`/`ttTable`/`crawlTTPlan` 与 `togglePriceRow`/`priceDrawerHtml`（见 §9）。
-- 爬取页：`crawlTT`/`showTimetable`（模态框）、`renderTickets`/`drawTicketsTable`（国铁席别+票价网格与行内展开）等。
+- 时刻表与票价展开：`toggleTT`/`renderTT`/`ttTable`（升级为纵向圆点时间线 `●──○──●`，自动淡化上/下车之外经停站）与 `togglePriceRow`/`priceDrawerHtml`（见 §9）。
+- 爬取页：`crawlTT`/`showTimetable`（模态框）、`renderTickets`/`drawTicketsTable`（复用动态席位折叠与合并规则的国铁表格与行内展开）等。
 
 > 改前端排序/筛选/自动查询逻辑都在 `index.html` 的 `priceKey/sortPlans/filterPlans/autoQuery` 几处。
 
