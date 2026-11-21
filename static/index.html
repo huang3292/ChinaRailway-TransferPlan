@@ -483,24 +483,53 @@ const PRUNE_PRESETS={
   balanced:{fk:8,maxh:48,detour:0,dom:false},
   relaxed:{fk:16,maxh:72,detour:0,dom:false},
 };
+function customFilterParts(){
+  return [['s-inc-pfx','只含车型头'],['s-exc-pfx','剪除车型头'],['s-inc-tst','必经中转站'],['s-exc-tst','排除中转站']]
+    .map(([id,label])=>{
+      const v=$(id)?String($(id).value||'').trim():'';
+      return v?`${label}「${v}」`:'';
+    }).filter(Boolean);
+}
+function appliedFilterParts(cfg){
+  const c=cfg||{};
+  const fields=[['allow_prefixes','只含车型头'],['exclude_prefixes','剪除车型头'],
+                ['include_stations','必经中转站'],['exclude_stations','排除中转站']];
+  const parts=fields.map(([k,label])=>{
+    const v=c[k];
+    const s=Array.isArray(v)?v.join(','):String(v||'').trim();
+    return s?`${label}「${s}」`:'';
+  }).filter(Boolean);
+  return parts.length?parts:customFilterParts();
+}
+function refreshPruneToggleBadge(){
+  const parts=customFilterParts();
+  const open=$('s-prune-panel').style.display!=='none';
+  $('s-prune-toggle').textContent=(open?'收起规则 ▴':'自定义规则 ▾')+(parts.length?` ⚠生效${parts.length}`:'');
+  $('s-prune-toggle').title=parts.length?`面板已折叠但筛选仍在生效：${parts.join('，')}`:'';
+}
+function clearCustomFilters(){
+  ['s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'].forEach(id=>{if($(id))$(id).value='';});
+  refreshPruneToggleBadge();
+  $('s-go').click();
+}
 $('s-prune-toggle').onclick=()=>{
   const p=$('s-prune-panel');
-  const open=p.style.display==='none';
-  p.style.display=open?'block':'none';
-  $('s-prune-toggle').textContent=open?'收起规则 ▴':'自定义规则 ▾';
+  p.style.display=p.style.display==='none'?'block':'none';
+  refreshPruneToggleBadge();
 };
 $('s-prune').onchange=()=>{
   const lv=$('s-prune').value;
   if(lv==='custom'){
     $('s-prune-panel').style.display='block';
-    $('s-prune-toggle').textContent='收起规则 ▴';
+    refreshPruneToggleBadge();
     return;
   }
   const pr=PRUNE_PRESETS[lv]||PRUNE_PRESETS.balanced;
   $('s-fk').value=pr.fk;$('s-maxh').value=pr.maxh;$('s-detour').value=pr.detour;$('s-dom').checked=pr.dom;
+  refreshPruneToggleBadge();
 };
 ['s-fk','s-maxh','s-detour','s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst','s-allow-cross','s-dom'].forEach(id=>{
-  $(id).addEventListener('change',()=>{$('s-prune').value='custom';});
+  $(id).addEventListener('change',()=>{$('s-prune').value='custom';refreshPruneToggleBadge();});
 });
 const PRUNE_LEVEL_NAMES={strict:'严格精简',balanced:'均衡剪枝',relaxed:'宽松探索',custom:'自定义剪枝'};
 function numVal(id,def){
@@ -510,7 +539,7 @@ function numVal(id,def){
   const n=+raw;
   return Number.isFinite(n)?n:def;
 }
-function pruneBreakdownItems(st){
+function pruneBreakdownItems(st,cfg){
   if(!st)return [];
   const loop=(st.loopback||0)+(st.city_loop||0)+(st.passed_dest||0);
   const items=[];
@@ -518,13 +547,16 @@ function pruneBreakdownItems(st){
   if(st.dominated)items.push(`劣势支配 ${st.dominated}`);
   if(st.frontier)items.push(`束宽截断 ${st.frontier}`);
   if(st.total_time)items.push(`总耗时超限 ${st.total_time}`);
-  if(st.custom_rule)items.push(`自定义规则 ${st.custom_rule}`);
+  if(st.custom_rule){
+    const parts=appliedFilterParts(cfg);
+    items.push(`自定义规则 ${st.custom_rule}${parts.length?`（已生效：${parts.join('，')}）`:''}`);
+  }
   if(st.repeat_train)items.push(`重复车次 ${st.repeat_train}`);
   if(loop)items.push(`折返绕回 ${loop}`);
   return items;
 }
 function formatPruneStats(st,cfg){
-  const items=pruneBreakdownItems(st);
+  const items=pruneBreakdownItems(st,cfg);
   const limitTxt=cfg&&cfg.detour_limit_min?`（绕行上限 ${fmtMin(cfg.detour_limit_min)}）`:'';
   return items.length?` · 树枝剪枝${limitTxt}：${items.join(' / ')}`:(limitTxt?` · 树枝剪枝${limitTxt}`:'');
 }
@@ -577,9 +609,10 @@ $('s-live').onchange=()=>{if(!$('s-live').checked){clearTimeout(autoTimer);planG
 function applyTypeUI(){
   const direct=$('s-type').value==='direct';
   document.querySelectorAll('.transfer-only').forEach(el=>el.style.display=direct?'none':'');
-  if(direct){$('s-tst').value='';$('s-same').value='';$('s-prune-panel').style.display='none';$('s-prune-toggle').textContent='自定义规则 ▾';}
+  if(direct){$('s-tst').value='';$('s-same').value='';$('s-prune-panel').style.display='none';refreshPruneToggleBadge();}
 }
 applyTypeUI();
+refreshPruneToggleBadge();
 ['s-filter','s-dep1','s-dep2','s-arr1','s-arr2','s-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();refreshAutoQuery();});
 
 let autoTimer=null;
@@ -686,7 +719,7 @@ function pruneDiagHtml(shownCount,transferCount){
   if(!R)return '';
   const cfg=R.prune_config||{},st=R.prune_stats||{};
   const lvName=PRUNE_LEVEL_NAMES[cfg.prune_level]||cfg.prune_level||'均衡剪枝';
-  const items=pruneBreakdownItems(st);
+  const items=pruneBreakdownItems(st,cfg);
   const limitPart=cfg.detour_limit_min?` · 绕行上限 ${fmtMin(cfg.detour_limit_min)}（含至少8小时保底）`:'';
   const statsPart=items.length?items.join(' · '):'未触发剪枝拦截';
   const actions=[];
@@ -698,10 +731,20 @@ function pruneDiagHtml(shownCount,transferCount){
   if((lowResult||hasPruned)&&cfg.prune_level!=='relaxed'){
     actions.push('<button type="button" class="mini" id="s-quick-relax" onclick="quickRelaxPrune()">放宽剪枝并重搜</button>');
   }
+  if(appliedFilterParts(cfg).length){
+    actions.push('<button type="button" class="mini" id="s-quick-clear-custom" onclick="clearCustomFilters()">清除自定义筛选并重搜</button>');
+  }
   return `<div class="hint" style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
     <span>剪枝策略：<b>${esc(lvName)}</b>${esc(limitPart)} ｜ 拦截明细：${esc(statsPart)}</span>
     ${actions.length?`<span style="display:inline-flex;gap:6px">${actions.join('')}</span>`:''}
   </div>`;
+}
+function transferOnlyNote(){
+  const same=$('s-same').value,tst=$('s-tst').value.trim();
+  if(same===''&&tst==='')return '';
+  const hidden=R&&R.direct?R.direct.length:0;
+  return `<div class="hint" style="margin-top:6px;color:#b45309">已启用${same==='1'?'同站换乘':same==='0'?'异站换乘':''}${same!==''&&tst?'＋':''}${tst?`中转站“${esc(tst)}”`:''}筛选，${hidden} 个直达方案被隐藏；
+    <button type="button" class="mini" onclick="$('s-same').value='';$('s-tst').value='';page=1;render()">清除中转筛选，显示直达</button></div>`;
 }
 function render(){
   if(!R)return;
@@ -717,7 +760,7 @@ function render(){
     $('s-result').innerHTML=`<div class="card">无匹配方案。若选了“席位”筛选，需先查询余票；或在“爬取数据”页抓取两端大屏/时刻表。${diag}</div>`;
     return;
   }
-  const head=`<div class="card" style="padding:12px 16px"><b>共 ${list.length} 个方案</b>（直达 ${nd} / 换乘 ${nt}），按${sortName}排序${diag}${pagerHtml(pages)}</div>`;
+  const head=`<div class="card" style="padding:12px 16px"><b>共 ${list.length} 个方案</b>（直达 ${nd} / 换乘 ${nt}），按${sortName}排序${transferOnlyNote()}${diag}${pagerHtml(pages)}</div>`;
   $('s-result').innerHTML=head+list.slice((page-1)*size,page*size).map(planHtml).join('')+pagerHtml(pages);
 }
 function planHtml(p){
