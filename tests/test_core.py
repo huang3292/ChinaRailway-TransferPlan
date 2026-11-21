@@ -1050,5 +1050,85 @@ class TestStrictPruningEnhancements(TempDBTestCase):
         self.assertGreater(res["prune_stats"]["dominated"], 0)
 
 
+class TestInMemoryCacheAndBatching(TempDBTestCase):
+    def test_memory_cache_hit_and_invalidation(self):
+        import sqlite3
+        from concurrent.futures import ThreadPoolExecutor
+
+        transfer.invalidate_cache()
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [
+                    ("XKS", "厦门北", "xiamenbei", "xmb", "厦门"),
+                    ("FZS", "福州", "fuzhou", "fz", "福州"),
+                    ("NOS", "南平市", "nanpingshi", "nps", "南平"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("T1", "G1", "2026-11-21", 1, "厦门北", "XKS", "----", "08:00"),
+                    ("T1", "G1", "2026-11-21", 2, "福州", "FZS", "09:20", "09:20"),
+                    ("T2", "G2", "2026-11-21", 1, "福州", "FZS", "----", "10:00"),
+                    ("T2", "G2", "2026-11-21", 2, "南平市", "NOS", "11:00", "11:00"),
+                ],
+            )
+        # 刷出一次检查点后，模拟不同搜索线程结束时调用 close_conn()，确认只读关闭不会误失效缓存
+        db.close_conn()
+
+        # 1) 并发冷启动检索应安全完成
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futs = [
+                pool.submit(transfer.search, "厦门北", "南平市", "2026-11-21", max_legs=2)
+                for _ in range(3)
+            ]
+            results = [f.result() for f in futs]
+        db.close_conn()
+        for r in results:
+            self.assertEqual([tuple(l["train"] for l in p["legs"]) for p in r["transfers"]], [("G1", "G2")])
+
+        # 2) 新线程（新 SQLite 连接）热命中内存缓存（含 3 程复用 services_all）
+        r_warm = transfer.search("厦门北", "南平市", "2026-11-21", max_legs=3)
+        self.assertTrue(r_warm["cache_hit"])
+        db.close_conn()
+        r_warm2 = transfer.search("厦门北", "南平市", "2026-11-21", max_legs=2)
+        self.assertTrue(r_warm2["cache_hit"])
+
+        # 3) 进程内写入后缓存自动失效并立即可见新直达车次
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("T3", "G3", "2026-11-21", 1, "厦门北", "XKS", "----", "08:30"),
+                    ("T3", "G3", "2026-11-21", 2, "南平市", "NOS", "10:10", "10:10"),
+                ],
+            )
+        r_after_tx = transfer.search("厦门北", "南平市", "2026-11-21", max_legs=2)
+        self.assertFalse(r_after_tx["cache_hit"])
+        self.assertEqual([p["legs"][0]["train"] for p in r_after_tx["direct"]], ["G3"])
+
+        r_warm3 = transfer.search("厦门北", "南平市", "2026-11-21", max_legs=2)
+        self.assertTrue(r_warm3["cache_hit"])
+        db.close_conn()
+
+        # 4) 模拟外部独立进程（如 crawl_nationwide.py）直接写库，应能通过文件变更感知失效并刷新
+        ext = sqlite3.connect(db.DB_PATH, timeout=30)
+        try:
+            ext.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("T4", "G4", "2026-11-21", 1, "厦门北", "XKS", "----", "09:00"),
+                    ("T4", "G4", "2026-11-21", 2, "南平市", "NOS", "10:30", "10:30"),
+                ],
+            )
+            ext.commit()
+        finally:
+            ext.close()
+        r_after_ext = transfer.search("厦门北", "南平市", "2026-11-21", max_legs=2)
+        self.assertFalse(r_after_ext["cache_hit"])
+        self.assertEqual({p["legs"][0]["train"] for p in r_after_ext["direct"]}, {"G3", "G4"})
+
+
 if __name__ == "__main__":
     unittest.main()

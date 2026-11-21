@@ -11,10 +11,27 @@ C. 站间余票（tickets）：精确日期的直达补充
 import bisect
 import json
 import re
+import threading
 import time
 from datetime import date, datetime, timedelta
 
 from . import db, fare, parsers
+
+_CACHE_LOCK = threading.Lock()
+_BUILD_LOCK = threading.Lock()
+_MEM_CACHE: dict | None = None
+_DATE_CACHE_VER = None
+_DATE_CACHE: dict[str, dict] = {}
+_MAX_DATE_CACHE = 8
+
+
+def invalidate_cache():
+    """清空进程内内存路网与按日票价/余票缓存。"""
+    global _MEM_CACHE, _DATE_CACHE_VER
+    with _CACHE_LOCK:
+        _MEM_CACHE = None
+        _DATE_CACHE_VER = None
+        _DATE_CACHE.clear()
 
 _MIN_RE = re.compile(r"(\d{1,2}):(\d{2})")
 _INF = 10**9
@@ -155,70 +172,86 @@ def _enrich(leg: dict, train_no: str, fno, tno, ftc, ttc, dep_date: str,
 # ---------- 引擎 A：车站大屏（真实日期优先，无当日数据时按每日开行假设平移） ----------
 def _load_screen(train_filter: set[str] | None = None, cancel_event=None) -> dict:
     trains = {}
+    conn = db.get_conn()
+    cols = (
+        "station_telecode,station_name,station_train_code,train_no,"
+        "station_train_date,start_train_date,station_no,arrive_time,start_time,"
+        "start_station_name,start_station_telecode,end_station_name,end_station_telecode,"
+        "running_fig,start_start_time,end_arrive_time,running_time,distance"
+    )
     if train_filter is not None:
         if not train_filter:
             return trains
         if len(train_filter) <= 500:
             ph = ",".join("?" * len(train_filter))
-            recs = db.rows(f"SELECT * FROM station_trains WHERE train_no IN ({ph})", tuple(train_filter))
+            recs = conn.execute(
+                f"SELECT {cols} FROM station_trains WHERE train_no IN ({ph})",
+                tuple(train_filter),
+            ).fetchall()
         else:
-            recs = [r for r in db.rows("SELECT * FROM station_trains") if r["train_no"] in train_filter]
+            recs = [
+                r for r in conn.execute(f"SELECT {cols} FROM station_trains")
+                if r[3] in train_filter
+            ]
     else:
-        recs = db.rows("SELECT * FROM station_trains")
-    for r_idx, r in enumerate(recs):
+        recs = conn.execute(f"SELECT {cols} FROM station_trains").fetchall()
+
+    for r_idx, (
+        stc, sname, st_code, tn, st_td, start_td, sno_val, arr_str, dep_str,
+        s_name, s_tc, e_name, e_tc, rfig, ss_str, ea_str, run_str, dist_val
+    ) in enumerate(recs):
         if (r_idx & 2047) == 0:
             _check_cancel(cancel_event)
-        tn = r["train_no"]
         if not tn:
             continue
         # 同一 train_no 可能对应多个开行日期/往返班次，按开行实例分组
-        run = (tn, r["start_train_date"] or r["station_train_date"])
-        sd_min = _date_min(r["start_train_date"]) or _date_min(r["station_train_date"])
-        t = trains.setdefault(run, {"code": r["station_train_code"], "obs": {}, "running_figs": set(),
-                                    "source_date": r["station_train_date"], "sd_min": sd_min})
+        run = (tn, start_td or st_td)
+        sd_min = _date_min(start_td) or _date_min(st_td)
+        t = trains.setdefault(run, {"code": st_code, "obs": {}, "running_figs": set(),
+                                    "source_date": st_td, "sd_min": sd_min})
         if t.get("sd_min") is None and sd_min is not None:
             t["sd_min"] = sd_min
-        if r["running_fig"]:
-            t["running_figs"].add(r["running_fig"])
-        t["start_key"] = r["start_station_telecode"] or r["start_station_name"]
-        t["end_key"] = r["end_station_telecode"] or r["end_station_name"]
-        t["start_name"] = r["start_station_name"]
-        t["end_name"] = r["end_station_name"]
-        d = _date_min(r["station_train_date"])
+        if rfig:
+            t["running_figs"].add(rfig)
+        t["start_key"] = s_tc or s_name
+        t["end_key"] = e_tc or e_name
+        t["start_name"] = s_name
+        t["end_name"] = e_name
+        d = _date_min(st_td)
         if d is None:
             continue
-        key = r["station_telecode"] or r["station_name"]
-        o = t["obs"].setdefault(key, {"name": r["station_name"], "telecode": r["station_telecode"],
-                                      "no": r["station_no"], "code": r["station_train_code"],
-                                      "dist": _int(r["distance"])})
-        arr, dep = _minutes(r["arrive_time"]), _minutes(r["start_time"])
+        key = stc or sname
+        o = t["obs"].setdefault(key, {"name": sname, "telecode": stc,
+                                      "no": sno_val, "code": st_code,
+                                      "dist": _int(dist_val)})
+        arr, dep = _minutes(arr_str), _minutes(dep_str)
         if arr is not None:
             o["arr"] = d + arr
         if dep is not None:
             o["dep"] = d + dep
         # 始发/终到推导：running_time 为始发至本站的累计历时，
         # 终到历时 = 不小于该值且与 (end_arrive - start_start) 同余(mod 1440) 的最小值
-        sd = _date_min(r["start_train_date"])
-        ss, run_m = _minutes(r["start_start_time"]), _dur_min(r["running_time"])
-        ea = _minutes(r["end_arrive_time"])
+        sd = _date_min(start_td)
+        ss, run_m = _minutes(ss_str), _dur_min(run_str)
+        ea = _minutes(ea_str)
         if sd is not None and ss is not None:
             so = t["obs"].setdefault(t["start_key"], {"name": t["start_name"],
-                                                      "telecode": r["start_station_telecode"] or None, "no": 1})
+                                                      "telecode": s_tc or None, "no": 1})
             so.setdefault("dep", sd + ss)
             so.setdefault("name", t["start_name"])
             if run_m is not None and ea is not None:
                 total_mod = (ea - ss) % 1440
                 total = run_m + (total_mod - run_m) % 1440
                 eo = t["obs"].setdefault(t["end_key"], {"name": t["end_name"],
-                                                        "telecode": r["end_station_telecode"] or None, "no": None})
+                                                        "telecode": e_tc or None, "no": None})
                 eo.setdefault("arr", sd + ss + total)
                 eo.setdefault("name", t["end_name"])
-        no = r["station_no"]
+        no = sno_val
         if no is not None:
             if t.get("min_no") is None or no < t["min_no"]:
-                t["min_no"], t["start_code"] = no, r["station_train_code"]
+                t["min_no"], t["start_code"] = no, st_code
             if t.get("max_no") is None or no > t["max_no"]:
-                t["max_no"], t["end_code"] = no, r["station_train_code"]
+                t["max_no"], t["end_code"] = no, st_code
 
     # 跨夜大屏桥接：同一 train_no 在不同始发日班次下若缺失停靠站，按各自始发日差值平移补全，
     # 解决“两端仅各爬同一查询日大屏，跨零点车次因 start_train_date 相差 1 天而断裂”的问题
@@ -1809,6 +1842,112 @@ def _load_sno(target_date: str | None = None) -> dict:
     return out
 
 
+def _build_graph_cache(ver: tuple, cancel_event=None, sub_cb=None) -> dict:
+    """将全量车站、票价校准、站序、大屏与时刻表路网构建为常驻内存快照。"""
+    n2c = {}
+    city_of, city_groups, tele_of = {}, {}, {}
+    for tc, nm, ct in db.get_conn().execute("SELECT telecode,name,city FROM stations"):
+        n2c[nm] = tc
+        tele_of[nm] = tc
+        if ct:
+            city_of[tc] = ct
+            city_of[nm] = ct
+            city_groups.setdefault(ct, set()).update((tc, nm))
+    cities = (city_of, city_groups, tele_of)
+    cal = fare.load_calibration()
+    sno_base = _load_sno(None)
+    screen_all = _load_screen(None, cancel_event=cancel_event)
+    screen_key_to_tn: dict[str, set[str]] = {}
+    for run, t in screen_all.items():
+        tn = run[0]
+        for k, o in t["obs"].items():
+            screen_key_to_tn.setdefault(k, set()).add(tn)
+            nm = o.get("name")
+            if nm:
+                screen_key_to_tn.setdefault(nm, set()).add(tn)
+
+    tt_all = _load_trains(None, cancel_event=cancel_event, sub_cb=sub_cb)
+    tt_key_to_tn: dict[str, set[str]] = {}
+    for T in tt_all:
+        tn = T.train_no
+        for s in T.stops:
+            tt_key_to_tn.setdefault(s["key"], set()).add(tn)
+            nm = s.get("station_name")
+            if nm:
+                tt_key_to_tn.setdefault(nm, set()).add(tn)
+
+    services_all = _load_services(screen_all, tt_all, cancel_event=cancel_event)
+    return {
+        "version": ver,
+        "n2c": n2c,
+        "cities": cities,
+        "cal": cal,
+        "sno_base": sno_base,
+        "screen_all": screen_all,
+        "screen_key_to_tn": screen_key_to_tn,
+        "tt_all": tt_all,
+        "tt_key_to_tn": tt_key_to_tn,
+        "services_all": services_all,
+    }
+
+
+def _get_graph_cache(cancel_event=None, sub_cb=None) -> tuple[dict, bool]:
+    """获取进程内常驻路网缓存；若数据库有写入或跨进程更新则自动重建。"""
+    global _MEM_CACHE
+    ver = db.data_version()
+    with _CACHE_LOCK:
+        cached = _MEM_CACHE if (_MEM_CACHE is not None and _MEM_CACHE["version"] == ver) else None
+    if cached is not None:
+        return cached, True
+    with _BUILD_LOCK:
+        ver = db.data_version()
+        with _CACHE_LOCK:
+            cached = _MEM_CACHE if (_MEM_CACHE is not None and _MEM_CACHE["version"] == ver) else None
+        if cached is not None:
+            return cached, True
+        built = _build_graph_cache(ver, cancel_event=cancel_event, sub_cb=sub_cb)
+        with _CACHE_LOCK:
+            _MEM_CACHE = built
+        return built, False
+
+
+def _get_date_cache(ver: tuple, target_date: str, sno_base: dict) -> dict:
+    """按目标日期缓存票价表、余票表及当日站序覆盖，数据版本变化时自动清空。"""
+    global _DATE_CACHE_VER
+    with _CACHE_LOCK:
+        if _DATE_CACHE_VER != ver:
+            _DATE_CACHE.clear()
+            _DATE_CACHE_VER = ver
+        hit = _DATE_CACHE.get(target_date)
+    if hit is not None:
+        return hit
+
+    prices = _price_map(target_date)
+    seats, real_tk = _seat_map(target_date)
+    overrides = db.get_conn().execute(
+        "SELECT train_no,telecode,station_no FROM train_stops "
+        "WHERE telecode IS NOT NULL AND train_date=?",
+        (target_date,),
+    ).fetchall()
+    if overrides:
+        sno = dict(sno_base)
+        for tn, tc, s_no in overrides:
+            sno[(tn, tc)] = s_no
+    else:
+        sno = sno_base
+    entry = {"prices": prices, "seats": seats, "real_tk": real_tk, "sno": sno}
+
+    with _CACHE_LOCK:
+        if _DATE_CACHE_VER != ver:
+            _DATE_CACHE.clear()
+            _DATE_CACHE_VER = ver
+        if len(_DATE_CACHE) >= _MAX_DATE_CACHE and target_date not in _DATE_CACHE:
+            oldest = next(iter(_DATE_CACHE))
+            _DATE_CACHE.pop(oldest, None)
+        _DATE_CACHE[target_date] = entry
+    return entry
+
+
 def search(from_q: str, to_q: str, date: str,
            min_wait: int = 30, max_wait: int = 360, limit: int = 0,
            max_legs: int = 2, expand_city: bool = True,
@@ -1879,24 +2018,28 @@ def search(from_q: str, to_q: str, date: str,
     tkeys = {s["telecode"] for s in tstations} | {s["name"] for s in tstations}
     base = datetime.strptime(date, "%Y-%m-%d")
     day_min = base.toordinal() * 1440
-    prices = _price_map(date)
-    seats, real_tk = _seat_map(date)
-    n2c = db.station_lookup()
-    cal = fare.load_calibration()
-    sno = _load_sno(date)
-    city_of, city_groups, tele_of = {}, {}, {}
-    for tc, nm, ct in db.get_conn().execute("SELECT telecode,name,city FROM stations"):
-        tele_of[nm] = tc
-        if ct:
-            city_of[tc] = ct
-            city_of[nm] = ct
-            city_groups.setdefault(ct, set()).update((tc, nm))
-    cities = (city_of, city_groups, tele_of)
 
     step(2, "加载大屏与时刻表缓存")
-    cand = _candidate_trains(fkeys, tkeys) if max_legs <= 2 else None
-    screen = _load_screen(cand, cancel_event=cancel_event)
-    tt = _load_trains(cand, cancel_event=cancel_event, sub_cb=sub_step)
+    g, cache_hit = _get_graph_cache(cancel_event=cancel_event, sub_cb=sub_step)
+    d_cache = _get_date_cache(g["version"], date, g["sno_base"])
+    prices = d_cache["prices"]
+    seats = d_cache["seats"]
+    real_tk = d_cache["real_tk"]
+    sno = d_cache["sno"]
+    n2c = g["n2c"]
+    cal = g["cal"]
+    cities = g["cities"]
+
+    # 基于内存倒排索引筛选接触起终点的候选车次，2程阶段无需遍历无关车次
+    cand_scr_tns = set()
+    for k in (fkeys | tkeys):
+        cand_scr_tns.update(g["screen_key_to_tn"].get(k, ()))
+    screen = {run: t for run, t in g["screen_all"].items() if run[0] in cand_scr_tns}
+
+    cand_tt_tns = set()
+    for k in (fkeys | tkeys):
+        cand_tt_tns.update(g["tt_key_to_tn"].get(k, ()))
+    tt = [T for T in g["tt_all"] if T.train_no in cand_tt_tns]
     step(3, f"计算大屏直达/换乘（{len(screen)} 班次）")
     d1, t1 = _search_screen(screen, fkeys, tkeys, day_min, date, min_wait, max_wait,
                             prices, seats, cal, sno, cities, cross_extra=cross_extra,
@@ -1960,8 +2103,8 @@ def search(from_q: str, to_q: str, date: str,
             non_conf_min = [p["total_min"] for p in direct + transfers if not _assumed_conflict(p)]
             if non_conf_min:
                 prune_cfg["detour_cap"] = max(DETOUR_FLOOR_MIN, min(non_conf_min) * eff_detour)
-        sub_step(70, 100, f"合并时刻表服务（{len(tt)} 车次）…", force=True)
-        services = _load_services(screen, tt, cancel_event=cancel_event)
+        sub_step(70, 100, f"复用内存路网服务（{len(g['services_all'])} 车次）…", force=True)
+        services = g["services_all"]
         transfers.extend(_search_multi(
             services, fkeys, tkeys, day_min, min_wait, max_wait,
             max_legs, prices, seats, cal, sno, cities,
@@ -2091,6 +2234,7 @@ def search(from_q: str, to_q: str, date: str,
         "from_station_labels": [f"{s['name']}({s['telecode']})" for s in fstations],
         "to_station_labels": [f"{s['name']}({s['telecode']})" for s in tstations],
         "screen_trains": len(screen), "timetable_trains": len(tt),
+        "cache_hit": cache_hit,
         "prune_config": {
             "prune_level": prune_level,
             "frontier_k": eff_fk,
