@@ -45,6 +45,7 @@ static/
   index.html   前端单页（换乘搜索 / 爬取数据 / 导入数据 / 数据浏览 四个页签）
 data/rail.db   本地数据库
 samples/       示例原始返回（可用于手动导入测试）
+diagnostics/   本地一次性诊断/基准脚本（被 .gitignore 忽略，不入库，见 §13）
 ```
 
 数据流总览：
@@ -151,6 +152,10 @@ samples/       示例原始返回（可用于手动导入测试）
 - 预加载：`_price_map()`（票价）、`_seat_map()`（余票）、`fare.load_calibration()`（费率校准）、
   `sno`（train_no+电报码→station_no）、`cities`（城市分组，用于同城异站换乘）。
 - `real_tk`：当日已爬到的权威余票 OD→车次集合，用于剔除与实际冲突的推算方案。
+- `_complete_screen_from_tt(screen, tt)`：大屏只记录"那天拍到的几个站"，行残缺。用 `train_no`
+  （匹配不到再退回 `(车次码, 始发站, 终到站)`）找到停站更全的时刻表班次，把大屏缺的站补进 `obs`
+  并标 `bridged`，票价/余票仍各自按大屏保留。缺站会让"已越过目的站""过头折返"这类按 `station_no`
+  的剪枝失明，补全后才会正确触发（反向判定见 §12 第 8 条）。
 
 ### 6.2 四个引擎（结果合并去重）
 
@@ -164,6 +169,8 @@ samples/       示例原始返回（可用于手动导入测试）
 - **D 多程换乘 `_search_multi`**（`max_legs>=3` 时启用）：`_load_services` 把大屏+时刻表统一成
   "车次服务"，BFS 逐层扩展，`FRONTIER_K=4` 每站每层保留最早到达的 4 个状态剪枝，
   `MAX_TOTAL_MIN=2880`（48h）总行程上限防组合爆炸。
+  未开启支配剪枝时走"入桶即截断"的有界桶：每个中转站只维护"最快到达/最低费用"两维 top-K，
+  落选分支立即释放，结果与"整层建完再排序截断"一致（稳定排序的平局用插入序号还原），只为压内存峰值。
 
 ### 6.3 换乘约束与剪枝
 
@@ -171,6 +178,8 @@ samples/       示例原始返回（可用于手动导入测试）
   （`eff_min = min_wait if same else min_wait+30`，见 `_dep_keys`）。
 - 跨天：`n = ceil((到达 + eff_min - 第二程发车) / 1440)` 自动取下一班。
 - **剔除折返/绕回**：第二程重新经过出发站、第一程走过的站、或再次回到换乘站 → 丢弃。
+  **过头折返**同计入 `loopback`：第二程/末程在最后一个目的站**之后**又停到第一程已走过的站
+  （全程成环），A/B/D 三个引擎都判这一条。
 - `_assumed_conflict`：推算方案（`date_assumed`）若其任一程的 OD+日期已有权威余票、但该车次不在
   当日余票里（即当日不开行）→ 剔除，以实际余票为准。
 
@@ -287,6 +296,10 @@ samples/       示例原始返回（可用于手动导入测试）
   其次有估价，最后按金额。`sortPlans` 价格模式据此排序。
 - `filterPlans`：方案类型/仅换乘/席位/换乘站/换乘类型/车次包含/车次头/出发到达时间等筛选。
   （"直达 0"通常是开了"仅换乘"或换乘站筛选所致，非 bug。）
+- 服务端剪枝可发现性：`refreshPruneToggleBadge()` 在折叠的"自定义规则"按钮上标 `⚠生效N` 并把
+  仍生效的筛选项写进 `title`；`pruneBreakdownItems`/`appliedFilterParts` 把拦截明细写成
+  `自定义规则 N（已生效：只含车型头「Z,D」…）`，取值优先用响应里的 `prune_config` 回显；
+  只要有筛选生效，诊断区就给"清除自定义筛选并重搜"（`clearCustomFilters`）。
 - `autoQuery()`：`sortPlans(filterPlans(...)).filter(!departed).slice(0,50)` → flatMap 腿 →
   `POST /api/plan_tickets` → `pollPlanJob` → `applyTickets` 按 key 回填真实价/余票。
 - `refreshAutoQuery()`：排序/筛选变化后防抖 900ms 重查（仅勾选"自动查询票价/余票"时）。
@@ -320,3 +333,32 @@ samples/       示例原始返回（可用于手动导入测试）
 5. 推算方案 `date_assumed=True`，会被 `_assumed_conflict` 用当日权威余票校验剔除。
 6. 改后端代码后需重启 uvicorn（或启用 `--reload`）；前端改 `index.html` 刷新浏览器即可。
 7. 所有抓取原始返回都进 `raw_payloads`，排查解析问题先查留档（`source` 区分 crawl/import/test）。
+8. 一个 `train_no` = 一趟物理车次的**单一方向**，途中会换显示车次码（厦门北→兰州记 `Z126/Z127`，
+   兰州→厦门北是另一个 `train_no`，记 `Z125/Z128`，且停站表不同）。因此"大屏车次码与时刻表车次码
+   不一致"**不能**当作反向证据剔除，反向/缺站只能靠 `train_no` 与 `station_no` 顺序判断。
+9. "自定义规则"面板折叠后，`搜索只含车型头`/`剪除车型头`/`必经中转站`/`排除中转站` 四个文本框
+   **仍然生效**，且切换剪枝预设（严格/均衡/宽松）不会清空它们。结果异常少时先看拦截明细里的
+   `自定义规则 N（已生效：…）`，别急着怀疑算法或数据。
+
+---
+
+## 13. 本地诊断脚本（`diagnostics/`，不入库）
+
+排查线上现象留下的一次性脚本，已写进 `.gitignore`，仓库里看不到；是否保留由本机自行决定。
+
+- 一律从仓库根执行：`python diagnostics/<脚本名>.py`。`diagnostics/_diag_env.py` 负责把仓库根加入
+  `sys.path` 并 `chdir` 到仓库根，所以脚本内仍按原样写 `data/rail.db`、`from app import transfer`。
+- 按依赖分三类，各脚本 docstring 的"用法"行已标明是哪一类：
+  1. **打 HTTP 接口**（`diag_1121*.py`、`diag_api_filters.py`、`diag_fingerprint.py`、`diag_fp2/3.py`）：
+     需先在 `127.0.0.1:8306` 起服务，端口可作第 1 个参数。
+  2. **进程内跑引擎**（`verify_complete.py`、`verify_fix_xmb_pt.py`、`_abfilter*.py`、`bench_*.py`、
+     `diag_z12x_*.py`、`diag_price_rank.py`、`diag_1122_sm.py` 等）：直接 import `app.transfer`，
+     不需要起服务，改完后端可先用它自检，再重启 uvicorn 验证接口。
+  3. **只查库/带参数**（`diag_sm_b_22.py` 只读 SQLite；`ab_counts.py`、`ab_z126.py`、`ab_bounded.py`
+     接受 `<module>` 参数，用于对比 HEAD 版本与当前版本的引擎结果）。
+- `diagnostics/_premove_backup/` 是从仓库根搬来的原件备份；`diagnostics/_scratch/` 是脚本输出与
+  临时服务日志。两者都可随时清理。
+- 留档案例（2026-11-21）：查"厦门北→南平市 只有莆田换乘、没有三明北"，`diag_fingerprint.py` 用截图
+  指纹反查出请求里残留的"搜索只含车型头 = Z,D"，算出的 `自定义规则 447115` 与截图逐位相同——
+  三明北→南平市 的车次全是 G 字头，被白名单剪光，只剩 D 字头经莆田。根因是折叠的文本筛选，
+  不是算法或数据问题；这也催生了 §11/§12 那两处可发现性改动。
