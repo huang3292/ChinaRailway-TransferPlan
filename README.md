@@ -51,6 +51,18 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8306 --reload
 
 数据库文件：`data/rail.db`（首次启动自动建表，见 `app/db.py` 的 `SCHEMA` 与 `init_db`）。
 
+### 1.1 新库第一次要有数据：一条命令初始化
+
+不用开前端，直接跑（细节与参数见 §4「初始化全量爬取」）：
+
+```bash
+python init_crawl.py --dry-run   # 先看要发多少请求、大概多久（不联网，也不改限速设置）
+python init_crawl.py             # 站名表 → 全部车站大屏 → 全部车次时刻表
+```
+
+目标日期缺省为北京时间**明天**（与前端各处日期口径一致）。中断后重跑同一条命令自动续爬；
+脚本只增不减，不会删除或清空任何已爬数据。
+
 ---
 
 ## 2. 目录结构 [概念]
@@ -71,6 +83,7 @@ tests/
   test_core.py       核心单元测试（解析、剪枝、缓存失效、HTTP 路由回归）
 crawl_nationwide.py     全国全量离线爬取脚本（旧版简洁版）
 crawl_all_timetables.py  全国全量车站经由车次 + 去重全车次时刻表爬取脚本（默认明天、支持分阶段/按站筛选/已有时刻表跳过/断点重试）
+init_crawl.py          一键初始化（体检→复用 crawl_all_timetables 跑完全部车站大屏+全部车次时刻表→收尾核对），见 §4「初始化全量爬取」
 package.json             dev/start 启动脚本（调用 python3 -m app.server --port 3000）
 data/rail.db         本地数据库
 samples/             示例原始返回（可用于手动导入测试）
@@ -150,6 +163,39 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 > 修改限速行为：调 `MIN_FLOOR/MAX_CEIL/MIN_INTERVAL` 或 `_note_ok/_note_throttled` 的系数。
 
+### 初始化全量爬取（`init_crawl.py`）
+
+脚本自己不发任何请求，抓取与入库全部复用 `crawl_all_timetables.run_crawl(phase="all")`；
+它只补初始化真正需要的三件事：开工前体检（工作量 + ETA）、收尾核对（是否真覆盖全）、
+把 `crawl_all_timetables.py` 那十几个运维参数收敛成一条安全默认的命令。
+
+| 阶段 | 动作 | 落到哪 |
+|---|---|---|
+| 0 | `crawl_stations()` 同步官方 `station_name.js` | `stations`；失败则降级用库内已有站表，库也空 → 退出码 2 |
+| 1 | 逐站 `crawl_station_trains(telecode, date)` | `station_trains`，全国约 3.4 千站 |
+| 2 | 从大屏按 `train_no` 聚合去重，逐趟 `crawl_timetable(train_no, date, from, to)` | `train_stops`，约 1.2 万车次 |
+
+- **顺序不能反**：阶段 2 的车次清单来自阶段 1 入库的大屏记录，所以体检里阶段 2 的数字
+  在大屏爬完之前必然偏小（全新库甚至是 0），这是设计而非漏统计。
+- **安全默认**：`skip_db_screens=True` 且不传 `force` —— 当日已有大屏的站跳过、库内已有
+  时刻表的车次跳过，重复执行只增不减。确需推倒重爬请显式用
+  `python crawl_all_timetables.py --force`（会重发全量请求，脚本不提供这个开关）。
+- **断点**：`data/crawl_all_timetables_state.json`，按 `date` 分组，日期一变旧断点自动作废。
+  Ctrl+C / 断电 / 进程被杀后重跑**同一条命令**即续爬；`--state PATH` 可给并行任务各配一份断点，
+  互不干扰。
+- **"无记录站"不等于失败**：小站当日确实可能一趟图定车都不停，接口返回的
+  `无数据/暂无/不存在` 按成功计入断点（关键词与 §12 第 12 条同一套）。收尾只看断点里
+  记账的 `failed_stations/failed_trains` 和仍缺的时刻表来判定完成与否。
+- **限速**：默认沿用自适应间隔；`--interval 1.5` 切固定间隔，会写进 `settings` 供交互端共用
+  （`--dry-run` 不写）。12306 每日 23:30–05:00 维护，脚本自动休眠等到 05:00 继续。
+- **耗时**：全量约 1.5 万次请求，按 1 秒/请求约 4 小时起；一旦触发风控，自适应间隔会成倍拉长
+  （上限 `MAX_CEIL=12` 秒/请求），体检行同时给出 `MIN_FLOOR`–`MAX_CEIL` 的耗时区间，
+  据此决定要不要挂机跑。
+- **退出码**：`0` 跑完（仍有失败项时打印待补数量）；`130` 手动中断（断点已保存）；
+  `2` 站名表为空，本次实际什么都没爬。
+- 只爬车站大屏与车次时刻表，**不碰余票与票价**（那两类按 §8 的接口即时查询），
+  与"联网只按需抓取公开接口"的产品口径一致。
+
 ---
 
 ## 5. 解析（`app/parsers.py`）[内核]
@@ -202,7 +248,8 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 - **B 车次时刻表 `_search_timetable`**：`_load_trains` 读 `train_stops`，先记录 `arr_day` 再判断是否过午夜翻日计算 `dep`，统一为相对始发的分钟数（解决跨零点停站如 `23:55` 到、`00:05` 发同日错位）。全程按"每日开行假设"推算日期（`date_assumed=True`）。
 - **C 站间余票**：仅有余票数据、A/B 未覆盖的直达，按精确日期补充（`search` 末段）；耗时优先用 `_colon_dur(r["duration"])` 解析 `HH:MM`（兼容超过 24h 的长途直达）。
 - **D 多程换乘 `_search_multi`**（`max_legs>=3` 时启用）：`_load_services` 把大屏+时刻表统一成
-  "车次服务"，BFS 逐层扩展。支持四档预设 `PRUNE_PRESETS`：
+  "车次服务"，BFS 逐层扩展。四档预设 `PRUNE_PRESETS` 对 A/B/D 都在用，但**每个开关的实际作用域不同**
+  （详见 §6.7）：
   - `unbounded`（无限制，仅防死循环）：`frontier_k=0 / max_total_min=0 / detour_ratio=0 / prune_dominated=False`；
   - `relaxed`（高度宽松）：`frontier_k=16 / max_total_min=5760(96h) / detour_ratio=0 / prune_dominated=False`；
   - `balanced`（均衡默认）：`frontier_k=8 / max_total_min=2880(48h) / detour_ratio=0 / prune_dominated=False`；
@@ -225,7 +272,12 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 - 直达按 `(首程train_no, 首程from, 首程to, 首程depart)` 去重；2 程换乘按 `(首程no, 二程no, 换乘站, 二程from, 首程from, 二程to, 首程depart)` 去重；多程按 `(完整train_no元组, 各换乘站名元组, 首程from, 末程to, 首程depart)` 去重，保留同站与异站或同城不同起讫站的合法分支。
 - `rank(p)`：**有真实票价的优先**，其次非推算（真实日期）优先。
-- 最终按 `total_min` 升序。返回含 `direct`/`transfers`/`screen_trains`/`timetable_trains`/`cache_hit`/`prune_config`/`prune_stats`/`note`。
+- 最终按 `total_min` 升序。`limit > 0` 是**直达+换乘的合计上限**（直达优先占额度），截断发生在
+  `departed`/`date_assumed` 归一与 `station_cities` 汇总**之前**，因此这两处逐方案统计只作用于返回的方案。
+  返回含 `direct`/`transfers`/`direct_total`/`transfers_total`（截断前命中数）/`screen_trains`/`timetable_trains`/`cache_hit`/`prune_config`/`prune_stats`/`note`。
+- **默认值分两层**：`search()` 本身 `limit=0`（不限，脚本自行负责）；HTTP 层 `/api/transfers` 与
+  `/api/transfers/start` 默认 `limit=1000`，前端不传即用该值。原因：两段枚举不设上限，实测
+  深圳→广州命中 37.4 万条换乘，全量 JSON 数百 MB 会同时打死服务端与浏览器。要全量请显式传 `limit=0`。
 
 ### 6.5 票价/余票富化 `_enrich`
 
@@ -269,7 +321,9 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 - `transfer.invalidate_cache()`：显式清空 `_MEM_CACHE` + `_DATE_CACHE`（测试用；正常写库已自动失效）。
 - `DELETE /api/cache`（`main.py` → `db.clear_cache`）：删的是**库表数据**（`station_trains`/
   `train_stops`/`tickets`/`prices`，可选 `raw_payloads`），经 `tx()` 提交触发 `bump_data_version()`，
-  缓存随版本键自动重建。
+  缓存随版本键自动重建。`before_date` 为**必填**：缺省时 `db.clear_cache(None)` 会全表删光已爬数据，
+  所以 HTTP 入口直接返回 400；要全量清空请传远期日期（如 `2100-01-01`），或在脚本里调用
+  `db.clear_cache(None)`。
 
 **「过期」的两层含义（易混淆）**
 
@@ -284,6 +338,47 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
   `search()` 里原地改（见 §12 第 10 条）。
 - 外部脚本正常写库会改变 db 文件签名并在下次查询自动重建；仅当文件 `mtime_ns`/`size` 恰好未变时
   才漏检，需重启或 `invalidate_cache()` 兜底（见 §12 第 11 条）。
+
+### 6.7 剪枝档位：四个开关各自作用在哪个引擎（易误解，改动前务必读）
+
+档位表 `PRUNE_PRESETS`（`transfer.py:357-361`）：
+
+| 档位 | `frontier_k` | `max_total_min` | `detour_ratio` | `prune_dominated` |
+|---|---|---|---|---|
+| `unbounded` 无限制（仅防死循环） | 0 | 0 | 0.0 | False |
+| `relaxed` 高度宽松 | 16 | 5760（96h） | 0.0 | False |
+| `balanced` 均衡（**默认**） | 8 | 2880（48h） | 0.0 | False |
+| `strict` 严格精简 | 4 | 2160（36h） | 2.0 | True |
+
+参数优先级：`search()` 先取档位值，显式传入的参数逐个覆盖（`transfer.py:2296-2300`）；**显式传 `0`
+表示"不限"**，不会被档位默认值回填（`transfer.py:1384-1387` 有 WHY 注释）。前端
+`static/index.html` 的 `PRUNE_PRESETS`（`index.html:1137-1142`）是同一份数值的**手工副本**，且
+`maxh` 单位是小时（后端是分钟）——改后端档位必须同步改前端，否则 UI 显示的档位口径与实际下发不一致。
+
+**作用域矩阵（同一个开关在不同引擎的生效阶段完全不同，这是所有性能误解的根源）**
+
+| 开关 | A 大屏 `_search_screen` | B 时刻表 `_search_timetable` | D ≥3 程 BFS `_search_multi` | `search()` 汇总阶段 |
+|---|---|---|---|---|
+| `max_total_min` | ✅ 枚举循环内（`749`/`835`） | ✅ 枚举循环内（`1077`/`1221`） | ✅ 循环内 + 反向可达下界剪枝（`1640`/`1650`/`1915`） | — |
+| `detour_ratio` | ❌ **不读** | ✅ 循环内随 `best_min` 动态收紧（`1123`/`1206`/`1234-1235`）+ 元组阶段终筛（`1248`） | ✅ 由汇总前算出的 `prune_cfg["detour_cap"]`（`2440` 写入）收紧 `time_limit`（`1389-1392`） | ✅ 事后对**已建好**的方案再筛（`2498-2509`） |
+| `prune_dominated` | ❌ **不读** | ✅ 在**轻量元组**上先做（`1258`），`_enrich` 只跑存活者 | ✅ 首程压缩（`1686`）、逐层桶（`2009-2027`）、终点终筛（`2079`） | ✅ 对合并结果再做一遍（`2511-2548`） |
+| `frontier_k` | ❌ **不读** | ❌ **不读** | ✅ 每站每层"最快到达 + 最低费用"两榜交替取 top-K；`prune_dominated=False` 时走**入桶即截断**的有界桶压内存峰值（`1716`、`1960-2006`），开启支配则改为层末截断（`2028-2054`） | — |
+| `hub_only`/`hub_stations` | ✅ 搜前收窄中转候选（`783-787`） | ✅ 同样收窄（`1144-1151`） | — | — |
+
+三条推论：
+
+1. **UI 默认的"最多 2 程"搜索不受 `frontier_k` 约束**，也享受不到 B 的元组级早筛：大屏引擎 A 会把
+   凡是过了 `max_total_min`（默认 48 小时）的每组合作为**已 `_enrich` 的 dict** 直接 `append` 进
+   `transfers`（`840`）。实测深圳→广州（`balanced`）换乘命中 **37.4 万条**。
+2. **换档位降不了两段搜索的耗时**：`strict` 只让引擎 B 少建方案、并在汇总阶段多筛一遍；引擎 A 的
+   内层循环组合数不变（档位对它的唯一影响是 `max_total_min` 从 48h 收到 36h，少落一点方案），
+   且它落进 `transfers` 的每条都已经付过 `_enrich`。而 `prune_dominated` 在汇总阶段是按
+   `(首程出发站, 末程到达站)` 分组后做 `any(accepted)` 两两比较（`2532-2539`），组内规模大时是
+   平方级——大 OD 上选"严格精简"反而更慢。真正兜住返回体积的只有 HTTP 层的 `limit`（见 §6.4）。
+3. `balanced`/`relaxed` 的 `detour_ratio=0.0` 是**有意的**：绕行倍率会误杀"慢但便宜"的普速中转。
+   相关常量：`DETOUR_FLOOR_MIN=480`（8 小时保底，`transfer.py:377`）、
+   `SAFE_WAIT_MIN=30`（支配比较里的稳妥等待缓冲，低于它才判被支配，`transfer.py:447`）、
+   `MAX_TOTAL_MIN=2880` / `FRONTIER_K=8`（引擎 D 的默认值，`transfer.py:1319-1320`）。
 
 ---
 
@@ -376,7 +471,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 | `GET /api/trains?q=&limit=` | 按车次号搜时刻表 |
 | `GET /api/tickets?from_station=&to_station=&date=` | 浏览余票（批量附带匹配实测票价 `prices`/`price_date`/`price_stale`） |
 | `GET /api/prices?train_no=` | 浏览票价 |
-| `DELETE /api/cache` | 清理过期数据与内存缓存（`?before_date=&include_raw=`） |
+| `DELETE /api/cache` | 清理过期数据与内存缓存（`?before_date=必填&include_raw=`） |
 | `GET /api/transfers?...` | 同步换乘搜索（见 §6 参数） |
 | `POST /api/transfers/start` | 异步换乘搜索 → job（支持进度查询与中断） |
 | `POST /api/plan_tickets` | 方案实时查价/余票 → job |
@@ -444,6 +539,10 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
     （`parsed==0` 或 errorMsg 含「无数据/暂无/不存在」）收集起来，tickets 阶段跳过以其为端点的 OD——
     这些站发不出也接不到车，`leftTicket` 必返空。**判定三词必须与 `crawl_all_timetables.py` 保持一致**；
     网络/风控失败（不含三词）的车站保守保留仍查，别把偶发失败误判为空站而漏票（见 §8）。
+13. **剪枝档位不是全局生效的，别指望换档位能救两段搜索的性能**：`frontier_k` 只作用于 ≥3 程 BFS，
+    `detour_ratio`/`prune_dominated` 在时刻表引擎是元组级早筛、在大屏引擎只在汇总阶段事后筛（且支配
+    比较是平方级）。UI 上"束宽 8"对默认的最多 2 程根本不起作用。完整作用域矩阵与推论见 §6.7，
+    返回体积的兜底靠 HTTP 层 `limit`（§6.4），不是靠档位。
 
 ---
 
