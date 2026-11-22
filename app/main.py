@@ -289,9 +289,50 @@ def stats():
     return out
 
 
+_CITY_MODES = ("single", "name", "string", "mixed", "all")
+
+
+def _query_cities(q: str, limit: int = 8) -> list[dict]:
+    if q:
+        like, pref = f"%{q}%", f"{q}%"
+        cities = db.rows(
+            """SELECT city AS name, COUNT(*) AS station_count
+               FROM stations
+               WHERE city <> '' AND (
+                   city LIKE ?
+                   OR ((name = city OR name = city || '市' OR name LIKE city || '%')
+                       AND (pinyin LIKE ? OR lower(short)=lower(?) OR lower(short) LIKE lower(?)))
+               )
+               GROUP BY city
+               ORDER BY CASE WHEN city=? THEN 0
+                             WHEN city LIKE ? THEN 1
+                             WHEN MAX(CASE WHEN (name=city OR name=city||'市')
+                                  AND (lower(short)=lower(?) OR lower(pinyin)=lower(?)) THEN 1 ELSE 0 END)=1 THEN 2
+                             WHEN MAX(CASE WHEN name LIKE city||'%' AND lower(short)=lower(?) THEN 1 ELSE 0 END)=1 THEN 3
+                             ELSE 4 END,
+                        station_count DESC,
+                        city
+               LIMIT ?""",
+            (like, pref, q, pref, q, pref, q, q, q, limit),
+        )
+    else:
+        cities = db.rows(
+            """SELECT city AS name, COUNT(*) AS station_count
+               FROM stations WHERE city <> ''
+               GROUP BY city ORDER BY station_count DESC, city LIMIT ?""",
+            (limit,),
+        )
+    for c in cities:
+        c["kind"] = "city"
+        c["telecode"] = ""
+    return cities
+
+
 @app.get("/api/stations")
-def stations(q: str = "", limit: int = 30, include_cities: bool = False):
+def stations(q: str = "", limit: int = 30, include_cities: bool = False, only_cities: bool = False):
     q = (q or "").strip()
+    if only_cities:
+        return _query_cities(q, min(limit, 15))
     if q:
         like = f"%{q}%"
         pref = f"{q}%"
@@ -307,23 +348,36 @@ def stations(q: str = "", limit: int = 30, include_cities: bool = False):
             (like, like, like, like, q, qu, pref, pref, q, pref, limit),
         )
         if include_cities:
-            cities = db.rows(
-                """SELECT DISTINCT city AS name FROM stations
-                   WHERE city <> '' AND (
-                       city LIKE ?
-                       OR ((name = city OR name = city || '市' OR name LIKE city || '%')
-                           AND (pinyin LIKE ? OR lower(short)=lower(?) OR lower(short) LIKE lower(?)))
-                   )
-                   ORDER BY CASE WHEN city=? THEN 0 WHEN city LIKE ? THEN 1 ELSE 2 END, city
-                   LIMIT 8""",
-                (like, pref, q, pref, q, pref),
-            )
-            for c in cities:
-                c["kind"] = "city"
-                c["telecode"] = ""
+            cities = _query_cities(q, 8)
             return cities + rows[:max(limit - len(cities), 0)]
         return rows
     return db.rows("SELECT * FROM stations ORDER BY name LIMIT ?", (limit,))
+
+
+@app.get("/api/stations/resolve")
+def resolve_stations_preview(q: str = "", city_mode: str = "name", expand_city: bool = True):
+    if city_mode not in _CITY_MODES:
+        raise HTTPException(400, "city_mode 必须为 single / name / string / mixed / all")
+    q_s = (q or "").strip()
+    if not q_s:
+        has_st = bool(db.rows("SELECT 1 FROM stations LIMIT 1"))
+        return {
+            "ok": False,
+            "mode": city_mode,
+            "count": 0,
+            "stations": [],
+            "empty_db": not has_st,
+            "error": "" if has_st else "站名表为空，请先在「爬取数据」页更新车站站名表",
+        }
+    sts = db.resolve_stations(q_s, expand_city, city_mode)
+    return {
+        "ok": bool(sts),
+        "mode": city_mode,
+        "count": len(sts),
+        "stations": [{"name": s["name"], "telecode": s["telecode"], "city": s.get("city", "")} for s in sts],
+        "empty_db": False,
+        "error": "" if sts else db.station_resolve_error(q_s, city_mode),
+    }
 
 
 @app.get("/api/hubs")
@@ -565,10 +619,13 @@ class RouteImportReq(BaseModel):
     date: str
     deep: bool = True
     city_mode: str | None = None
+    from_city_mode: str | None = None
+    to_city_mode: str | None = None
 
 
 def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: str, deep: bool,
-               city_mode: str | None = None):
+               city_mode: str | None = None, from_city_mode: str | None = None,
+               to_city_mode: str | None = None):
     crawler.set_cancel_event(ev)
 
     def run(txt, fn, *args):
@@ -585,11 +642,14 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
         _job_append(job_id, "log", txt)
 
     try:
-        fstations = db.resolve_stations(from_q, True, city_mode)
-        tstations = db.resolve_stations(to_q, True, city_mode)
+        f_mode = from_city_mode or city_mode
+        t_mode = to_city_mode or city_mode
+        fstations = db.resolve_stations(from_q, True, f_mode)
+        tstations = db.resolve_stations(to_q, True, t_mode)
         if not fstations or not tstations:
             missing = from_q if not fstations else to_q
-            _job_update(job_id, status="error", error=db.station_resolve_error(missing, city_mode))
+            miss_mode = f_mode if not fstations else t_mode
+            _job_update(job_id, status="error", error=db.station_resolve_error(missing, miss_mode))
             return
         tc_name = {s["telecode"]: s["name"] for s in fstations + tstations}
         ftcs = [s["telecode"] for s in fstations]
@@ -716,17 +776,25 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
 @app.post("/api/import/route")
 def import_route(body: RouteImportReq):
     _check_date(body.date)
-    if body.city_mode is not None and body.city_mode not in ("single", "name", "string", "mixed", "all"):
-        raise HTTPException(400, "city_mode 必须为 single / name / string / mixed / all")
-    fstations = db.resolve_stations(body.from_city, True, body.city_mode)
-    tstations = db.resolve_stations(body.to_city, True, body.city_mode)
+    for m in (body.city_mode, body.from_city_mode, body.to_city_mode):
+        if m is not None and m not in _CITY_MODES:
+            raise HTTPException(400, "city_mode 必须为 single / name / string / mixed / all")
+    f_mode = body.from_city_mode or body.city_mode
+    t_mode = body.to_city_mode or body.city_mode
+    fstations = db.resolve_stations(body.from_city, True, f_mode)
+    tstations = db.resolve_stations(body.to_city, True, t_mode)
     if not fstations or not tstations:
         missing = body.from_city if not fstations else body.to_city
-        raise HTTPException(400, db.station_resolve_error(missing, body.city_mode))
+        miss_mode = f_mode if not fstations else t_mode
+        raise HTTPException(400, db.station_resolve_error(missing, miss_mode))
     job_id, ev = _create_job({"status": "running", "done": 0, "total": 0, "phase": "init",
                                "current": "", "truncated": 0, "log": [], "errors": [], "result": {}})
-    threading.Thread(target=_route_job, args=(job_id, ev, body.from_city, body.to_city,
-                                              body.date, body.deep, body.city_mode), daemon=True).start()
+    threading.Thread(
+        target=_route_job,
+        args=(job_id, ev, body.from_city, body.to_city, body.date, body.deep,
+              body.city_mode, body.from_city_mode, body.to_city_mode),
+        daemon=True,
+    ).start()
     return {"job_id": job_id,
             "from_stations": [s["name"] for s in fstations],
             "to_stations": [s["name"] for s in tstations],
@@ -866,7 +934,9 @@ def _validate_search_params(date: str, max_legs: int, cross_extra: int,
                             frontier_k: int | None, prune_level: str,
                             max_total_min: int | None, detour_ratio: float | None,
                             include_stations_mode: str = "or",
-                            city_mode: str | None = None):
+                            city_mode: str | None = None,
+                            from_city_mode: str | None = None,
+                            to_city_mode: str | None = None):
     _check_date(date)
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
@@ -882,8 +952,9 @@ def _validate_search_params(date: str, max_legs: int, cross_extra: int,
         raise HTTPException(400, "detour_ratio 必须在 0-20 之间")
     if (include_stations_mode or "or").strip().lower() not in ("or", "and"):
         raise HTTPException(400, "include_stations_mode 必须为 or 或 and")
-    if city_mode is not None and city_mode not in ("single", "name", "string", "mixed", "all"):
-        raise HTTPException(400, "city_mode 必须为 single / name / string / mixed / all")
+    for m in (city_mode, from_city_mode, to_city_mode):
+        if m is not None and m not in _CITY_MODES:
+            raise HTTPException(400, "city_mode 必须为 single / name / string / mixed / all")
 
 
 # WHY: HTTP 默认必须带上限——两段换乘枚举不设限（深圳→广州实测 37.4 万条），全量 JSON 可达
@@ -905,10 +976,13 @@ def transfers(from_station: str, to_station: str, date: str,
               include_stations: str = "",
               exclude_stations: str = "",
               include_stations_mode: str = "or",
-              city_mode: str | None = None):
+              city_mode: str | None = None,
+              from_city_mode: str | None = None,
+              to_city_mode: str | None = None):
     _validate_search_params(
         date, max_legs, cross_extra, frontier_k, prune_level,
-        max_total_min, detour_ratio, include_stations_mode, city_mode,
+        max_total_min, detour_ratio, include_stations_mode,
+        city_mode, from_city_mode, to_city_mode,
     )
     return _run(
         transfer.search, from_station, to_station, date,
@@ -917,7 +991,7 @@ def transfers(from_station: str, to_station: str, date: str,
         allow_cross_station, hub_only, hub_stations,
         allow_prefixes, exclude_prefixes,
         include_stations, exclude_stations, include_stations_mode,
-        city_mode,
+        city_mode, from_city_mode, to_city_mode,
     )
 
 
@@ -945,6 +1019,8 @@ class TransferSearchReq(BaseModel):
     exclude_stations: str = ""
     include_stations_mode: str = "or"
     city_mode: str | None = None
+    from_city_mode: str | None = None
+    to_city_mode: str | None = None
 
 
 def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchReq):
@@ -973,6 +1049,8 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
             exclude_stations=body.exclude_stations,
             include_stations_mode=body.include_stations_mode,
             city_mode=body.city_mode,
+            from_city_mode=body.from_city_mode,
+            to_city_mode=body.to_city_mode,
             progress_cb=on_prog, cancel_event=ev, sub_cb=on_sub,
         )
         if ev.is_set():
@@ -994,12 +1072,16 @@ def start_transfers(body: TransferSearchReq):
         body.date, body.max_legs, body.cross_extra, body.frontier_k,
         body.prune_level, body.max_total_min, body.detour_ratio,
         body.include_stations_mode, body.city_mode,
+        body.from_city_mode, body.to_city_mode,
     )
-    fstations = db.resolve_stations(body.from_station, body.expand_city, body.city_mode)
-    tstations = db.resolve_stations(body.to_station, body.expand_city, body.city_mode)
+    f_mode = body.from_city_mode or body.city_mode
+    t_mode = body.to_city_mode or body.city_mode
+    fstations = db.resolve_stations(body.from_station, body.expand_city, f_mode)
+    tstations = db.resolve_stations(body.to_station, body.expand_city, t_mode)
     if not fstations or not tstations:
         missing = body.from_station if not fstations else body.to_station
-        raise HTTPException(400, db.station_resolve_error(missing, body.city_mode))
+        miss_mode = f_mode if not fstations else t_mode
+        raise HTTPException(400, db.station_resolve_error(missing, miss_mode))
     total_steps = 6 if body.max_legs < 3 else 5 + (body.max_legs - 1)
     job_id, ev = _create_job({
         "status": "running", "phase": "search", "done": 0, "total": total_steps,

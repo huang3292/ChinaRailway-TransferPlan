@@ -246,9 +246,33 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
 .toolbar-warn{color:#b45309;background:#fffbeb;border:1px solid #fde68a;padding:3px 8px;border-radius:4px;font-size:12px}
 
 .ac{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid #cbd5e1;border-radius:4px;max-height:260px;overflow:auto;z-index:30;display:none;box-shadow:0 6px 16px rgba(15,23,42,.12)}
-.ac .it{padding:6px 10px;cursor:pointer;font-size:13px;border-bottom:1px solid #f1f5f9}
+.ac .it{padding:6px 10px;cursor:pointer;font-size:13px;border-bottom:1px solid #f1f5f9;display:flex;justify-content:space-between;align-items:center;gap:8px}
 .ac .it:hover,.ac .it.sel{background:#eff6ff}
-.ac small{color:var(--muted);margin-left:8px;font-size:11px}
+.ac small{color:var(--muted);font-size:11px;white-space:nowrap}
+
+/* 5档车站选择器与实时解析预览 */
+.od-row{align-items:flex-start}
+.od-box{flex:1.5;min-width:250px}
+.od-hd{display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:4px}
+.od-hd label{margin:0}
+.od-mode{width:auto;padding:2px 6px;font-size:12px;height:23px;border-color:#bfd6f6;background:#f7faff;color:#1e3a8a;font-weight:500}
+.od-inputs{display:flex;gap:6px;align-items:stretch}
+.od-ac-wrap{position:relative;flex:1;min-width:0}
+.od-str-wrap{position:relative;flex:0 0 43%;min-width:105px}
+.od-chips-box{display:flex;flex-wrap:wrap;align-items:center;gap:4px;border:1px solid #cbd5e1;border-radius:4px;padding:3px 6px;background:#fff;min-height:32px;cursor:text;transition:border-color .15s,box-shadow .15s}
+.od-chips-box:focus-within{border-color:var(--blue);box-shadow:0 0 0 2px rgba(38,118,227,.14)}
+.od-chips{display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center}
+.od-chip{display:inline-flex;align-items:center;gap:3px;background:#eef5ff;color:#1d4ed8;border:1px solid #bfdbfe;border-radius:3px;padding:1px 6px;font-size:12px;font-weight:500;white-space:nowrap;line-height:1.35}
+.od-chip button{border:none;background:transparent;color:#64748b;cursor:pointer;padding:0 1px;font-size:13px;line-height:1}
+.od-chip button:hover{color:#dc2626}
+.od-mix-inp{border:none !important;box-shadow:none !important;padding:2px 4px;min-width:95px;width:100%;font-size:13px;background:transparent}
+.od-chips-clr{border:none;background:#f1f5f9;color:#64748b;border-radius:3px;padding:1px 6px;font-size:11px;cursor:pointer;margin-left:auto}
+.od-chips-clr:hover{background:#fee2e2;color:#dc2626}
+.od-preview{margin-top:5px;font-size:11px;color:var(--muted);min-height:16px;line-height:1.5;display:flex;flex-wrap:wrap;align-items:center;gap:4px}
+.od-pv-ok{color:#15803d;font-weight:600}
+.od-pv-err{color:#dc2626;font-weight:500}
+.od-pv-tag{display:inline-block;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:3px;padding:0 5px;color:#334155;font-variant-numeric:tabular-nums}
+.od-pv-btn{border:none;background:transparent;color:var(--blue);cursor:pointer;padding:0 3px;font-size:11px;text-decoration:underline}
 
 .pager{display:flex;gap:10px;align-items:center;margin:10px 0}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}
@@ -284,33 +308,73 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
 <!-- ============ 换乘搜索 ============ -->
 <section class="tab active" id="tab-search">
   <div class="card">
-    <div class="row">
-      <div><label>出发地（站名/城市/拼音/电报码）</label><div style="position:relative"><input id="s-from" class="station-ac" placeholder="如：厦门"></div><input id="s-f-str" placeholder="③档站名字样，如：延平" title="城市+该字样筛选市内车站" style="display:none;margin-top:4px"></div>
-      <div class="swap-wrap"><button type="button" class="btn-swap" id="s-swap" title="互换出发到达">⇄</button></div>
-      <div><label>到达地（站名/城市/拼音/电报码）</label><div style="position:relative"><input id="s-to" class="station-ac" placeholder="如：南平市"></div><input id="s-t-str" placeholder="③档站名字样，如：延平" title="城市+该字样筛选市内车站" style="display:none;margin-top:4px"></div>
+    <div class="row od-row">
+      <div class="od-box">
+        <div class="od-hd">
+          <label for="s-from">出发地</label>
+          <select id="s-from-mode" class="od-mode" title="①仅该站：站名/电报码精确单站，绝不换站；②城市名站：厦门→厦门/厦门北/厦门高崎；③城市+字样：南平+延平→延平/延平东/延平西；④混合多选：点选车站或城市自由累加标签；⑤全市所有站：含下辖郊县站。">
+            <option value="single">① 仅该站</option>
+            <option value="name" selected>② 城市名站</option>
+            <option value="string">③ 城市+字样</option>
+            <option value="mixed">④ 混合多选</option>
+            <option value="all">⑤ 全市所有站</option>
+          </select>
+        </div>
+        <div id="s-from-inputs" class="od-inputs">
+          <div class="od-ac-wrap"><input id="s-from" placeholder="城市或站名，如：厦门"></div>
+          <div id="s-f-str-wrap" class="od-str-wrap" style="display:none"><input id="s-f-str" placeholder="站名字样，如：延平" title="筛选该城市内含此字样的车站，多关键词可逗号分隔"></div>
+        </div>
+        <div id="s-from-chips-box" class="od-chips-box" style="display:none">
+          <span id="s-from-chips" class="od-chips"></span>
+          <div class="od-ac-wrap"><input id="s-from-mix" class="od-mix-inp" placeholder="搜站名或城市点击累加…"></div>
+          <button type="button" id="s-from-clr" class="od-chips-clr" style="display:none" title="清空已选">清空</button>
+        </div>
+        <div id="s-from-preview" class="od-preview"></div>
+      </div>
+      <div class="swap-wrap" style="padding-top:27px"><button type="button" class="btn-swap" id="s-swap" title="互换出发到达（含范围模式与多选标签）">⇄</button></div>
+      <div class="od-box">
+        <div class="od-hd">
+          <label for="s-to">到达地</label>
+          <select id="s-to-mode" class="od-mode" title="①仅该站：站名/电报码精确单站，绝不换站；②城市名站：泉州→泉州/泉州东/泉州南；③城市+字样：南平+延平→延平/延平东/延平西；④混合多选：点选车站或城市自由累加标签；⑤全市所有站：含下辖郊县站。">
+            <option value="single">① 仅该站</option>
+            <option value="name" selected>② 城市名站</option>
+            <option value="string">③ 城市+字样</option>
+            <option value="mixed">④ 混合多选</option>
+            <option value="all">⑤ 全市所有站</option>
+          </select>
+        </div>
+        <div id="s-to-inputs" class="od-inputs">
+          <div class="od-ac-wrap"><input id="s-to" placeholder="城市或站名，如：南平市"></div>
+          <div id="s-t-str-wrap" class="od-str-wrap" style="display:none"><input id="s-t-str" placeholder="站名字样，如：延平" title="筛选该城市内含此字样的车站，多关键词可逗号分隔"></div>
+        </div>
+        <div id="s-to-chips-box" class="od-chips-box" style="display:none">
+          <span id="s-to-chips" class="od-chips"></span>
+          <div class="od-ac-wrap"><input id="s-to-mix" class="od-mix-inp" placeholder="搜站名或城市点击累加…"></div>
+          <button type="button" id="s-to-clr" class="od-chips-clr" style="display:none" title="清空已选">清空</button>
+        </div>
+        <div id="s-to-preview" class="od-preview"></div>
+      </div>
       <div style="flex:0 0 148px"><label>出发日期（默认明天）</label><input id="s-date" type="date"></div>
-      <div class="narrow transfer-only"><label>最短换乘(分)</label><input id="s-min" type="number" value="30"></div>
-      <div class="narrow transfer-only"><label>最长换乘(分)</label><input id="s-max" type="number" value="360"></div>
-      <div class="narrow transfer-only"><label>异站加时(分)</label><input id="s-cross" type="number" value="60" min="0" max="360"></div>
-      <div style="flex:0"><button class="btn" id="s-go">查询</button></div>
+      <div style="flex:0;padding-top:26px"><button class="btn" id="s-go">查询</button></div>
     </div>
     <div class="row" style="margin-top:10px">
-      <div style="flex:0 0 135px"><label>排序</label>
+      <div style="flex:0 0 125px"><label>排序</label>
         <select id="s-sort">
           <option value="duration">耗时最短</option>
           <option value="depart">发车最早</option>
           <option value="price">价格最低</option>
         </select></div>
-      <div style="flex:0 0 115px"><label>方案类型</label>
+      <div style="flex:0 0 110px"><label>方案类型</label>
         <select id="s-type"><option value="">全部</option><option value="direct">仅直达</option><option value="transfer">仅换乘</option></select></div>
-      <div style="flex:0 0 130px"><label>最多程数</label>
+      <div style="flex:0 0 125px"><label>最多程数</label>
         <select id="s-legs"><option value="2" selected>2程(1次换乘)</option><option value="3">3程(2次换乘)</option><option value="4">4程(3次换乘)</option><option value="5">5程(4次换乘)</option></select></div>
-      <div style="flex:0 0 100px"><label>每页方案数</label>
+      <div style="flex:0 0 90px"><label>每页方案</label>
         <select id="s-size"><option>20</option><option selected>50</option><option>100</option><option>200</option></select></div>
-      <div style="flex:3;padding-bottom:4px">
-        <label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0">车站范围</label>
-        <select id="s-city" style="width:auto" title="①仅该站：站名/电报码精确匹配，绝不换站（12306 输入框会把郊县站引到主站，这里由你显式控制）；②城市名站：泉州→泉州/泉州东/泉州南；③城市+字样：南平+延平→延平/延平东/延平西；④混合多选：在联想里连续点选多个站自动合并；⑤全市所有站：该地级市全部车站含郊县（注意按 city 字段，安溪站会漏）。"><option value="single">① 仅该站（站名/电报码）</option><option value="name" selected>② 城市名站（泉州→泉州/泉州东…）</option><option value="string">③ 城市+站名字样（南平+延平）</option><option value="mixed">④ 混合多选（点选累加车站）</option><option value="all">⑤ 全市所有站（含郊县站）</option></select>
-        <label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0 0 0 14px;cursor:pointer"><input type="checkbox" id="s-online" style="width:auto"> 在线模式（搜索前实时抓取）</label>
+      <div class="narrow transfer-only"><label>最短换乘(分)</label><input id="s-min" type="number" value="30"></div>
+      <div class="narrow transfer-only"><label>最长换乘(分)</label><input id="s-max" type="number" value="360"></div>
+      <div class="narrow transfer-only"><label>异站加时(分)</label><input id="s-cross" type="number" value="60" min="0" max="360"></div>
+      <div style="flex:2;min-width:210px;padding-bottom:4px">
+        <label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0;cursor:pointer"><input type="checkbox" id="s-online" style="width:auto"> 在线模式（搜索前实时抓取）</label>
         <label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0 0 0 14px;cursor:pointer"><input type="checkbox" id="s-live" style="width:auto"> 自动查询票价/余票</label>
       </div>
     </div>
@@ -652,12 +716,11 @@ const tomorrow=new Date(Date.now()+8*3600e3+86400e3).toISOString().slice(0,10);
 ['s-date','c-date','c-t-date','w-date'].forEach(id=>{if($(id))$(id).value=tomorrow;});
 if($('b-clean-date'))$('b-clean-date').value=today;
 
-// 互换出发/到达快捷按钮
+// 互换出发/到达快捷按钮（搜索页由 SearchODController 接管同步两端的模式/筛选/标签）
 function wireSwap(btnId,fromId,toId){
   const btn=$(btnId);if(!btn)return;
   btn.onclick=()=>{const f=$(fromId),t=$(toId);if(!f||!t)return;const v=f.value;f.value=t.value;t.value=v;};
 }
-wireSwap('s-swap','s-from','s-to');
 wireSwap('w-swap','w-from','w-to');
 wireSwap('c-swap','c-from','c-to');
 
@@ -1047,109 +1110,418 @@ function priceDrawerHtml(l,opts={}){
   </div>`;
 }
 
-// 车站自动补全：中文站名为主，附电报码与城市，支持拼音/电报码检索
-// 仅在支持城市聚合的模式（②/③/⑤及一键导入向导）返回城市条目；①仅该站与④混合多选绝不返回城市；
-// ④混合多选对分隔符后的末尾片段做检索，并在点选时替换该片段而非拼接重复前缀。
+// ---------- 通用车站自动补全（爬取页向导 / 单站抓包输入框） ----------
 const acHideHooks=[];
-function splitMixedTokens(raw){
-  const parts=String(raw||'').split(/([,，、；;])/);
-  const active=parts[parts.length-1].trim();
-  const completed=[];
-  for(let i=0;i<parts.length-1;i+=2){
-    const t=parts[i].trim();
-    if(t&&!completed.includes(t))completed.push(t);
-  }
-  return {completed,active};
-}
 function attachAC(inp){
   const wrap=inp.parentElement;wrap.style.position='relative';
   const box=document.createElement('div');box.className='ac';wrap.appendChild(box);
-  const isSearch=inp.id==='s-from'||inp.id==='s-to';
   const isWizard=inp.id==='w-from'||inp.id==='w-to';
-  const cityMode=()=>{const e=$('s-city');return isSearch&&e?e.value:null;};
-  const allowCities=()=>{
-    if(isWizard)return true;
-    if(!isSearch)return false;
-    const m=cityMode();
-    return m==='name'||m==='all'||m==='string';
-  };
-  const cityKindHint=()=>{
-    const m=cityMode();
-    if(m==='all')return '城市（全市含郊县）';
-    if(m==='string')return '城市（配合下方字样筛选）';
-    return '城市（市内名站）';
-  };
   let items=[],sel=-1,timer,reqSeq=0;
   const hide=()=>{box.style.display='none';sel=-1;};
   acHideHooks.push(hide);
-  const pick=(it)=>{
-    if(it.kind==='city'){inp.value=it.name;hide();return;}
-    if(cityMode()==='mixed'){
-      const {completed}=splitMixedTokens(inp.value);
-      if(!completed.includes(it.name))completed.push(it.name);
-      inp.value=completed.join('，');
-      inp.focus();hide();
-      return;
-    }
-    inp.value=it.name;hide();
-  };
+  const pick=(it)=>{inp.value=it.name;hide();};
   const show=()=>{
     if(!items.length){hide();return;}
-    const ch=cityKindHint();
-    box.innerHTML=items.map((s,i)=>`<div class="it${i===sel?' sel':''}" data-i="${i}"><b>${esc(s.name)}</b><small>${s.kind==='city'?ch:esc(s.telecode)+(s.city?' · '+esc(s.city):'')}</small></div>`).join('');
+    box.innerHTML=items.map((s,i)=>`<div class="it${i===sel?' sel':''}" data-i="${i}"><b>${esc(s.name)}</b><small>${s.kind==='city'?`城市 · 市内名站${s.station_count?'（全市'+s.station_count+'站）':''}`:esc(s.telecode)+(s.city?' · '+esc(s.city):'')}</small></div>`).join('');
     box.style.display='block';
     box.querySelectorAll('.it').forEach(el=>el.onmousedown=e=>{e.preventDefault();pick(items[+el.dataset.i]);});
   };
   inp.addEventListener('input',()=>{
     clearTimeout(timer);
-    const modeAtInput=cityMode();
-    const q=modeAtInput==='mixed'?splitMixedTokens(inp.value).active:inp.value.trim();
+    const q=inp.value.trim();
     if(!q){items=[];hide();return;}
-    const valAtReq=inp.value;
-    const mySeq=++reqSeq;
+    const valAtReq=inp.value,mySeq=++reqSeq;
     timer=setTimeout(async()=>{
       try{
-        const wantCities=allowCities();
-        let its=await api('/api/stations?q='+encodeURIComponent(q)+(wantCities?'&include_cities=1':''));
-        if(mySeq!==reqSeq||inp.value!==valAtReq||cityMode()!==modeAtInput)return;
-        if(!wantCities)its=its.filter(x=>x.kind!=='city');
+        let its=await api('/api/stations?q='+encodeURIComponent(q)+(isWizard?'&include_cities=1':''));
+        if(mySeq!==reqSeq||inp.value!==valAtReq)return;
+        if(!isWizard)its=its.filter(x=>x.kind!=='city');
         items=its;sel=-1;show();
       }catch(e){}
-    },150);
+    },140);
   });
   inp.addEventListener('keydown',e=>{
-    if(box.style.display!=='block')return;
+    if(box.style.display!=='block'||!items.length)return;
     if(e.key==='ArrowDown'){sel=Math.min(sel+1,items.length-1);show();e.preventDefault();}
     else if(e.key==='ArrowUp'){sel=Math.max(sel-1,0);show();e.preventDefault();}
-    else if(e.key==='Enter'){if(sel>=0){pick(items[sel]);e.preventDefault();}}
-    else if(e.key==='Escape')hide();
+    else if(e.key==='Enter'){
+      const v=inp.value.trim().toUpperCase();
+      const exactHit=items.some(it=>it.name.toUpperCase()===v||(it.telecode&&it.telecode.toUpperCase()===v));
+      if(sel>=0||!exactHit){pick(items[sel>=0?sel:0]);e.preventDefault();}
+      else hide();
+    }else if(e.key==='Escape'){hide();}
   });
   inp.addEventListener('blur',()=>setTimeout(hide,150));
 }
 document.querySelectorAll('input.station-ac').forEach(attachAC);
 
-// 车站范围五档：③档显示"站名字样"输入框，④档联想按分隔符末尾片段检索并替换累加
-function applyCityMode(){
-  acHideHooks.forEach(fn=>fn());
-  const m=$('s-city').value,show=m==='string';
-  $('s-f-str').style.display=show?'':'none';
-  $('s-t-str').style.display=show?'':'none';
-  const ph={single:'如：建阳（绝不换站）',name:'如：南平（→南平市）',string:'城市，如：南平',mixed:'连续输入：延平，建阳',all:'如：泉州（含郊县站）'}[m];
-  $('s-from').placeholder=ph;$('s-to').placeholder=ph;
+// ---------- 换乘搜索 5 档车站范围独立控制器（支持两端独立选档、④标签累加、③城市内下钻、实时解析预览） ----------
+const SEARCH_SIDE_IDS={
+  from:{mode:'s-from-mode',main:'s-from',inputs:'s-from-inputs',strWrap:'s-f-str-wrap',str:'s-f-str',chipsBox:'s-from-chips-box',chips:'s-from-chips',mix:'s-from-mix',clr:'s-from-clr',preview:'s-from-preview'},
+  to:{mode:'s-to-mode',main:'s-to',inputs:'s-to-inputs',strWrap:'s-t-str-wrap',str:'s-t-str',chipsBox:'s-to-chips-box',chips:'s-to-chips',mix:'s-to-mix',clr:'s-to-clr',preview:'s-to-preview'},
+};
+const MODE_META={
+  single:{ph:'站名或电报码，如：建阳',hint:'① 仅该站：严格按站名/电报码单站匹配，绝不换站或拆逗号'},
+  name:{ph:'城市或站名，如：厦门 / 南平',hint:'② 城市名站：城市展开以市名打头的市区站，输入具体站名则查该站'},
+  string:{ph:'输入城市，如：南平',hint:'③ 城市+字样：左侧选城市，右侧填站名关键词筛选（多关键词可逗号分隔）'},
+  mixed:{ph:'搜站名或城市点击累加…',hint:'④ 混合多选：点选车站或城市批量展开为可编辑标签，支持跨城组合'},
+  all:{ph:'地级市或站名，如：泉州',hint:'⑤ 全市所有站：展开该市归属的全部车站（含下辖郊县站）'},
+};
+const odState={
+  from:{mode:'name',chips:[],expanded:false,pvSeq:0,pvTimer:null},
+  to:{mode:'name',chips:[],expanded:false,pvSeq:0,pvTimer:null},
+};
+
+function getSideMode(side){return $(SEARCH_SIDE_IDS[side].mode).value;}
+function compField(mainId,strId,mode){
+  const v=$(mainId).value.trim(),s=$(strId).value.trim();
+  if(mode!=='string'||!s)return v;
+  if(!v)return ':'+s;
+  if(/[:：]/.test(v))return v;
+  const parts=s.split(/[,，、；;]/).map(x=>x.trim()).filter(Boolean);
+  return parts.length>1?parts.map(p=>v+':'+p).join(','):v+':'+s;
 }
-$('s-city').addEventListener('change',applyCityMode);
+function getSideQuery(side){
+  const ids=SEARCH_SIDE_IDS[side],st=odState[side],m=getSideMode(side);
+  if(m==='mixed'){
+    const toks=st.chips.map(c=>c.name);
+    const tail=$(ids.mix).value.trim();
+    if(tail)tail.split(/[,，、；;]/).map(x=>x.trim()).filter(Boolean).forEach(t=>{if(!toks.includes(t))toks.push(t);});
+    return toks.join('，');
+  }
+  return compField(ids.main,ids.str,m);
+}
+
+function renderMixedChips(side){
+  const ids=SEARCH_SIDE_IDS[side],st=odState[side];
+  $(ids.chips).innerHTML=st.chips.map((c,i)=>`<span class="od-chip" title="${esc(c.telecode||'')}${c.city?' · '+esc(c.city):''}">${esc(c.name)}<small style="opacity:.7">${c.telecode?' '+esc(c.telecode):''}</small><button type="button" data-idx="${i}" title="移除">×</button></span>`).join('');
+  $(ids.chips).querySelectorAll('button[data-idx]').forEach(btn=>{
+    btn.onclick=e=>{e.stopPropagation();st.chips.splice(+btn.dataset.idx,1);renderMixedChips(side);schedulePreview(side,true);$(ids.mix).focus();};
+  });
+  $(ids.clr).style.display=st.chips.length>=1?'':'none';
+  $(ids.mix).placeholder=st.chips.length?'继续输入站名/城市添加…':MODE_META.mixed.ph;
+}
+
+function addMixedStations(side,list){
+  const st=odState[side],seen=new Set(st.chips.map(c=>c.telecode||c.name));
+  for(const s of list){
+    const key=s.telecode||s.name;
+    if(!key||seen.has(key))continue;
+    seen.add(key);
+    st.chips.push({name:s.name,telecode:s.telecode||'',city:s.city||''});
+  }
+  renderMixedChips(side);
+}
+
+function renderSideUI(side){
+  const ids=SEARCH_SIDE_IDS[side],m=getSideMode(side);
+  const isMixed=(m==='mixed'),isStr=(m==='string');
+  $(ids.inputs).style.display=isMixed?'none':'flex';
+  $(ids.strWrap).style.display=isStr?'block':'none';
+  $(ids.chipsBox).style.display=isMixed?'flex':'none';
+  $(ids.main).placeholder=MODE_META[m].ph;
+  if(isMixed)renderMixedChips(side);
+}
+
+function schedulePreview(side,immediate=false){
+  const st=odState[side];
+  clearTimeout(st.pvTimer);
+  const run=async()=>{
+    const ids=SEARCH_SIDE_IDS[side],pvEl=$(ids.preview);
+    const m=getSideMode(side),q=getSideQuery(side);
+    const mySeq=++st.pvSeq;
+    if(!q){
+      try{
+        const d=await api('/api/stations/resolve?q=&city_mode='+encodeURIComponent(m));
+        if(mySeq!==st.pvSeq)return;
+        if(d.empty_db&&d.error){pvEl.innerHTML=`<span class="od-pv-err">${esc(d.error)}</span>`;return;}
+      }catch(_e){}
+      pvEl.innerHTML=`<span>${esc(MODE_META[m].hint)}</span>`;
+      return;
+    }
+    try{
+      const d=await api(`/api/stations/resolve?q=${encodeURIComponent(q)}&city_mode=${encodeURIComponent(m)}`);
+      if(mySeq!==st.pvSeq||getSideMode(side)!==m||getSideQuery(side)!==q)return;
+      if(!d.ok||!d.stations.length){
+        pvEl.innerHTML=`<span class="od-pv-err">${esc(d.error||'未匹配到车站')}</span>`;
+        return;
+      }
+      const limit=st.expanded?d.stations.length:6;
+      const shown=d.stations.slice(0,limit).map(s=>`<span class="od-pv-tag">${esc(s.name)}(${esc(s.telecode)})</span>`).join('');
+      const more=d.stations.length>6
+        ?`<button type="button" class="od-pv-btn" data-toggle-pv="${side}">${st.expanded?'收起':'展开全部 '+d.stations.length+' 站'}</button>`:'';
+      pvEl.innerHTML=`<span class="od-pv-ok">已匹配 ${d.count} 站：</span>${shown}${more}`;
+      const btn=pvEl.querySelector('[data-toggle-pv]');
+      if(btn)btn.onclick=()=>{st.expanded=!st.expanded;schedulePreview(side,true);};
+    }catch(_e){}
+  };
+  if(immediate)run();
+  else st.pvTimer=setTimeout(run,140);
+}
+
+function initSidePicker(side){
+  const ids=SEARCH_SIDE_IDS[side],st=odState[side];
+  const mainInp=$(ids.main),strInp=$(ids.str),mixInp=$(ids.mix),modeSel=$(ids.mode);
+
+  // 1) 主输入框（single / name / all / string左侧城市）联想
+  const mainWrap=mainInp.parentElement;
+  const mainBox=document.createElement('div');mainBox.className='ac';mainWrap.appendChild(mainBox);
+  let mItems=[],mSel=-1,mTimer,mSeq=0;
+  const hideMain=()=>{mainBox.style.display='none';mSel=-1;};
+  acHideHooks.push(hideMain);
+  const pickMain=(it)=>{
+    mainInp.value=it.name;
+    hideMain();
+    if(getSideMode(side)==='string'){strInp.focus();}
+    schedulePreview(side,true);
+  };
+  const showMain=()=>{
+    if(!mItems.length){hideMain();return;}
+    const m=getSideMode(side);
+    mainBox.innerHTML=mItems.map((s,i)=>{
+      let tail='';
+      if(s.kind==='city'){
+        if(m==='all')tail=`城市 · 全市 ${s.station_count||''} 站`;
+        else if(m==='string')tail=`城市 · 共 ${s.station_count||''} 站（右侧筛选）`;
+        else tail='城市 · 市内名站';
+      }else{
+        tail=esc(s.telecode)+(s.city?' · '+esc(s.city):'');
+      }
+      return `<div class="it${i===mSel?' sel':''}" data-i="${i}"><b>${esc(s.name)}</b><small>${tail}</small></div>`;
+    }).join('');
+    mainBox.style.display='block';
+    mainBox.querySelectorAll('.it').forEach(el=>el.onmousedown=e=>{e.preventDefault();pickMain(mItems[+el.dataset.i]);});
+  };
+  mainInp.addEventListener('input',()=>{
+    st.expanded=false;
+    const m=getSideMode(side);
+    // ③档若用户直接在左框粘贴“南平:延平”，自动拆进左右两框
+    if(m==='string'&&/[:：]/.test(mainInp.value)){
+      const parts=mainInp.value.replace('：',':').split(':');
+      mainInp.value=parts[0].trim();
+      strInp.value=parts.slice(1).join(':').trim();
+      hideMain();schedulePreview(side,true);return;
+    }
+    schedulePreview(side,false);
+    clearTimeout(mTimer);
+    const q=mainInp.value.trim();
+    if(!q){mItems=[];hideMain();return;}
+    const valAtReq=mainInp.value,modeAtReq=m,mySeq=++mSeq;
+    mTimer=setTimeout(async()=>{
+      try{
+        const qs=modeAtReq==='string'?'only_cities=1':((modeAtReq==='name'||modeAtReq==='all')?'include_cities=1':'');
+        let its=await api('/api/stations?q='+encodeURIComponent(q)+(qs?'&'+qs:''));
+        if(mySeq!==mSeq||mainInp.value!==valAtReq||getSideMode(side)!==modeAtReq)return;
+        if(modeAtReq==='single')its=its.filter(x=>x.kind!=='city');
+        mItems=its;mSel=-1;showMain();
+      }catch(e){}
+    },130);
+  });
+  mainInp.addEventListener('keydown',e=>{
+    if(mainBox.style.display!=='block'||!mItems.length)return;
+    if(e.key==='ArrowDown'){mSel=Math.min(mSel+1,mItems.length-1);showMain();e.preventDefault();}
+    else if(e.key==='ArrowUp'){mSel=Math.max(mSel-1,0);showMain();e.preventDefault();}
+    else if(e.key==='Enter'){
+      const v=mainInp.value.trim().toUpperCase();
+      const exactHit=mItems.some(it=>it.name.toUpperCase()===v||(it.telecode&&it.telecode.toUpperCase()===v));
+      if(mSel>=0||!exactHit){pickMain(mItems[mSel>=0?mSel:0]);e.preventDefault();}
+      else hideMain();
+    }else if(e.key==='Escape'){hideMain();}
+  });
+  mainInp.addEventListener('blur',()=>setTimeout(hideMain,150));
+
+  // 2) ③档右侧“站名字样”框：聚焦/输入时展示该城市全部车站供参考或点击
+  const strWrap=strInp.parentElement;
+  const strBox=document.createElement('div');strBox.className='ac';strWrap.appendChild(strBox);
+  let sAll=[],sItems=[],sSel=-1,sSeq=0,sCity='';
+  const hideStr=()=>{strBox.style.display='none';sSel=-1;};
+  acHideHooks.push(hideStr);
+  const pickStr=(it)=>{
+    const parts=strInp.value.split(/([,，、；;])/);
+    if(parts.length>=3){
+      parts[parts.length-1]=it.name;
+      strInp.value=parts.join('');
+    }else{
+      strInp.value=it.name;
+    }
+    hideStr();schedulePreview(side,true);
+  };
+  const renderStrBox=()=>{
+    const kwRaw=strInp.value.trim();
+    const lastKw=kwRaw.split(/[,，、；;]/).pop().trim();
+    sItems=lastKw?sAll.filter(x=>x.name.includes(lastKw)||x.telecode.includes(lastKw.toUpperCase())):sAll;
+    if(!sItems.length){hideStr();return;}
+    const shown=sItems.slice(0,25);
+    if(sSel>=shown.length)sSel=shown.length-1;
+    strBox.innerHTML=shown.map((s,i)=>`<div class="it${i===sSel?' sel':''}" data-i="${i}"><b>${esc(s.name)}</b><small>${esc(s.telecode)}</small></div>`).join('');
+    strBox.style.display='block';
+    strBox.querySelectorAll('.it').forEach(el=>el.onmousedown=e=>{e.preventDefault();pickStr(sItems[+el.dataset.i]);});
+  };
+  const refreshStrList=async()=>{
+    const city=mainInp.value.trim();
+    if(!city||getSideMode(side)!=='string'){sAll=[];sItems=[];sCity='';hideStr();return;}
+    if(city===sCity&&sAll.length){renderStrBox();return;}
+    const mySeq=++sSeq;
+    try{
+      const d=await api(`/api/stations/resolve?q=${encodeURIComponent(city)}&city_mode=all`);
+      if(mySeq!==sSeq||getSideMode(side)!=='string'||document.activeElement!==strInp)return;
+      sCity=city;sAll=d.stations||[];
+      renderStrBox();
+    }catch(_e){}
+  };
+  strInp.addEventListener('focus',()=>{sSel=-1;refreshStrList();});
+  strInp.addEventListener('input',()=>{sSel=-1;schedulePreview(side,false);refreshStrList();});
+  strInp.addEventListener('keydown',e=>{
+    if(strBox.style.display!=='block'||!sItems.length)return;
+    if(e.key==='ArrowDown'){sSel=Math.min(sSel+1,Math.min(sItems.length,25)-1);renderStrBox();e.preventDefault();}
+    else if(e.key==='ArrowUp'){sSel=Math.max(sSel-1,0);renderStrBox();e.preventDefault();}
+    else if(e.key==='Enter'&&sSel>=0){pickStr(sItems[sSel]);e.preventDefault();}
+    else if(e.key==='Escape'){hideStr();}
+  });
+  strInp.addEventListener('blur',()=>setTimeout(hideStr,150));
+
+  // 3) ④档混合多选芯片输入框：点击车站或城市直接累加芯片并清空待输入文字
+  const mixWrap=mixInp.parentElement;
+  const mixBox=document.createElement('div');mixBox.className='ac';mixWrap.appendChild(mixBox);
+  let xItems=[],xSel=-1,xTimer,xSeq=0;
+  const hideMix=()=>{mixBox.style.display='none';xSel=-1;};
+  acHideHooks.push(hideMix);
+  $(ids.chipsBox).addEventListener('click',()=>mixInp.focus());
+  $(ids.clr).onclick=e=>{e.stopPropagation();st.chips=[];mixInp.value='';renderMixedChips(side);schedulePreview(side,true);mixInp.focus();};
+  const pickMix=async(it)=>{
+    hideMix();mixInp.value='';
+    if(it.kind==='city_name'||it.kind==='city_all'){
+      const cm=it.kind==='city_all'?'all':'name';
+      try{
+        const d=await api(`/api/stations/resolve?q=${encodeURIComponent(it.name)}&city_mode=${cm}`);
+        if(d.stations&&d.stations.length)addMixedStations(side,d.stations);
+      }catch(_e){}
+    }else{
+      addMixedStations(side,[it]);
+    }
+    mixInp.focus();
+    schedulePreview(side,true);
+  };
+  const showMix=()=>{
+    if(!xItems.length){hideMix();return;}
+    mixBox.innerHTML=xItems.map((s,i)=>{
+      let title=esc(s.name),hint='';
+      if(s.kind==='city_name'){title=`+ 展开城市名站：${esc(s.name)}`;hint='加入市内名站';}
+      else if(s.kind==='city_all'){title=`+ 展开全市所有站：${esc(s.name)}`;hint=`加入全市 ${s.station_count||''} 站`;}
+      else{hint=esc(s.telecode)+(s.city?' · '+esc(s.city):'')+' · 添加单站';}
+      return `<div class="it${i===xSel?' sel':''}" data-i="${i}"><b>${title}</b><small>${hint}</small></div>`;
+    }).join('');
+    mixBox.style.display='block';
+    mixBox.querySelectorAll('.it').forEach(el=>el.onmousedown=e=>{e.preventDefault();pickMix(xItems[+el.dataset.i]);});
+  };
+  mixInp.addEventListener('input',()=>{
+    schedulePreview(side,false);
+    clearTimeout(xTimer);
+    const q=mixInp.value.trim().split(/[,，、；;]/).pop().trim();
+    if(!q){xItems=[];hideMix();return;}
+    const valAtReq=mixInp.value,mySeq=++xSeq;
+    xTimer=setTimeout(async()=>{
+      try{
+        const raw=await api('/api/stations?q='+encodeURIComponent(q)+'&include_cities=1');
+        if(mySeq!==xSeq||mixInp.value!==valAtReq||getSideMode(side)!=='mixed')return;
+        const expanded=[];
+        for(const it of raw){
+          if(it.kind==='city'){
+            expanded.push({name:it.name,kind:'city_name',station_count:it.station_count});
+            if((it.station_count||0)>1)expanded.push({name:it.name,kind:'city_all',station_count:it.station_count});
+          }else{
+            expanded.push(it);
+          }
+        }
+        xItems=expanded;xSel=-1;showMix();
+      }catch(_e){}
+    },130);
+  });
+  mixInp.addEventListener('keydown',e=>{
+    if(e.key==='Backspace'&&!mixInp.value&&st.chips.length){
+      st.chips.pop();renderMixedChips(side);schedulePreview(side,true);return;
+    }
+    if(mixBox.style.display==='block'&&xItems.length){
+      if(e.key==='ArrowDown'){xSel=Math.min(xSel+1,xItems.length-1);showMix();e.preventDefault();}
+      else if(e.key==='ArrowUp'){xSel=Math.max(xSel-1,0);showMix();e.preventDefault();}
+      else if(e.key==='Enter'){pickMix(xItems[xSel>=0?xSel:0]);e.preventDefault();}
+      else if(e.key==='Escape'){hideMix();}
+    }
+  });
+  mixInp.addEventListener('blur',()=>setTimeout(hideMix,150));
+
+  // 4) 切换该侧 5 档模式时自动同步可用状态（切入 mixed 自动解析展开为可编辑标签；切出不留死文本）
+  modeSel.addEventListener('change',async()=>{
+    acHideHooks.forEach(fn=>fn());
+    const oldMode=st.mode,newMode=modeSel.value;
+    st.mode=newMode;st.expanded=false;
+    if(newMode==='mixed'&&oldMode!=='mixed'){
+      const prevQ=compField(ids.main,ids.str,oldMode);
+      st.chips=[];mixInp.value='';
+      if(prevQ){
+        try{
+          const d=await api(`/api/stations/resolve?q=${encodeURIComponent(prevQ)}&city_mode=${encodeURIComponent(oldMode)}`);
+          if(d.ok&&d.stations.length)addMixedStations(side,d.stations);
+          else mixInp.value=prevQ;
+        }catch(_e){mixInp.value=prevQ;}
+      }
+    }else if(oldMode==='mixed'&&newMode!=='mixed'){
+      const names=st.chips.map(c=>c.name);
+      const tail=mixInp.value.trim();
+      if(tail&&!names.includes(tail))names.push(tail);
+      mixInp.value='';
+      if(newMode==='single')mainInp.value=names[0]||'';
+      else if(newMode==='string'){
+        const city=(st.chips[0]&&st.chips[0].city)||names[0]||'';
+        mainInp.value=city;strInp.value='';
+      }else{
+        mainInp.value=names.join('，');
+      }
+      st.chips=[];
+    }else if(oldMode==='string'&&newMode!=='string'){
+      if(newMode==='single'){
+        const curQ=compField(ids.main,ids.str,'string');
+        if(curQ){
+          try{
+            const d=await api(`/api/stations/resolve?q=${encodeURIComponent(curQ)}&city_mode=string`);
+            if(d.ok&&d.stations.length===1)mainInp.value=d.stations[0].name;
+          }catch(_e){}
+        }
+      }
+      strInp.value='';
+    }else if(newMode==='string'&&oldMode!=='string'){
+      if(/[:：]/.test(mainInp.value)){
+        const parts=mainInp.value.replace('：',':').split(':');
+        mainInp.value=parts[0].trim();
+        strInp.value=parts.slice(1).join(':').trim();
+      }else{
+        strInp.value='';
+      }
+    }
+    renderSideUI(side);
+    schedulePreview(side,true);
+  });
+
+  renderSideUI(side);
+  schedulePreview(side,false);
+}
+
+initSidePicker('from');
+initSidePicker('to');
+
 $('s-swap').addEventListener('click',()=>{
   acHideHooks.forEach(fn=>fn());
-  if($('s-city').value!=='string')return;
-  const a=$('s-f-str').value;$('s-f-str').value=$('s-t-str').value;$('s-t-str').value=a;
+  const f=SEARCH_SIDE_IDS.from,t=SEARCH_SIDE_IDS.to;
+  [$(f.mode).value,$(t.mode).value]=[$(t.mode).value,$(f.mode).value];
+  [odState.from.mode,odState.to.mode]=[odState.to.mode,odState.from.mode];
+  [$(f.main).value,$(t.main).value]=[$(t.main).value,$(f.main).value];
+  [$(f.str).value,$(t.str).value]=[$(t.str).value,$(f.str).value];
+  [$(f.mix).value,$(t.mix).value]=[$(t.mix).value,$(f.mix).value];
+  [odState.from.chips,odState.to.chips]=[odState.to.chips,odState.from.chips];
+  [odState.from.expanded,odState.to.expanded]=[odState.to.expanded,odState.from.expanded];
+  renderSideUI('from');renderSideUI('to');
+  schedulePreview('from',true);schedulePreview('to',true);
 });
-applyCityMode();
-const compField=(main,str)=>{
-  const v=$(main).value.trim(),s=$(str).value.trim();
-  if($('s-city').value!=='string'||!s)return v;
-  if(!v)return ':'+s;
-  return /[:：]/.test(v)?v:v+':'+s;
-};
 
 // ---------- 换乘搜索 ----------
 let R=null,page=1,planPoll=null,activePlanJob=null,activeSearchJob=null,searchPoll=null,activeRouteJob=null,activeTicketJob=null,ticketPoll=null,planGen=0,searchGen=0,planCtrl=null,searchCtrl=null;
@@ -1322,9 +1694,11 @@ $('s-go').onclick=async()=>{
   setProg('s-prog',null);
   if(!$('s-online').checked){$('s-log').innerHTML='';$('s-log').className='logbox';}
   try{
-    const fq=compField('s-from','s-f-str'),tq=compField('s-to','s-t-str'),cm=$('s-city').value;
+    const fq=getSideQuery('from'),tq=getSideQuery('to');
+    const fcm=getSideMode('from'),tcm=getSideMode('to');
+    const cm=(fcm===tcm)?fcm:null;
     if($('s-online').checked){
-      await runRouteImport(fq,tq,$('s-date').value,true,'s-msg','s-cancel','s-log','s-prog',cm);
+      await runRouteImport(fq,tq,$('s-date').value,true,'s-msg','s-cancel','s-log','s-prog',cm,fcm,tcm);
     }
     if(mySearch!==searchGen)return;
     const rawMaxh=numVal('s-maxh',48);
@@ -1333,7 +1707,8 @@ $('s-go').onclick=async()=>{
     const body={
       from_station:fq,to_station:tq,date:$('s-date').value,
       min_wait:numVal('s-min',30),max_wait:numVal('s-max',360),
-      max_legs:+numVal('s-legs',2),city_mode:cm,
+      max_legs:+numVal('s-legs',2),
+      from_city_mode:fcm,to_city_mode:tcm,...(cm?{city_mode:cm}:{}),
       cross_extra:numVal('s-cross',60),
       prune_level:$('s-prune').value,
       // WHY: 非 custom 时面板值只是预设的镜像，显式下发会被后端当"用户指定"，
@@ -2121,7 +2496,7 @@ function renderJobLog(logEl,j){
   logEl.className='logbox show';
   if(stick)logEl.scrollTop=logEl.scrollHeight;
 }
-async function runRouteImport(from,to,date,deep,msgElId,cancelBtnId,logElId,progElId,cityMode=null){
+async function runRouteImport(from,to,date,deep,msgElId,cancelBtnId,logElId,progElId,cityMode=null,fromCityMode=null,toCityMode=null){
   const logEl=logElId?$(logElId):null;
   if(logEl){logEl.innerHTML='';logEl.className='logbox';}
   const ctrl=new AbortController();
@@ -2133,6 +2508,8 @@ async function runRouteImport(from,to,date,deep,msgElId,cancelBtnId,logElId,prog
   try{
     const req={from_city:from,to_city:to,date:date,deep:!!deep};
     if(cityMode)req.city_mode=cityMode;
+    if(fromCityMode)req.from_city_mode=fromCityMode;
+    if(toCityMode)req.to_city_mode=toCityMode;
     r=await post('/api/import/route',req,{signal:ctrl.signal});
   }catch(e){
     setAbortBtn(cancelBtnId,null);setProg(progElId,null);
@@ -2554,7 +2931,7 @@ function attachEnter(ids,btnId){
     });
   });
 }
-attachEnter(['s-from','s-to','s-f-str','s-t-str','s-date','s-min','s-max','s-cross','s-filter','s-fk','s-maxh','s-detour','s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'],'s-go');
+attachEnter(['s-from','s-to','s-f-str','s-t-str','s-from-mix','s-to-mix','s-date','s-min','s-max','s-cross','s-filter','s-fk','s-maxh','s-detour','s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'],'s-go');
 attachEnter(['w-from','w-to','w-date'],'w-go');
 attachEnter(['c-station','c-date'],'c-st-go');
 attachEnter(['c-from','c-to','c-t-date'],'c-t-go');

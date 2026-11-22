@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -281,7 +282,16 @@ def resolve_station(q: str) -> dict | None:
            ORDER BY CASE WHEN telecode=? THEN 0 WHEN name=? THEN 1 ELSE 2 END LIMIT 1""",
         (q.upper(), q, q.removesuffix("站"), q.upper(), q),
     )
-    return r[0] if r else None
+    if r:
+        return r[0]
+    m = re.fullmatch(r"(.+?)\s*\(([A-Za-z]{3})\)", q)
+    if m:
+        tc, nm = m.group(2).upper(), m.group(1).strip()
+        r = rows("SELECT * FROM stations WHERE telecode=? OR name=? ORDER BY CASE WHEN telecode=? THEN 0 ELSE 1 END LIMIT 1",
+                 (tc, nm, tc))
+        if r:
+            return r[0]
+    return None
 
 
 # 部分城市的城区/近郊核心枢纽站名不以城市名开头，手动补充
@@ -399,11 +409,30 @@ def resolve_stations(q: str, expand_city: bool = True, city_mode: str | None = N
                     if s:
                         cands = [s]
         elif mode == "mixed":
-            s = resolve_station(tok)
-            if not s:
-                # 混合多选要求每个 token 均为有效物理站/电报码，避免漏掉拼写错误或误填的城市名
-                return []
-            cands = [s]
+            # mixed 档默认把无冒号 token 严格当单个物理站/电报码（防止把城市名“南平”静默忽略或把“厦门”歧义展开），
+            # 若显式带冒号修饰符（name:厦门 / all:泉州 / station:厦门 / 南平:延平）则允许与单站混合组合。
+            if ":" in tok or "：" in tok:
+                head, _, tail = tok.replace("：", ":").partition(":")
+                head, tail = head.strip(), tail.strip()
+                hl = head.lower()
+                if hl == "name" and tail:
+                    cands = city_stations(tail)
+                elif hl == "all" and tail:
+                    cands = city_all_stations(tail)
+                elif hl == "station" and tail:
+                    s = resolve_station(tail)
+                    cands = [s] if s else []
+                elif head:
+                    cands = city_all_stations(head)
+                    if tail:
+                        cands = [r for r in cands if tail in r["name"]]
+                if not cands:
+                    return []
+            else:
+                s = resolve_station(tok)
+                if not s:
+                    return []
+                cands = [s]
         elif mode == "name":
             cands = city_stations(tok)
             if not cands:
@@ -431,20 +460,28 @@ def station_resolve_error(q: str, city_mode: str | None = None) -> str:
     if not q_s:
         return "请输入出发/到达车站或城市"
     if city_mode == "mixed":
-        missing = [t for t in _split_station_tokens(q_s) if not resolve_station(t)]
+        missing = []
+        for t in _split_station_tokens(q_s):
+            if ":" in t or "：" in t:
+                if not resolve_stations(t, city_mode="mixed"):
+                    missing.append(t)
+            elif not resolve_station(t):
+                missing.append(t)
         if missing:
-            return f"混合多选仅支持精确站名或电报码（不支持城市名），未识别：“{'、'.join(missing)}”"
+            return f"混合多选仅支持精确站名/电报码或「城市:字样」，未识别：“{'、'.join(missing)}”"
     if city_mode == "string":
         for tok in _split_station_tokens(q_s):
             base, sep, pfx = tok.replace("：", ":").partition(":")
             base, pfx = base.strip(), pfx.strip()
             if sep and not base:
                 return f"“{tok}”缺少城市名，请先输入城市再配合站名字样筛选"
+            if sep and not city_all_stations(base):
+                return f"城市“{base}”不存在或未归属任何车站"
             if sep and pfx:
                 return f"城市“{base}”下未找到站名含“{pfx}”的车站"
     if city_mode == "single":
-        return f"车站“{q_s}”不存在（仅该站模式不支持城市名或多站列表），请确认站名或电报码"
-    return f"车站/城市“{q_s}”不存在，请先在「爬取数据」页更新车站站名表"
+        return f"车站“{q_s}”不存在（①仅该站模式不支持城市名或多站），请确认站名或电报码"
+    return f"车站/城市“{q_s}”不存在，请确认名称或先更新车站站名表"
 
 
 def get_setting(key: str, default=None):

@@ -1740,11 +1740,14 @@ class TestNationwideTimetablesAndTicketsAPI(TempDBTestCase):
             transfer.search("北京:不存在", "上海", "2026-11-21", city_mode="string")
         self.assertIn("未找到站名含“不存在”", str(ctx_str.exception))
 
-        # 4) mixed 档：仅精确单站取并集；任一 token 为城市名或不存在即整体失败
+        # 4) mixed 档：无冒号 token 仅精确单站取并集，显式冒号支持混合城市/字样（如 name:上海、南平:延平）；任一未知 token 整体失败
         self.assertEqual(
             [s["name"] for s in db.resolve_stations("厦门，延平", city_mode="mixed")],
             ["厦门", "延平"],
         )
+        mix_combo = [s["name"] for s in db.resolve_stations("延平，name:厦门", city_mode="mixed")]
+        self.assertEqual(mix_combo[:2], ["延平", "厦门"])
+        self.assertIn("厦门北", mix_combo)
         self.assertEqual(db.resolve_stations("南平，厦门", city_mode="mixed"), [])
         with self.assertRaises(ValueError) as ctx_mix:
             transfer.search("南平，厦门", "上海", "2026-11-21", city_mode="mixed")
@@ -1755,15 +1758,45 @@ class TestNationwideTimetablesAndTicketsAPI(TempDBTestCase):
         for expected in ("泉州", "泉州东", "晋江", "惠安", "德化"):
             self.assertIn(expected, qz_all)
 
-        # 6) /api/stations：简拼排序优先与城市拼音匹配
+        # 6) /api/stations：简拼排序优先、only_cities=1 与城市排序（sh→上海优先、xm→厦门、bj→北京）
         st_bj = main_mod.stations(q="bj", limit=8, include_cities=False)
         self.assertIn(st_bj[0]["name"], ("北京", "宝鸡"))
+        st_sh_only = main_mod.stations(q="sh", limit=8, only_cities=True)
+        self.assertEqual(st_sh_only[0]["name"], "上海")
+        self.assertEqual(st_sh_only[0]["kind"], "city")
         st_xm_cities = main_mod.stations(q="xm", limit=10, include_cities=True)
         self.assertTrue(any(x.get("kind") == "city" and x["name"] == "厦门" for x in st_xm_cities))
         st_np_cities = main_mod.stations(q="np", limit=10, include_cities=True)
         self.assertTrue(any(x.get("kind") == "city" and x["name"] == "南平" for x in st_np_cities))
 
-        # 7) 在线导入 /api/import/route 与 _route_job 按 city_mode 解析车站
+        # 7) /api/stations/resolve 实时预览接口
+        pv_ok = main_mod.resolve_stations_preview(q="南平:延平", city_mode="string")
+        self.assertTrue(pv_ok["ok"])
+        self.assertEqual([s["name"] for s in pv_ok["stations"]], ["延平", "延平东", "延平西"])
+        pv_err = main_mod.resolve_stations_preview(q="南平", city_mode="single")
+        self.assertFalse(pv_err["ok"])
+        self.assertIn("仅该站", pv_err["error"])
+        pv_blank = main_mod.resolve_stations_preview(q="", city_mode="name")
+        self.assertFalse(pv_blank["ok"])
+        self.assertFalse(pv_blank["empty_db"])
+
+        # 8) 两端独立口径（from_city_mode != to_city_mode）透传到 search / /api/transfers / /api/transfers/start / /api/import/route
+        sr_asym = transfer.search("延平", "厦门", "2026-11-21", from_city_mode="single", to_city_mode="name")
+        self.assertEqual(sr_asym["from_stations"], ["延平"])
+        self.assertEqual(set(sr_asym["to_stations"]), {"厦门", "厦门北", "厦门高崎"})
+        api_asym = main_mod.transfers("南平:延平", "泉州", "2026-11-21", from_city_mode="string", to_city_mode="all")
+        self.assertEqual(set(api_asym["from_stations"]), {"延平", "延平东", "延平西"})
+        self.assertIn("晋江", api_asym["to_stations"])
+
+        with mock.patch("threading.Thread") as m_thr:
+            m_thr.return_value.start = lambda: None
+            st_job = main_mod.start_transfers(main_mod.TransferSearchReq(
+                from_station="延平", to_station="厦门", date="2026-11-21",
+                from_city_mode="single", to_city_mode="name",
+            ))
+            self.assertIn("job_id", st_job)
+
+        # 9) 在线导入 /api/import/route 与 _route_job 支持独立 from_city_mode / to_city_mode
         with self.assertRaises(main_mod.HTTPException) as ctx_bad:
             main_mod.import_route(main_mod.RouteImportReq(
                 from_city="厦门", to_city="上海", date="2026-11-21", deep=False, city_mode="bad",
@@ -1778,22 +1811,28 @@ class TestNationwideTimetablesAndTicketsAPI(TempDBTestCase):
              mock.patch("threading.Thread") as m_thr:
             m_thr.return_value.start = lambda: None
             res = main_mod.import_route(main_mod.RouteImportReq(
-                from_city="南平:延平", to_city="厦门", date="2026-11-21", deep=False, city_mode="string",
+                from_city="南平:延平", to_city="厦门", date="2026-11-21", deep=False,
+                from_city_mode="string", to_city_mode="name",
             ))
             self.assertEqual(set(res["from_stations"]), {"延平", "延平东", "延平西"})
             self.assertEqual(set(res["to_stations"]), {"厦门", "厦门北", "厦门高崎"})
             jid = res["job_id"]
             ev = main_mod._job_cancels[jid]
-            main_mod._route_job(jid, ev, "南平:延平", "厦门", "2026-11-21", False, "string")
+            main_mod._route_job(jid, ev, "南平:延平", "厦门", "2026-11-21", False, None, "string", "name")
         self.assertEqual(set(seen_screens), {"ADS", "YPS", "YWS", "XMS", "XKS", "XBS"})
         self.assertEqual(len(seen_tickets), 9)
 
-        # 8) 前端静态校验：mixed 末尾片段检索、single/mixed 不查城市、在线模式传递 compField 与 city_mode
+        # 10) 前端静态校验：两端独立选择器、芯片多选、实时预览、无旧 #s-city 与 station-ac 冲突
         html_text = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        self.assertIn("splitMixedTokens", html_text)
-        self.assertIn("return m==='name'||m==='all'||m==='string';", html_text)
-        self.assertIn("await runRouteImport(fq,tq,$('s-date').value,true,'s-msg','s-cancel','s-log','s-prog',cm);", html_text)
-        self.assertIn("if(cityMode)req.city_mode=cityMode;", html_text)
+        self.assertIn('id="s-from-mode"', html_text)
+        self.assertIn('id="s-to-mode"', html_text)
+        self.assertNotIn('id="s-city"', html_text)
+        self.assertNotIn('id="s-from" class="station-ac"', html_text)
+        self.assertIn("initSidePicker", html_text)
+        self.assertIn("addMixedStations", html_text)
+        self.assertIn("/api/stations/resolve", html_text)
+        self.assertIn("only_cities=1", html_text)
+        self.assertIn("from_city_mode:fcm,to_city_mode:tcm", html_text)
 
 
 if __name__ == "__main__":

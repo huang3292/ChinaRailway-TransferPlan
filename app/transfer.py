@@ -2320,6 +2320,8 @@ def search(from_q: str, to_q: str, date: str,
            exclude_stations: str = "",
            include_stations_mode: str = "or",
            city_mode: str | None = None,
+           from_city_mode: str | None = None,
+           to_city_mode: str | None = None,
            progress_cb=None, cancel_event=None, sub_cb=None) -> dict:
     preset = PRUNE_PRESETS.get(prune_level, PRUNE_PRESETS["balanced"])
     eff_fk = frontier_k if frontier_k is not None else preset["frontier_k"]
@@ -2390,11 +2392,14 @@ def search(from_q: str, to_q: str, date: str,
             sub_cb(s_done, s_total, text)
 
     step(1, "解析车站与价格/余票索引")
-    fstations = db.resolve_stations(from_q, expand_city, city_mode)
-    tstations = db.resolve_stations(to_q, expand_city, city_mode)
+    f_mode = from_city_mode or city_mode
+    t_mode = to_city_mode or city_mode
+    fstations = db.resolve_stations(from_q, expand_city, f_mode)
+    tstations = db.resolve_stations(to_q, expand_city, t_mode)
     if not fstations or not tstations:
         missing = from_q if not fstations else to_q
-        raise ValueError(db.station_resolve_error(missing, city_mode))
+        miss_mode = f_mode if not fstations else t_mode
+        raise ValueError(db.station_resolve_error(missing, miss_mode))
     fkeys = {s["telecode"] for s in fstations} | {s["name"] for s in fstations}
     tkeys = {s["telecode"] for s in tstations} | {s["name"] for s in tstations}
     base = datetime.strptime(date, "%Y-%m-%d")
