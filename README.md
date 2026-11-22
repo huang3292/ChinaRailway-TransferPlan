@@ -180,6 +180,9 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 - **安全默认**：`skip_db_screens=True` 且不传 `force` —— 当日已有大屏的站跳过、库内已有
   时刻表的车次跳过，重复执行只增不减。确需推倒重爬请显式用
   `python crawl_all_timetables.py --force`（会重发全量请求，脚本不提供这个开关）。
+- **想先小规模试跑**：本脚本固定全国全量；只爬某几个站/某个城市请用
+  `python crawl_all_timetables.py --stations 厦门 --date 2026-11-23`（或 `--limit 20`）。
+  两者共用同一份断点文件，所以试跑成功的站在正式初始化时不会重复爬。
 - **断点**：`data/crawl_all_timetables_state.json`，按 `date` 分组，日期一变旧断点自动作废。
   Ctrl+C / 断电 / 进程被杀后重跑**同一条命令**即续爬；`--state PATH` 可给并行任务各配一份断点，
   互不干扰。

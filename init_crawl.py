@@ -116,7 +116,7 @@ def print_preflight(p: dict):
               f"（{p['rate_mode']}限速 {iv:.2f}s/请求，区间 {fmt_sec(est * MIN_FLOOR)}"
               f"–{fmt_sec(est * MAX_CEIL)}；触发风控会变慢，23:30–05:00 自动休眠）")
     print(f"断点文件       : {p['state_path']}")
-    print("中断后重跑同一条命令即可续爬；本脚本不会删除或覆盖已爬数据。\n")
+    print("中断后重跑同一条命令即可续爬；本脚本不会清空或删除已爬数据。\n")
 
 
 def postflight(date: str, state_path: Path = DEFAULT_STATE):
