@@ -570,8 +570,29 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
         all_tcs = list(dict.fromkeys(ftcs + ttcs))
 
         _job_update(job_id, phase="screen", total=len(all_tcs))
+        # 大屏当日"无任何经由车次"的车站（停办客运如厦门高崎/漳州东、季节性停运如永定仅 K230 汛期不开），
+        # 其站名/电报码进此集合；后续区间余票按 OD 端点剔除它们，省去必然为空的查询。
+        # WHY：crawl_station_trains 对空站有两种表征——data 为空列表(parsed==0)，或 data 非列表且
+        # errorMsg 含"无数据/暂无/不存在"(抛 CrawlError)；两者都判为空站。而网络/风控类失败不含这些
+        # 关键词，保守视为"未知"，保留查询以免偶发失败漏掉真实车次（口径同 crawl_all_timetables.py）。
+        no_train_stations: list[str] = []
         for tc in all_tcs:
-            run(f"车站大屏 {_fmt_station(tc_name.get(tc), tc)}", crawler.crawl_station_trains, tc, date)
+            label = f"车站大屏 {_fmt_station(tc_name.get(tc), tc)}"
+            _job_update(job_id, current=label)
+            try:
+                if ev.is_set():
+                    raise CrawlCancelled("任务已取消")
+                if not crawler.crawl_station_trains(tc, date).get("parsed"):
+                    no_train_stations.append(tc)
+            except CrawlCancelled:
+                raise
+            except Exception as e:
+                if any(k in str(e) for k in ("无数据", "暂无", "不存在")):
+                    no_train_stations.append(tc)
+                else:
+                    _job_append(job_id, "errors", f"{label}: {e}")
+            _job_inc(job_id, "done")
+            _job_append(job_id, "log", label)
 
         if deep:
             ph = ",".join("?" * len(all_tcs))
@@ -609,7 +630,15 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
                     continue
                 run(f"时刻表 {t_label}", crawler.crawl_timetable, tn, d, f, t)
 
-        pairs = [(f, t) for f in ftcs for t in ttcs if f != t]
+        # 区间余票 OD 组合剔除大屏当日无图定车次的车站：这些站发不出/接不到任何车，
+        # leftTicket 必返空，跳过即减少无谓请求；抓取失败(非"无数据")的车站不在集合内，仍照常查询（保守不漏）。
+        skip_st = set(no_train_stations)
+        pairs = [(f, t) for f in ftcs if f not in skip_st
+                 for t in ttcs if t not in skip_st if f != t]
+        if skip_st:
+            _job_append(job_id, "log",
+                        "大屏无图定车次，跳过其区间余票：" +
+                        "、".join(_fmt_station(tc_name.get(tc), tc) for tc in no_train_stations))
         with _jobs_lock:
             cur_total = jobs[job_id]["total"]
         _job_update(job_id, phase="tickets", total=cur_total + len(pairs))

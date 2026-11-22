@@ -8,7 +8,26 @@
 
 ---
 
-## 1. 技术栈与启动
+## 0. 阅读分层（先选你的深度）
+
+本仓库读者分两类，全文各章节按 **[概念]** 与 **[内核]** 标注分层：
+
+- **[概念] 查票原理与表面设计** —— 面向一般专业人员：工具怎么用、数据怎么抓、一次换乘查询/爬取的
+  完整链路、接口与前端如何组织。不含算法细节。
+- **[内核] 搜索算法与底层设计** —— 面向二次开发/深度排障：组合搜索的算法内核（图遍历、多程 BFS、
+  剪枝、支配）、跨表关联口径、缓存失效机制、根因级踩坑约定。
+
+> 编号与所有交叉引用（如 §6.6 引 §12 第 10 条）保持不变，仅在标题尾追加 `[概念]`/`[内核]` 标签。
+> 只想看懂「如何得到直达/中转 + 票价/余票」→ 通读 **[概念]** 即可；要改算法或排查「结果偏少」→ 从 §6、§12 入手。
+
+| 层级 | 章节 |
+|---|---|
+| **[概念]** 查票原理与表面设计 | §1 技术栈与启动、§2 目录结构、§4 抓取与限速、§8 后台任务、§9 时刻表查看、§10 API 速查、§11 前端逻辑 |
+| **[内核]** 搜索算法与底层设计 | §3 数据模型标识、§5 解析、§6 换乘搜索引擎（图遍历/BFS/剪枝/缓存）、§7 票价估算校准、§12 二次修改入口与踩坑点、§13 诊断脚本 |
+
+---
+
+## 1. 技术栈与启动 [概念]
 
 - 后端：Python（FastAPI + Uvicorn，并内置基于标准库 `http.server` 的无三方依赖兜底服务端 `app/server.py`），SQLite（WAL 模式，线程局部连接；连接建好即设
   `synchronous=NORMAL`、`temp_store=MEMORY`、`cache_size=-131072`≈128MB 页缓存、
@@ -34,7 +53,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8306 --reload
 
 ---
 
-## 2. 目录结构
+## 2. 目录结构 [概念]
 
 ```
 app/
@@ -68,7 +87,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ---
 
-## 3. 数据模型（`app/db.py`）
+## 3. 数据模型（`app/db.py`）[内核]
 
 | 表 | 含义 | 唯一键 | 来源接口 |
 |---|---|---|---|
@@ -101,7 +120,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ---
 
-## 4. 抓取与限速（`app/crawler.py`）
+## 4. 抓取与限速（`app/crawler.py`）[概念]
 
 单例 `crawler`，`requests.Session` + 全局锁串行限速。
 
@@ -133,7 +152,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ---
 
-## 5. 解析（`app/parsers.py`）
+## 5. 解析（`app/parsers.py`）[内核]
 
 - `detect_type(text)`：自动识别 `stations / left_ticket / price / station_screen / train_stops`。
 - `parse_left_ticket`：竖线分隔字段，索引见 `LT` 字典；席别余票索引见 `SEAT_FIELDS`。
@@ -152,7 +171,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ---
 
-## 6. 换乘搜索引擎（`app/transfer.py`，核心）
+## 6. 换乘搜索引擎（`app/transfer.py`，核心）[内核]
 
 入口 `search(from_q, to_q, date, min_wait=30, max_wait=360, limit=0, max_legs=2, expand_city=True, cross_extra=60, frontier_k=None, prune_level="balanced", max_total_min=None, detour_ratio=None, prune_dominated=None, allow_cross_station=True, hub_only=False, hub_stations="", allow_prefixes="", exclude_prefixes="", include_stations="", exclude_stations="", include_stations_mode="or", progress_cb=None, cancel_event=None, sub_cb=None)`；独立后置过滤器 `filter_plans(...)`。
 
@@ -268,7 +287,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ---
 
-## 7. 票价估算与校准（`app/fare.py`）
+## 7. 票价估算与校准（`app/fare.py`）[内核]
 
 - `RATES`：各车型（G/C/D/Z/T/K/P）各席别的**元/km 参考区间**；`SPEED`：各车型 km/h 区间。
 - `estimate(code, km, duration_min, cal)`：
@@ -283,7 +302,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ---
 
-## 8. 后台任务（`app/main.py` 的 `jobs`）
+## 8. 后台任务（`app/main.py` 的 `jobs`）[概念]
 
 `jobs: dict[job_id, dict]`，线程执行，前端轮询 `GET /api/jobs/{id}`。任务字典含
 `status/done/total/errors/phase/current/log/result` 等，响应实时附带 `elapsed_sec`（已完成/取消/报错时冻结为总实际用时）；`running` 时针对子阶段附带局部 `sub_eta_sec`（如搜索 BFS 各深度独立计时），非搜索的同类抓包阶段按当前 `phase` 均速附带 `eta_sec`。
@@ -292,6 +311,12 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 - **`_route_job`**（一键导入/在线模式）：`/api/import/route` 触发，阶段
   `screen→timetable→tickets→price`。先抓出发/到达全部车站大屏；`deep` 时再抓最多
   `MAX_TIMETABLES=200` 个车次时刻表、各 OD 余票、各车次票价。
+  - **大屏空站短路区间余票**：screen 阶段逐站记录「当日无任何经由车次」的车站——判据为
+    `crawl_station_trains` 返回 `parsed==0`（`data` 为空列表），或抛 `CrawlError` 且 errorMsg
+    含「无数据/暂无/不存在」（`data` 非列表）。tickets 阶段的 OD 笛卡尔积**跳过以这些空站为任一端点的组合**，
+    避免对停办客运站（如按电报码的厦门高崎、漳州东）或季节性停运（如永定仅 K230、只在非汛期/临时开行）
+    发起必然为空的余票查询。**网络/风控类失败（不含上述关键词）的车站不跳过**，仍照常查询，
+    以免偶发失败漏掉真实车次（与 `crawl_all_timetables.py` 的空站判定口径一致，见 §12 第 12 条）。
 - **`_transfer_search_job`**（异步换乘搜索）：`POST /api/transfers/start` 触发，支持实时进度/子进度（`sub_done`/`sub_total`）与中断。
 - **`_plan_tickets_job`**（方案实时查价/余票）：`/api/plan_tickets` 触发，见下节。
 
@@ -308,7 +333,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ---
 
-## 9. 时刻表查看 `/api/timetable`（含大屏退回）
+## 9. 时刻表查看 `/api/timetable`（含大屏退回）[概念]
 
 `GET /api/timetable?train_no=X` 返回 `{stops, complete, source}`：
 
@@ -326,7 +351,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ---
 
-## 10. API 端点速查（`app/main.py`）
+## 10. API 端点速查（`app/main.py`）[概念]
 
 | 方法 路径 | 作用 |
 |---|---|
@@ -358,7 +383,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ---
 
-## 11. 前端逻辑（`static/index.html`）
+## 11. 前端逻辑（`static/index.html`）[概念]
 
 五个页签：换乘搜索 / 爬取数据 / 导入数据 / 数据浏览 / 显示设置。核心 JS：
 
@@ -381,7 +406,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ---
 
-## 12. 二次修改常见入口
+## 12. 二次修改常见入口 [内核]
 
 | 想改什么 | 去哪改 |
 |---|---|
@@ -415,10 +440,14 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
     本地引用，删早了末尾统计就取不到值）。要调整停靠站口径就改 `_build_graph_cache`，一次构建全生效。
 11. 缓存过期只看 `db.data_version()`：进程内 `db.tx()` 写入代数 + `data/rail.db` 与 `-wal` 的
     `mtime_ns`/`size`。外部脚本正常写库会改变这两项并在下次查询时自动触发缓存重建；仅当文件元数据未变化时才需重启服务。
+12. **一键导入的区间余票由大屏结果 gate**（`_route_job`）：screen 阶段把「当日无任何经由车次」的车站
+    （`parsed==0` 或 errorMsg 含「无数据/暂无/不存在」）收集起来，tickets 阶段跳过以其为端点的 OD——
+    这些站发不出也接不到车，`leftTicket` 必返空。**判定三词必须与 `crawl_all_timetables.py` 保持一致**；
+    网络/风控失败（不含三词）的车站保守保留仍查，别把偶发失败误判为空站而漏票（见 §8）。
 
 ---
 
-## 13. 本地诊断脚本（`diagnostics/`，不入库）
+## 13. 本地诊断脚本（`diagnostics/`，不入库）[内核]
 
 排查线上现象留下的一次性脚本，已写进 `.gitignore`，仓库里看不到；是否保留由本机自行决定。
 
