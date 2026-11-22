@@ -2564,6 +2564,15 @@ def search(from_q: str, to_q: str, date: str,
             cities=cities, stats=prune_stats,
         )
 
+    direct.sort(key=lambda x: x["total_min"])
+    transfers.sort(key=lambda x: x["total_min"])
+    direct_total, transfers_total = len(direct), len(transfers)
+    if limit > 0:
+        # limit 为直达与换乘的合计上限，直达优先占用额度（此前两者各自截断会翻倍返回）
+        direct = direct[:limit]
+        transfers = transfers[:max(0, limit - len(direct))]
+
+    # 截断已前移到下面两处遍历之前：它们只扫真正返回的方案，否则 37 万条量级的枚举结果会被整体再扫两遍。
     cn_now_str = db.cn_now().strftime("%Y-%m-%d %H:%M")
     for p in direct + transfers:
         p["departed"] = any(l["depart"] <= cn_now_str for l in p["legs"])
@@ -2574,13 +2583,6 @@ def search(from_q: str, to_q: str, date: str,
             ups = [l["ticket_updated"] for l in p["legs"] if l.get("ticket_updated")]
             if ups:
                 p["ticket_updated"] = max(ups)
-
-    direct.sort(key=lambda x: x["total_min"])
-    transfers.sort(key=lambda x: x["total_min"])
-    if limit > 0:
-        # limit 为直达与换乘的合计上限，直达优先占用额度（此前两者各自截断会翻倍返回）
-        direct = direct[:limit]
-        transfers = transfers[:max(0, limit - len(direct))]
 
     # 供前端本地后置过滤复用精确站名→城市映射与以“市”结尾的物理站清单（如“南平市”）
     city_of_map, _, tele_of_map = cities
@@ -2626,6 +2628,9 @@ def search(from_q: str, to_q: str, date: str,
         },
         "prune_stats": prune_stats,
         "note": f"时间基准：北京时间(UTC+8) · 异站换乘默认额外预留{cross_extra}分钟 · 无当日数据时按最近日期与 running_fig 校验推算并剔除余票冲突车次",
+        # 截断前的全量命中数：limit 生效时前端据此提示“另有 N 条未返回”，避免把上限误当总数
+        "direct_total": direct_total,
+        "transfers_total": transfers_total,
         "direct": direct,
         "transfers": transfers,
     }

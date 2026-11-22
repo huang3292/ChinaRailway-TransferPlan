@@ -926,6 +926,11 @@ class TestStdlibHTTPServer(TempDBTestCase):
                     break
                 time.sleep(0.05)
             self.assertEqual(jobj["status"], "done")
+            # 3b) HTTP 换乘默认带返回上限（两段枚举不设限会返回数十万条），且给出截断前命中数
+            res = jobj["result"]
+            self.assertIn("direct_total", res)
+            self.assertIn("transfers_total", res)
+            self.assertLessEqual(len(res["direct"]) + len(res["transfers"]), 1000)
             self.assertEqual(jobj["result"]["max_legs"], 2)
 
             st_bad, _ = req("POST", "/api/transfers/start", {
@@ -945,6 +950,10 @@ class TestStdlibHTTPServer(TempDBTestCase):
             st_d, raw_d = req("DELETE", "/api/cache?before_date=2099-01-01&include_raw=false")
             self.assertEqual(st_d, 200)
             self.assertIn("deleted", json.loads(raw_d))
+
+            # 5b) 缺省 before_date 必须拒绝，否则 db.clear_cache(None) 会全表删光已爬数据
+            st_all, _ = req("DELETE", "/api/cache")
+            self.assertEqual(st_all, 400)
         finally:
             srv.shutdown()
             srv.server_close()

@@ -822,9 +822,13 @@ def prices(train_no: str):
 
 @app.delete("/api/cache")
 def clear_cache(before_date: str | None = None, include_raw: bool = False):
-    if before_date:
-        _check_date(before_date)
-    return {"deleted": db.clear_cache(before_date or None, include_raw)}
+    # WHY: before_date 缺省时 db.clear_cache(None) 会全表删光 station_trains/train_stops/
+    # tickets/prices（全国全量重爬需数小时）。HTTP 入口一律要求显式日期；确需全量清空请传
+    # 远期日期（如 2100-01-01），或在脚本里直接调用 db.clear_cache(None)。
+    if not before_date:
+        raise HTTPException(400, "必须显式给出 before_date（YYYY-MM-DD），否则将清空全部已爬数据")
+    _check_date(before_date)
+    return {"deleted": db.clear_cache(before_date, include_raw)}
 
 
 # ---------- 换乘搜索 ----------
@@ -849,9 +853,11 @@ def _validate_search_params(date: str, max_legs: int, cross_extra: int,
         raise HTTPException(400, "include_stations_mode 必须为 or 或 and")
 
 
+# WHY: HTTP 默认必须带上限——两段换乘枚举不设限（深圳→广州实测 37.4 万条），全量 JSON 可达
+# 数百 MB，会把服务端与浏览器一起打死的。要全量请显式 limit=0。
 @app.get("/api/transfers")
 def transfers(from_station: str, to_station: str, date: str,
-              min_wait: int = 30, max_wait: int = 360, limit: int = 0,
+              min_wait: int = 30, max_wait: int = 360, limit: int = 1000,
               max_legs: int = 2, expand_city: bool = True,
               cross_extra: int = 60, frontier_k: int | None = None,
               prune_level: str = "balanced",
@@ -886,7 +892,7 @@ class TransferSearchReq(BaseModel):
     date: str
     min_wait: int = 30
     max_wait: int = 360
-    limit: int = 0
+    limit: int = 1000
     max_legs: int = 2
     expand_city: bool = True
     cross_extra: int = 60

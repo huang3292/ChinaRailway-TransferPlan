@@ -1261,7 +1261,9 @@ $('s-go').onclick=async()=>{
     const fl=R.from_station_labels||R.from_stations,tl=R.to_station_labels||R.to_stations;
     const scope=(fl.length>1||tl.length>1)?`出发 ${fl.join('/')} → 到达 ${tl.join('/')} · `:'';
     const pruneText=formatPruneStats(R.prune_stats,R.prune_config);
-    msg('s-msg',`${scope}大屏车次 ${R.screen_trains} 个，时刻表 ${R.timetable_trains} 个 · 直达 ${R.direct.length} 个，换乘 ${R.transfers.length} 个${pruneText}${actualDurTxt(R._elapsed_sec)} · ${R.note}`);
+    const truncText=(R.direct_total>R.direct.length||R.transfers_total>R.transfers.length)
+      ?`（实际命中 直达 ${R.direct_total}／换乘 ${R.transfers_total}，已按返回上限截断）`:'';
+    msg('s-msg',`${scope}大屏车次 ${R.screen_trains} 个，时刻表 ${R.timetable_trains} 个 · 直达 ${R.direct.length} 个，换乘 ${R.transfers.length} 个${truncText}${pruneText}${actualDurTxt(R._elapsed_sec)} · ${R.note}`);
     render();
     if($('s-live').checked)autoQuery();
   }catch(e){setProg('s-prog',null);setCancelBtn('s-cancel',null);msg('s-msg',e.name==='AbortError'?'【换乘搜索】任务已中断':e.message,false);}
