@@ -291,25 +291,39 @@ def stats():
 
 @app.get("/api/stations")
 def stations(q: str = "", limit: int = 30, include_cities: bool = False):
+    q = (q or "").strip()
     if q:
         like = f"%{q}%"
-        rows = db.rows("""SELECT * FROM stations WHERE name LIKE ? OR telecode LIKE ? OR pinyin LIKE ?
-                          OR short LIKE ?
-                          ORDER BY CASE WHEN name=? OR telecode=? THEN 0
-                                        WHEN name LIKE ? OR pinyin LIKE ? THEN 1 ELSE 2 END, name
-                          LIMIT ?""",
-                       (like, like, like, like, q, q.upper(), f"{q}%", f"{q}%", limit))
+        pref = f"{q}%"
+        qu = q.upper()
+        rows = db.rows(
+            """SELECT * FROM stations WHERE name LIKE ? OR telecode LIKE ? OR pinyin LIKE ?
+               OR short LIKE ?
+               ORDER BY CASE WHEN name=? OR telecode=? THEN 0
+                             WHEN name LIKE ? OR pinyin LIKE ? OR lower(short)=lower(?) THEN 1
+                             WHEN lower(short) LIKE lower(?) THEN 2
+                             ELSE 3 END, name
+               LIMIT ?""",
+            (like, like, like, like, q, qu, pref, pref, q, pref, limit),
+        )
         if include_cities:
-            cities = db.rows("""SELECT DISTINCT city AS name FROM stations
-                                WHERE city LIKE ? AND city <> ''
-                                ORDER BY CASE WHEN name=? THEN 0 ELSE 1 END, name LIMIT 8""",
-                             (like, q))
+            cities = db.rows(
+                """SELECT DISTINCT city AS name FROM stations
+                   WHERE city <> '' AND (
+                       city LIKE ?
+                       OR ((name = city OR name = city || '市' OR name LIKE city || '%')
+                           AND (pinyin LIKE ? OR lower(short)=lower(?) OR lower(short) LIKE lower(?)))
+                   )
+                   ORDER BY CASE WHEN city=? THEN 0 WHEN city LIKE ? THEN 1 ELSE 2 END, city
+                   LIMIT 8""",
+                (like, pref, q, pref, q, pref),
+            )
             for c in cities:
                 c["kind"] = "city"
                 c["telecode"] = ""
             return cities + rows[:max(limit - len(cities), 0)]
         return rows
-    return db.rows("SELECT * FROM stations LIMIT ?", (limit,))
+    return db.rows("SELECT * FROM stations ORDER BY name LIMIT ?", (limit,))
 
 
 @app.get("/api/hubs")
@@ -550,9 +564,11 @@ class RouteImportReq(BaseModel):
     to_city: str
     date: str
     deep: bool = True
+    city_mode: str | None = None
 
 
-def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: str, deep: bool):
+def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: str, deep: bool,
+               city_mode: str | None = None):
     crawler.set_cancel_event(ev)
 
     def run(txt, fn, *args):
@@ -569,10 +585,11 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
         _job_append(job_id, "log", txt)
 
     try:
-        fstations = db.resolve_stations(from_q, True)
-        tstations = db.resolve_stations(to_q, True)
+        fstations = db.resolve_stations(from_q, True, city_mode)
+        tstations = db.resolve_stations(to_q, True, city_mode)
         if not fstations or not tstations:
-            _job_update(job_id, status="error", error="车站/城市不存在，请先在「爬取数据」页更新车站站名表")
+            missing = from_q if not fstations else to_q
+            _job_update(job_id, status="error", error=db.station_resolve_error(missing, city_mode))
             return
         tc_name = {s["telecode"]: s["name"] for s in fstations + tstations}
         ftcs = [s["telecode"] for s in fstations]
@@ -699,14 +716,17 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
 @app.post("/api/import/route")
 def import_route(body: RouteImportReq):
     _check_date(body.date)
-    fstations = db.resolve_stations(body.from_city, True)
-    tstations = db.resolve_stations(body.to_city, True)
+    if body.city_mode is not None and body.city_mode not in ("single", "name", "string", "mixed", "all"):
+        raise HTTPException(400, "city_mode 必须为 single / name / string / mixed / all")
+    fstations = db.resolve_stations(body.from_city, True, body.city_mode)
+    tstations = db.resolve_stations(body.to_city, True, body.city_mode)
     if not fstations or not tstations:
-        raise HTTPException(400, "车站/城市不存在，请先在「爬取数据」页更新车站站名表")
+        missing = body.from_city if not fstations else body.to_city
+        raise HTTPException(400, db.station_resolve_error(missing, body.city_mode))
     job_id, ev = _create_job({"status": "running", "done": 0, "total": 0, "phase": "init",
                                "current": "", "truncated": 0, "log": [], "errors": [], "result": {}})
     threading.Thread(target=_route_job, args=(job_id, ev, body.from_city, body.to_city,
-                                              body.date, body.deep), daemon=True).start()
+                                              body.date, body.deep, body.city_mode), daemon=True).start()
     return {"job_id": job_id,
             "from_stations": [s["name"] for s in fstations],
             "to_stations": [s["name"] for s in tstations],
@@ -979,7 +999,7 @@ def start_transfers(body: TransferSearchReq):
     tstations = db.resolve_stations(body.to_station, body.expand_city, body.city_mode)
     if not fstations or not tstations:
         missing = body.from_station if not fstations else body.to_station
-        raise HTTPException(400, f"车站/城市“{missing}”不存在，请先在「爬取数据」页更新车站站名表")
+        raise HTTPException(400, db.station_resolve_error(missing, body.city_mode))
     total_steps = 6 if body.max_legs < 3 else 5 + (body.max_legs - 1)
     job_id, ev = _create_job({
         "status": "running", "phase": "search", "done": 0, "total": total_steps,

@@ -285,9 +285,9 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
 <section class="tab active" id="tab-search">
   <div class="card">
     <div class="row">
-      <div><label>出发地（站名/城市/拼音/电报码）</label><input id="s-from" class="station-ac" placeholder="如：厦门"><input id="s-f-str" placeholder="③档站名字样，如：延平" title="城市+该字样筛选市内车站" style="display:none;margin-top:4px"></div>
+      <div><label>出发地（站名/城市/拼音/电报码）</label><div style="position:relative"><input id="s-from" class="station-ac" placeholder="如：厦门"></div><input id="s-f-str" placeholder="③档站名字样，如：延平" title="城市+该字样筛选市内车站" style="display:none;margin-top:4px"></div>
       <div class="swap-wrap"><button type="button" class="btn-swap" id="s-swap" title="互换出发到达">⇄</button></div>
-      <div><label>到达地（站名/城市/拼音/电报码）</label><input id="s-to" class="station-ac" placeholder="如：南平市"><input id="s-t-str" placeholder="③档站名字样，如：延平" title="城市+该字样筛选市内车站" style="display:none;margin-top:4px"></div>
+      <div><label>到达地（站名/城市/拼音/电报码）</label><div style="position:relative"><input id="s-to" class="station-ac" placeholder="如：南平市"></div><input id="s-t-str" placeholder="③档站名字样，如：延平" title="城市+该字样筛选市内车站" style="display:none;margin-top:4px"></div>
       <div style="flex:0 0 148px"><label>出发日期（默认明天）</label><input id="s-date" type="date"></div>
       <div class="narrow transfer-only"><label>最短换乘(分)</label><input id="s-min" type="number" value="30"></div>
       <div class="narrow transfer-only"><label>最长换乘(分)</label><input id="s-max" type="number" value="360"></div>
@@ -1048,20 +1048,46 @@ function priceDrawerHtml(l,opts={}){
 }
 
 // 车站自动补全：中文站名为主，附电报码与城市，支持拼音/电报码检索
-// 换乘搜索的出发/到达框额外列出"城市"实体；④混合模式下点选为追加站名而非替换
+// 仅在支持城市聚合的模式（②/③/⑤及一键导入向导）返回城市条目；①仅该站与④混合多选绝不返回城市；
+// ④混合多选对分隔符后的末尾片段做检索，并在点选时替换该片段而非拼接重复前缀。
+const acHideHooks=[];
+function splitMixedTokens(raw){
+  const parts=String(raw||'').split(/([,，、；;])/);
+  const active=parts[parts.length-1].trim();
+  const completed=[];
+  for(let i=0;i<parts.length-1;i+=2){
+    const t=parts[i].trim();
+    if(t&&!completed.includes(t))completed.push(t);
+  }
+  return {completed,active};
+}
 function attachAC(inp){
   const wrap=inp.parentElement;wrap.style.position='relative';
   const box=document.createElement('div');box.className='ac';wrap.appendChild(box);
   const isSearch=inp.id==='s-from'||inp.id==='s-to';
+  const isWizard=inp.id==='w-from'||inp.id==='w-to';
   const cityMode=()=>{const e=$('s-city');return isSearch&&e?e.value:null;};
-  let items=[],sel=-1,timer;
+  const allowCities=()=>{
+    if(isWizard)return true;
+    if(!isSearch)return false;
+    const m=cityMode();
+    return m==='name'||m==='all'||m==='string';
+  };
+  const cityKindHint=()=>{
+    const m=cityMode();
+    if(m==='all')return '城市（全市含郊县）';
+    if(m==='string')return '城市（配合下方字样筛选）';
+    return '城市（市内名站）';
+  };
+  let items=[],sel=-1,timer,reqSeq=0;
   const hide=()=>{box.style.display='none';sel=-1;};
+  acHideHooks.push(hide);
   const pick=(it)=>{
     if(it.kind==='city'){inp.value=it.name;hide();return;}
     if(cityMode()==='mixed'){
-      const cur=inp.value.trim();
-      const toks=cur?cur.split(/[,，、；;]/).map(t=>t.trim()).filter(Boolean):[];
-      if(!toks.includes(it.name))inp.value=cur?cur+'，'+it.name:it.name;
+      const {completed}=splitMixedTokens(inp.value);
+      if(!completed.includes(it.name))completed.push(it.name);
+      inp.value=completed.join('，');
       inp.focus();hide();
       return;
     }
@@ -1069,18 +1095,24 @@ function attachAC(inp){
   };
   const show=()=>{
     if(!items.length){hide();return;}
-    box.innerHTML=items.map((s,i)=>`<div class="it${i===sel?' sel':''}" data-i="${i}"><b>${esc(s.name)}</b><small>${s.kind==='city'?'城市（整市聚合）':esc(s.telecode)+(s.city?' · '+esc(s.city):'')}</small></div>`).join('');
+    const ch=cityKindHint();
+    box.innerHTML=items.map((s,i)=>`<div class="it${i===sel?' sel':''}" data-i="${i}"><b>${esc(s.name)}</b><small>${s.kind==='city'?ch:esc(s.telecode)+(s.city?' · '+esc(s.city):'')}</small></div>`).join('');
     box.style.display='block';
     box.querySelectorAll('.it').forEach(el=>el.onmousedown=e=>{e.preventDefault();pick(items[+el.dataset.i]);});
   };
   inp.addEventListener('input',()=>{
     clearTimeout(timer);
-    const q=inp.value.trim();
+    const modeAtInput=cityMode();
+    const q=modeAtInput==='mixed'?splitMixedTokens(inp.value).active:inp.value.trim();
     if(!q){items=[];hide();return;}
+    const valAtReq=inp.value;
+    const mySeq=++reqSeq;
     timer=setTimeout(async()=>{
       try{
-        let its=await api('/api/stations?q='+encodeURIComponent(q)+(isSearch?'&include_cities=1':''));
-        if(cityMode()==='mixed')its=its.filter(x=>x.kind!=='city');
+        const wantCities=allowCities();
+        let its=await api('/api/stations?q='+encodeURIComponent(q)+(wantCities?'&include_cities=1':''));
+        if(mySeq!==reqSeq||inp.value!==valAtReq||cityMode()!==modeAtInput)return;
+        if(!wantCities)its=its.filter(x=>x.kind!=='city');
         items=its;sel=-1;show();
       }catch(e){}
     },150);
@@ -1096,23 +1128,27 @@ function attachAC(inp){
 }
 document.querySelectorAll('input.station-ac').forEach(attachAC);
 
-// 车站范围五档：③档显示"站名字样"输入框，④档联想改为追加
+// 车站范围五档：③档显示"站名字样"输入框，④档联想按分隔符末尾片段检索并替换累加
 function applyCityMode(){
+  acHideHooks.forEach(fn=>fn());
   const m=$('s-city').value,show=m==='string';
   $('s-f-str').style.display=show?'':'none';
   $('s-t-str').style.display=show?'':'none';
-  const ph={single:'如：建阳（绝不换站）',name:'如：南平（→南平市）',string:'城市，如：南平',mixed:'连续点选：延平，建阳',all:'如：泉州（含郊县站）'}[m];
+  const ph={single:'如：建阳（绝不换站）',name:'如：南平（→南平市）',string:'城市，如：南平',mixed:'连续输入：延平，建阳',all:'如：泉州（含郊县站）'}[m];
   $('s-from').placeholder=ph;$('s-to').placeholder=ph;
 }
 $('s-city').addEventListener('change',applyCityMode);
 $('s-swap').addEventListener('click',()=>{
+  acHideHooks.forEach(fn=>fn());
   if($('s-city').value!=='string')return;
   const a=$('s-f-str').value;$('s-f-str').value=$('s-t-str').value;$('s-t-str').value=a;
 });
 applyCityMode();
 const compField=(main,str)=>{
-  const v=$(main).value.trim();
-  return $('s-city').value==='string'&&$(str).value.trim()?v+':'+$(str).value.trim():v;
+  const v=$(main).value.trim(),s=$(str).value.trim();
+  if($('s-city').value!=='string'||!s)return v;
+  if(!v)return ':'+s;
+  return /[:：]/.test(v)?v:v+':'+s;
 };
 
 // ---------- 换乘搜索 ----------
@@ -1286,17 +1322,18 @@ $('s-go').onclick=async()=>{
   setProg('s-prog',null);
   if(!$('s-online').checked){$('s-log').innerHTML='';$('s-log').className='logbox';}
   try{
+    const fq=compField('s-from','s-f-str'),tq=compField('s-to','s-t-str'),cm=$('s-city').value;
     if($('s-online').checked){
-      await runRouteImport($('s-from').value,$('s-to').value,$('s-date').value,true,'s-msg','s-cancel','s-log','s-prog');
+      await runRouteImport(fq,tq,$('s-date').value,true,'s-msg','s-cancel','s-log','s-prog',cm);
     }
     if(mySearch!==searchGen)return;
     const rawMaxh=numVal('s-maxh',48);
     const maxh=rawMaxh<=0?0:Math.min(336,Math.max(1,rawMaxh));
     const fk=Math.min(64,Math.max(0,numVal('s-fk',8)));
     const body={
-      from_station:compField('s-from','s-f-str'),to_station:compField('s-to','s-t-str'),date:$('s-date').value,
+      from_station:fq,to_station:tq,date:$('s-date').value,
       min_wait:numVal('s-min',30),max_wait:numVal('s-max',360),
-      max_legs:+numVal('s-legs',2),city_mode:$('s-city').value,
+      max_legs:+numVal('s-legs',2),city_mode:cm,
       cross_extra:numVal('s-cross',60),
       prune_level:$('s-prune').value,
       // WHY: 非 custom 时面板值只是预设的镜像，显式下发会被后端当"用户指定"，
@@ -2084,7 +2121,7 @@ function renderJobLog(logEl,j){
   logEl.className='logbox show';
   if(stick)logEl.scrollTop=logEl.scrollHeight;
 }
-async function runRouteImport(from,to,date,deep,msgElId,cancelBtnId,logElId,progElId){
+async function runRouteImport(from,to,date,deep,msgElId,cancelBtnId,logElId,progElId,cityMode=null){
   const logEl=logElId?$(logElId):null;
   if(logEl){logEl.innerHTML='';logEl.className='logbox';}
   const ctrl=new AbortController();
@@ -2094,7 +2131,9 @@ async function runRouteImport(from,to,date,deep,msgElId,cancelBtnId,logElId,prog
   msg(msgElId,'【一键导入】正在提交导入任务…');
   let r;
   try{
-    r=await post('/api/import/route',{from_city:from,to_city:to,date:date,deep:!!deep},{signal:ctrl.signal});
+    const req={from_city:from,to_city:to,date:date,deep:!!deep};
+    if(cityMode)req.city_mode=cityMode;
+    r=await post('/api/import/route',req,{signal:ctrl.signal});
   }catch(e){
     setAbortBtn(cancelBtnId,null);setProg(progElId,null);
     throw new Error(e.name==='AbortError'?'【一键导入】任务已取消':e.message);
@@ -2515,7 +2554,7 @@ function attachEnter(ids,btnId){
     });
   });
 }
-attachEnter(['s-from','s-to','s-date','s-min','s-max','s-cross','s-filter','s-fk','s-maxh','s-detour','s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'],'s-go');
+attachEnter(['s-from','s-to','s-f-str','s-t-str','s-date','s-min','s-max','s-cross','s-filter','s-fk','s-maxh','s-detour','s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'],'s-go');
 attachEnter(['w-from','w-to','w-date'],'w-go');
 attachEnter(['c-station','c-date'],'c-st-go');
 attachEnter(['c-from','c-to','c-t-date'],'c-t-go');

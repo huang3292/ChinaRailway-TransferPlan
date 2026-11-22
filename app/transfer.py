@@ -2394,7 +2394,7 @@ def search(from_q: str, to_q: str, date: str,
     tstations = db.resolve_stations(to_q, expand_city, city_mode)
     if not fstations or not tstations:
         missing = from_q if not fstations else to_q
-        raise ValueError(f"车站/城市“{missing}”不存在，请先在「爬取数据」页更新车站站名表")
+        raise ValueError(db.station_resolve_error(missing, city_mode))
     fkeys = {s["telecode"] for s in fstations} | {s["name"] for s in fstations}
     tkeys = {s["telecode"] for s in tstations} | {s["name"] for s in tstations}
     base = datetime.strptime(date, "%Y-%m-%d")

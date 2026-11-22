@@ -272,9 +272,15 @@ def station_lookup() -> dict:
 
 
 def resolve_station(q: str) -> dict | None:
-    q = q.strip()
-    r = rows("SELECT * FROM stations WHERE telecode=? OR name=? OR name=? LIMIT 1",
-             (q.upper(), q, q.removesuffix("站")))
+    q = (q or "").strip()
+    if not q:
+        return None
+    # 精确电报码、精确站名优先于去“站”后缀匹配，避免同名/近名顺序不确定
+    r = rows(
+        """SELECT * FROM stations WHERE telecode=? OR name=? OR name=?
+           ORDER BY CASE WHEN telecode=? THEN 0 WHEN name=? THEN 1 ELSE 2 END LIMIT 1""",
+        (q.upper(), q, q.removesuffix("站"), q.upper(), q),
+    )
     return r[0] if r else None
 
 
@@ -303,27 +309,48 @@ def city_stations(q: str) -> list[dict]:
     城市范围只保留“站名以城市名开头”的车站（厦门/厦门北/厦门高崎、南昌/南昌西/南昌东/南昌南），
     另加 CITY_PROPER 别名（武汉=武昌/汉口），避免把郊县站（如南昌的向塘/进贤）误算进市区。
     """
-    q = q.strip()
+    q = (q or "").strip()
     base = q.removesuffix("市")
+    if not base:
+        return []
     all_rows = rows("SELECT * FROM stations WHERE city=? OR city=? OR city=?",
                     (q, base, base + "市"))
     proper = set(CITY_PROPER.get(base, ()))
     out = [r for r in all_rows
            if r["name"].startswith(base) or r["name"] in proper or r["name"].removesuffix("站") in proper]
+    # WHY: 12306 station_name.js 中少数同名县级站归在地级市名下（如 建德→杭州、上杭→龙岩、兴安→桂林），
+    # 而其新建/支线站挂在县级 city 下（建德东/蛟洋/兴安盟）；仅查 city 列会漏掉同名主站甚至错扩到异省同名盟市。
+    exact = resolve_station(q)
+    if exact and exact["name"] in (q, base, q.removesuffix("站")) and all(
+        r["telecode"] != exact["telecode"] for r in out
+    ):
+        out.insert(0, exact)
     if not out:
         out = all_rows
-    out.sort(key=lambda r: (0 if r["name"] in (base, base + "站") else 1, r["name"]))
+    out.sort(key=lambda r: (0 if r["name"] in (base, base + "站", q) else 1, r["name"]))
     return out
 
 
 def city_all_stations(q: str) -> list[dict]:
     """返回 city 列归属该市的全部车站（含郊县站，如泉州→晋江/德化/惠安…）。"""
-    q = q.strip()
+    q = (q or "").strip()
     base = q.removesuffix("市")
+    if not base:
+        return []
     all_rows = rows("SELECT * FROM stations WHERE city=? OR city=? OR city=?",
                     (q, base, base + "市"))
+    exact = resolve_station(q)
+    if exact and exact["name"] in (q, base) and all(
+        r["telecode"] != exact["telecode"] for r in all_rows
+    ):
+        all_rows.insert(0, exact)
     all_rows.sort(key=lambda r: (0 if r["name"].startswith(base) else 1, r["name"]))
     return all_rows
+
+
+def _split_station_tokens(q: str) -> list[str]:
+    norm = q.replace("，", ",").replace("、", ",").replace("；", ",").replace(";", ",")
+    return [t.strip() for t in norm.split(",") if t.strip()]
 
 
 def resolve_stations(q: str, expand_city: bool = True, city_mode: str | None = None) -> list[dict]:
@@ -333,48 +360,91 @@ def resolve_stations(q: str, expand_city: bool = True, city_mode: str | None = N
     （如建阳→南平市站），但查询接口本身是按电报码精确查的；口径必须显式
     交给调用方，city_mode="single" 保证绝不换站。
     city_mode（优先于 expand_city）五档，与前端「车站范围」下拉一一对应：
-      "single"=仅该站本身（站名/电报码精确，绝不换站）；
+      "single"=仅该站本身（站名/电报码精确，绝不换站、不拆分列表）；
       "name"=市内站名以城市名打头的站（`city_stations` 旧 expand_city=True 行为）；
       "string"=token 写作 "城市:字样"，取该市 city 归属且站名含字样的站
-        （南平:延平→延平/延平东/延平西）；无冒号时退化为 "all"；
+        （南平:延平→延平/延平东/延平西）；有冒号但未命中时严禁回退单站；无冒号时退化为 "all"；
       "mixed"=逗号/顿号/分号分隔的站名或电报码列表取并集，各 token 仅按
-        单站精确解析（绝不做城市展开）；
+        单站精确解析（任一 token 未匹配即整体返回空列表，绝不悄悄忽略或做城市展开）；
       "all"=该地级市 city 归属的全部车站（含郊县站）。
     例外口径：安溪站 city='安溪'（非泉州），"all" 档按 city 字段会漏。
     """
-    q = q.strip()
+    q = (q or "").strip()
+    if not q:
+        return []
     mode = city_mode or ("name" if expand_city else "single")
-    norm = q.replace("，", ",").replace("、", ",").replace("；", ",").replace(";", ",")
-    toks = [t.strip() for t in norm.split(",") if t.strip()] or [q]
+    if mode == "single":
+        s = resolve_station(q)
+        return [s] if s else []
+
+    toks = _split_station_tokens(q)
+    if not toks:
+        return []
+
     out, seen = [], set()
     for tok in toks:
         cands: list[dict] = []
-        base = tok
         if mode == "string":
-            base, _, pfx = tok.replace("：", ":").partition(":")
-            cands = city_all_stations(base)
-            if pfx:
-                cands = [r for r in cands if pfx in r["name"]]
+            base, sep, pfx = tok.replace("：", ":").partition(":")
+            base, pfx = base.strip(), pfx.strip()
+            if sep:
+                if base:
+                    cands = city_all_stations(base)
+                    if pfx:
+                        cands = [r for r in cands if pfx in r["name"]]
+            else:
+                cands = city_all_stations(base)
+                if not cands:
+                    s = resolve_station(base)
+                    if s:
+                        cands = [s]
         elif mode == "mixed":
             s = resolve_station(tok)
-            cands = [s] if s else []
+            if not s:
+                # 混合多选要求每个 token 均为有效物理站/电报码，避免漏掉拼写错误或误填的城市名
+                return []
+            cands = [s]
         elif mode == "name":
             cands = city_stations(tok)
+            if not cands:
+                s = resolve_station(tok)
+                if s:
+                    cands = [s]
         elif mode == "all":
             cands = city_all_stations(tok)
-        if mode not in ("mixed", "string") and not cands:
-            s = resolve_station(tok)
-            if s:
-                cands = [s]
-        elif mode == "string" and not cands:
-            s = resolve_station(base)
-            if s:
-                cands = [s]
+            if not cands:
+                s = resolve_station(tok)
+                if s:
+                    cands = [s]
         for r in cands:
             if r["telecode"] not in seen:
                 seen.add(r["telecode"])
                 out.append(r)
     return out
+
+
+def station_resolve_error(q: str, city_mode: str | None = None) -> str:
+    """生成符合当前 city_mode 语义的车站解析失败提示。"""
+    if not rows("SELECT 1 FROM stations LIMIT 1"):
+        return "站名表为空，请先在「爬取数据」页更新车站站名表"
+    q_s = (q or "").strip()
+    if not q_s:
+        return "请输入出发/到达车站或城市"
+    if city_mode == "mixed":
+        missing = [t for t in _split_station_tokens(q_s) if not resolve_station(t)]
+        if missing:
+            return f"混合多选仅支持精确站名或电报码（不支持城市名），未识别：“{'、'.join(missing)}”"
+    if city_mode == "string":
+        for tok in _split_station_tokens(q_s):
+            base, sep, pfx = tok.replace("：", ":").partition(":")
+            base, pfx = base.strip(), pfx.strip()
+            if sep and not base:
+                return f"“{tok}”缺少城市名，请先输入城市再配合站名字样筛选"
+            if sep and pfx:
+                return f"城市“{base}”下未找到站名含“{pfx}”的车站"
+    if city_mode == "single":
+        return f"车站“{q_s}”不存在（仅该站模式不支持城市名或多站列表），请确认站名或电报码"
+    return f"车站/城市“{q_s}”不存在，请先在「爬取数据」页更新车站站名表"
 
 
 def get_setting(key: str, default=None):
