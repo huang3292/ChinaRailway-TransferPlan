@@ -309,9 +309,9 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
       </div>
     </div>
     <div class="row" style="margin-top:10px">
-      <div><label>只含车型头（后置过滤）</label><input id="s-inc-pfx" placeholder="如 G,D,C（全程仅限）"></div>
-      <div><label>排除车型头（后置过滤）</label><input id="s-exc-pfx" placeholder="如 S,K（含即排除）"></div>
-      <div><label>车次包含（后置过滤）</label><input id="s-filter" placeholder="如 Z126 或 G,D（任一程命中）"></div>
+      <div><label>只含车型头（搜索条件）</label><input id="s-inc-pfx" placeholder="如 G,D,C（全程仅限）" title="组内任一 token 命中(OR)，但全程每一程都须命中；与其它条件组之间为 AND"></div>
+      <div><label>排除车型头（搜索条件）</label><input id="s-exc-pfx" placeholder="如 S,K（含即排除）" title="任一程命中任一 token 即排除(OR)；与其它条件组之间为 AND"></div>
+      <div><label>车次包含（后置过滤）</label><input id="s-filter" placeholder="如 Z126 或 G,D（任一程命中）" title="任一程命中任一 token 即保留(OR)；与其它条件组之间为 AND"></div>
       <div style="flex:0 0 145px"><label>席位（按已查余票）</label>
         <select id="s-seat"><option value="">不限</option><option value="swz">商务座</option><option value="tz">特等座</option><option value="yxyz">优选一等</option><option value="zy">一等座</option><option value="ze">二等座</option><option value="rw">软卧/一等卧</option><option value="yw">硬卧/二等卧</option><option value="rz">软座</option><option value="yz">硬座</option><option value="wz">无座</option><option value="srrb">动卧</option></select></div>
       <div style="flex:0 0 215px"><label>出发时间</label>
@@ -320,9 +320,9 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
         <div style="display:flex;gap:4px"><input id="s-arr1" type="time"><input id="s-arr2" type="time"></div></div>
     </div>
     <div class="row transfer-only" style="margin-top:10px">
-      <div style="flex:1.4"><label>必经换乘站/城市（后置）</label>
-        <div style="display:flex;gap:4px"><input id="s-inc-tst" placeholder="如 福州,南昌（精确站名/城市）"><select id="s-inc-mode" style="flex:0 0 98px;width:auto" title="多个必经换乘条件的组合逻辑"><option value="or" selected>任一(OR)</option><option value="and">全部(AND)</option></select></div></div>
-      <div><label>排除换乘站/城市（后置）</label><input id="s-exc-tst" placeholder="如 北京南,天津（精确排除）"></div>
+      <div style="flex:1.4"><label>必经换乘站/城市（搜索条件）</label>
+        <div style="display:flex;gap:4px"><input id="s-inc-tst" placeholder="如 福州,南昌（精确站名/城市）" title="与排除换乘站/车型头等其它条件组之间为 AND；组内按右侧下拉 OR/AND；AND 要求每个 token 各被一个换乘对命中，站数超过换乘次数时自动提高程数（最多 5 程）"><select id="s-inc-mode" style="flex:0 0 98px;width:auto" title="多个必经换乘条件的组合逻辑：OR=任一换乘对命中任一 token；AND=每个 token 都须被某换乘对命中，站数不够时自动提高程数"><option value="or" selected>任一(OR)</option><option value="and">全部(AND)</option></select></div></div>
+      <div><label>排除换乘站/城市（搜索条件）</label><input id="s-exc-tst" placeholder="如 北京南,天津（精确排除）" title="任一换乘对(下车站或上车站)命中任一 token 即排除(OR)；先于必经判定，与必经之间为 AND"></div>
       <div style="flex:0 0 130px"><label>换乘类型</label>
         <select id="s-same"><option value="">不限</option><option value="1">同站换乘</option><option value="0">异站换乘(同城)</option></select></div>
       <div style="flex:0 0 175px"><label>树枝剪枝级别（搜前）</label>
@@ -352,7 +352,7 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
           <label style="display:inline-flex;align-items:center;gap:5px;color:var(--text);margin:0 0 0 14px" title="同中转站出发不早且到达不晚且程数不少的劣势分支自动剪除"><input type="checkbox" id="s-dom" style="width:auto"> 耗时劣势支配剪枝</label>
         </div>
       </div>
-      <div class="hint" style="margin-top:6px">重复车次、折返已乘车站、同城空转、绕回已离城市、过终点后再绕等防死循环规则在底层全局强制剪除；车型头与换乘站过滤已全部后置，修改即时生效无需重搜。</div>
+      <div class="hint" style="margin-top:6px">重复车次、折返已乘车站、同城空转、绕回已离城市、过终点后再绕等防死循环规则在底层全局强制剪除；车型头与换乘站条件修改后即时本地过滤并自动重搜：约束生效时搜前自动关闭束宽/支配剪枝，保证必经/排除/车型方案不被误剪；必经 AND 站数超过换乘次数时自动提高程数（最多 5 程）。</div>
     </div>
     <div class="hint">时间基准：北京时间(UTC+8)；异站换乘默认额外预留 60 分钟；点击表内 <b>车次</b> 或 <b>席位余票/票价单元格</b> 可仿国铁样式展开时刻表与各席别明细。</div>
     <div style="display:flex;gap:8px;align-items:center"><div class="msg" id="s-msg" style="flex:1"></div><button class="btn sec" id="s-cancel" style="display:none;margin-top:10px">停止任务</button></div>
@@ -1156,7 +1156,7 @@ function activePostFilterCount(){
 function clearPostFilters(){
   ['s-inc-pfx','s-exc-pfx','s-filter','s-inc-tst','s-exc-tst'].forEach(id=>{if($(id))$(id).value='';});
   if($('s-inc-mode'))$('s-inc-mode').value='or';
-  page=1;render();refreshAutoQuery();
+  page=1;render();refreshAutoQuery();scheduleCondResearch();
 }
 function refreshPruneToggleBadge(){
   const open=$('s-prune-panel').style.display!=='none';
@@ -1245,13 +1245,17 @@ $('s-go').onclick=async()=>{
       max_legs:+numVal('s-legs',2),expand_city:$('s-city').checked,
       cross_extra:numVal('s-cross',60),
       prune_level:$('s-prune').value,
-      frontier_k:fk,
-      max_total_min:maxh===0?0:Math.round(maxh*60),
-      detour_ratio:Math.max(0,numVal('s-detour',0)),
-      prune_dominated:$('s-dom').checked,
+      // WHY: 非 custom 时面板值只是预设的镜像，显式下发会被后端当"用户指定"，
+      // 从而跳过约束生效时的搜前自动放宽(auto_relaxed)；故仅 custom 下发这四项覆盖。
+      ...($('s-prune').value==='custom'?{frontier_k:fk,max_total_min:maxh===0?0:Math.round(maxh*60),detour_ratio:Math.max(0,numVal('s-detour',0)),prune_dominated:$('s-dom').checked}:{}),
       allow_cross_station:$('s-allow-cross').checked,
       hub_only:$('s-hub-only').checked,
       hub_stations:$('s-hubs').value.trim(),
+      allow_prefixes:$('s-inc-pfx').value.trim(),
+      exclude_prefixes:$('s-exc-pfx').value.trim(),
+      include_stations:$('s-inc-tst')?$('s-inc-tst').value.trim():'',
+      include_stations_mode:($('s-inc-mode')&&$('s-inc-mode').value==='and')?'and':'or',
+      exclude_stations:$('s-exc-tst')?$('s-exc-tst').value.trim():'',
     };
     const sWrap=await runTransferSearch(body,mySearch);page=1;
     R=sWrap.result;
@@ -1269,7 +1273,7 @@ $('s-go').onclick=async()=>{
   }catch(e){setProg('s-prog',null);setCancelBtn('s-cancel',null);msg('s-msg',e.name==='AbortError'?'【换乘搜索】任务已中断':e.message,false);}
   btn.disabled=false;
 };
-['s-sort','s-type','s-seat','s-same','s-inc-mode'].forEach(id=>$(id).onchange=()=>{applyTypeUI();page=1;render();refreshAutoQuery();});
+['s-sort','s-type','s-seat','s-same','s-inc-mode'].forEach(id=>$(id).onchange=()=>{applyTypeUI();page=1;render();refreshAutoQuery();if(id==='s-inc-mode'){autoLegsForAnd();scheduleCondResearch();}});
 $('s-size').onchange=()=>{page=1;render();refreshAutoQuery();};
 $('s-live').onchange=()=>{if(!$('s-live').checked){clearTimeout(autoTimer);planGen++;cancelActivePlanJob(true);setProg('s-prog',null);}else if(R){autoQuery();}};
 function applyTypeUI(){
@@ -1280,7 +1284,14 @@ function applyTypeUI(){
 }
 applyTypeUI();
 refreshPruneToggleBadge();
-['s-inc-pfx','s-exc-pfx','s-filter','s-dep1','s-dep2','s-arr1','s-arr2','s-inc-tst','s-exc-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();refreshAutoQuery();});
+['s-inc-pfx','s-exc-pfx','s-filter','s-dep1','s-dep2','s-arr1','s-arr2','s-inc-tst','s-exc-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();refreshAutoQuery();if(id==='s-inc-tst')autoLegsForAnd();if(['s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'].includes(id))scheduleCondResearch();});
+let condTimer=null;
+function scheduleCondResearch(){if(!R)return;clearTimeout(condTimer);condTimer=setTimeout(()=>{if(R)$('s-go').click();},600);}
+function autoLegsForAnd(){
+  const toks=parseTokens($('s-inc-tst')?$('s-inc-tst').value:'');
+  const need=toks.length+1;
+  if($('s-inc-mode')&&$('s-inc-mode').value==='and'&&need>parseInt($('s-legs').value,10)&&need<=5)$('s-legs').value=String(need);
+}
 
 let autoTimer=null;
 function refreshAutoQuery(){
@@ -1461,10 +1472,23 @@ function pruneDiagHtml(shownCount,transferCount){
 }
 function transferOnlyNote(){
   const same=$('s-same').value,tst=$('s-inc-tst')?$('s-inc-tst').value.trim():'';
-  if(same===''&&tst==='')return '';
+  const exc=$('s-exc-tst')?$('s-exc-tst').value.trim():'';
+  const ip=$('s-inc-pfx')?$('s-inc-pfx').value.trim():'',ep=$('s-exc-pfx')?$('s-exc-pfx').value.trim():'';
+  if(same===''&&tst===''&&exc===''&&ip===''&&ep==='')return '';
+  const mode=($('s-inc-mode')&&$('s-inc-mode').value==='and')?'AND':'OR';
+  const parts=[];
+  if(same!=='')parts.push(same==='1'?'同站换乘':'异站换乘');
+  if(tst)parts.push(`必经中转站“${esc(tst)}”(${mode})`);
+  if(exc)parts.push(`排除中转站“${esc(exc)}”(任一命中)`);
+  if(ip)parts.push(`只含车型头“${esc(ip)}”(全程)`);
+  if(ep)parts.push(`排除车型头“${esc(ep)}”(任一命中)`);
+  const transferOnly=same!==''||tst!=='';
   const hidden=R&&R.direct?R.direct.length:0;
-  return `<div class="hint" style="margin-top:6px;color:#b45309">已启用${same==='1'?'同站换乘':same==='0'?'异站换乘':''}${same!==''&&tst?'＋':''}${tst?`必经中转站“${esc(tst)}”`:''}筛选，${hidden} 个直达方案被隐藏；
-    <button type="button" class="mini" onclick="$('s-same').value='';if($('s-inc-tst'))$('s-inc-tst').value='';page=1;render()">清除中转筛选，显示直达</button></div>`;
+  const btn=transferOnly
+    ?`<button type="button" class="mini" onclick="$('s-same').value='';if($('s-inc-tst'))$('s-inc-tst').value='';if($('s-exc-tst'))$('s-exc-tst').value='';page=1;render();scheduleCondResearch()">清除中转筛选，显示直达</button>`
+    :`<button type="button" class="mini" onclick="clearPostFilters()">清除后置筛选</button>`;
+  return `<div class="hint" style="margin-top:6px;color:#b45309">已启用${parts.join('＋')}筛选（条件组之间 AND）${transferOnly?`，${hidden} 个直达方案被隐藏`:''}；
+    ${btn}</div>`;
 }
 
 function dayDiffLabel(depStr,arrStr){

@@ -2305,6 +2305,26 @@ def search(from_q: str, to_q: str, date: str,
     inc_st_mode = "and" if str(include_stations_mode or "or").strip().lower() == "and" else "or"
     exc_st = _parse_tokens(exclude_stations)
 
+    # WHY: 束宽(frontier_k)与支配剪枝在过滤之前按"局部最优"扔分支，会把"尚未经过必经站/
+    # 尚未用上允许车型"的合法分支误剪，后置过滤无法补回（实测 3 程必经 balanced=260 vs 无束宽=6314）。
+    # 故任一换乘/车型约束生效且用户未显式指定这两项剪枝参数时，搜前自动关闭它们，
+    # 让约束方案完整进入后置过滤；硬防死循环规则与用户显式参数仍生效。
+    auto_relaxed = False
+    if (inc_pfx or exc_pfx or inc_st or exc_st) and frontier_k is None and prune_dominated is None:
+        if eff_fk or eff_dom:
+            eff_fk, eff_dom = 0, False
+            auto_relaxed = True
+    # AND 要求每个 token 各命中一个换乘对：2 程仅 1 对，AND 两站恒 0。
+    # 与其回空结果不如自动提高程数（上限 5 程），超上限时在 note 说明。
+    legs_note = ""
+    if inc_st and inc_st_mode == "and" and len(inc_st) > max_legs - 1:
+        need = len(inc_st) + 1
+        if need <= 5:
+            legs_note = f"必经 AND {len(inc_st)} 站需 {len(inc_st)} 次换乘，已自动把程数从 {max_legs} 提高到 {need} · "
+            max_legs = need
+        else:
+            legs_note = f"必经 AND {len(inc_st)} 站超过 5 程(4 次换乘)上限，AND 无法满足，结果可能为 0 · "
+
     prune_stats = {
         "repeat_train": 0, "loopback": 0, "city_loop": 0, "passed_dest": 0,
         "total_time": 0, "detour": 0, "dominated": 0, "frontier": 0,
@@ -2316,6 +2336,7 @@ def search(from_q: str, to_q: str, date: str,
         "max_total_min": eff_max_total,
         "detour_ratio": eff_detour,
         "prune_dominated": eff_dom,
+        "auto_relaxed": auto_relaxed,
         "allow_cross_station": bool(allow_cross_station),
         "hub_only": bool(hub_only),
         "hub_tokens": hub_tokens,
@@ -2617,6 +2638,7 @@ def search(from_q: str, to_q: str, date: str,
             "detour_ratio": eff_detour,
             "detour_limit_min": int(round(detour_limit_min)) if detour_limit_min is not None else None,
             "prune_dominated": eff_dom,
+            "auto_relaxed": auto_relaxed,
             "allow_cross_station": bool(allow_cross_station),
             "hub_only": bool(hub_only),
             "hub_stations": hub_tokens,
@@ -2627,7 +2649,7 @@ def search(from_q: str, to_q: str, date: str,
             "exclude_stations": exc_st,
         },
         "prune_stats": prune_stats,
-        "note": f"时间基准：北京时间(UTC+8) · 异站换乘默认额外预留{cross_extra}分钟 · 无当日数据时按最近日期与 running_fig 校验推算并剔除余票冲突车次",
+        "note": f"{legs_note}{'换乘/车型约束生效：搜前已自动关闭束宽与支配剪枝（其余剪枝参数仍生效） · ' if auto_relaxed else ''}时间基准：北京时间(UTC+8) · 异站换乘默认额外预留{cross_extra}分钟 · 无当日数据时按最近日期与 running_fig 校验推算并剔除余票冲突车次",
         # 截断前的全量命中数：limit 生效时前端据此提示“另有 N 条未返回”，避免把上限误当总数
         "direct_total": direct_total,
         "transfers_total": transfers_total,
