@@ -252,6 +252,8 @@ def parse_station_screen(payload: dict, ctx: dict) -> list[dict]:
             "train_class_name": t.get("train_class_name"),
             "seat_types": t.get("seat_types"),
             "running_fig": t.get("running_fig"),
+            "train_style": t.get("train_style"),
+            "jiaolu_train_style": t.get("jiaolu_train_style"),
             "start_start_time": t.get("start_start_time"),
             "end_arrive_time": t.get("end_arrive_time"),
             "running_time": t.get("running_time"),

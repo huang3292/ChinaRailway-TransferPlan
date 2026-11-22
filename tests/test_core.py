@@ -888,7 +888,7 @@ class TestStdlibHTTPServer(TempDBTestCase):
             # 1) 首页与统计接口
             st, raw = req("GET", "/")
             self.assertEqual(st, 200)
-            self.assertIn("12306 智能中转", raw.decode("utf-8"))
+            self.assertIn("中国铁路12306 · 智能中转", raw.decode("utf-8"))
 
             st, raw = req("GET", "/api/stats")
             self.assertEqual(st, 200)

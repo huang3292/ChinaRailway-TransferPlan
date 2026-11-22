@@ -222,12 +222,33 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ## 6. 换乘搜索引擎（`app/transfer.py`，核心）[内核]
 
-入口 `search(from_q, to_q, date, min_wait=30, max_wait=360, limit=0, max_legs=2, expand_city=True, cross_extra=60, frontier_k=None, prune_level="balanced", max_total_min=None, detour_ratio=None, prune_dominated=None, allow_cross_station=True, hub_only=False, hub_stations="", allow_prefixes="", exclude_prefixes="", include_stations="", exclude_stations="", include_stations_mode="or", progress_cb=None, cancel_event=None, sub_cb=None)`；独立后置过滤器 `filter_plans(...)`。
+入口 `search(from_q, to_q, date, min_wait=30, max_wait=360, limit=0, max_legs=2, expand_city=True, cross_extra=60, frontier_k=None, prune_level="balanced", max_total_min=None, detour_ratio=None, prune_dominated=None, allow_cross_station=True, hub_only=False, hub_stations="", allow_prefixes="", exclude_prefixes="", include_stations="", exclude_stations="", include_stations_mode="or", city_mode=None, progress_cb=None, cancel_event=None, sub_cb=None)`；独立后置过滤器 `filter_plans(...)`。
 
 ### 6.1 准备
 
-- `db.resolve_stations` 把出发/到达解析为车站列表；`expand_city=True` 时城市名展开为同城车站
-  （`db.city_stations`：站名以城市名开头 + `CITY_PROPER` 别名，如武汉=武昌/汉口）。
+- `db.resolve_stations(q, expand_city=True, city_mode=None)` 把出发/到达解析为车站列表。
+  `city_mode` 五档（优先于 `expand_city`，前端「车站范围」下拉①–⑤下发）：
+  `single`=仅该站本身（站名或电报码精确，绝不换站）；`name`=市内站名以城市名打头的站
+  （`db.city_stations` + `CITY_PROPER` 别名，如武汉=武昌/汉口，即旧 `expand_city=True` 行为）；
+  `string`=token 写作 `城市:字样`，取该市 `city` 归属且站名含字样的站（`南平:延平`→
+  延平/延平东/延平西；无冒号退化为 `all`）；`mixed`=逗号/顿号/分号分隔的站名/电报码列表
+  取并集，各 token 仅按单站精确解析（城市名会解析失败，**不做**任何展开）；
+  `all`=该地级市 `city` 列归属的全部车站（含晋江/惠安/德化等郊县站，`db.city_all_stations`）。
+  **WHY**：12306 的"同城聚合"是可勾选扩展（查询页有同城车站勾选项），但官网/App 输入框的
+  地名→车站匹配层会把郊县站引到市内主站（建阳→南平市站）；本站把口径显式交给用户，
+  `single` 档保证绝不换站。前端配套：④档在联想中连续点选车站自动以顿号累加；
+  ③档框下出现"站名字样"小输入框，提交时拼成 `城市:字样`。已知例外：站表 `city` 列源自 12306
+  station_name.js，个别郊县站挂县级市名（如「安溪」站 city=安溪），`all` 档按 city 匹配会漏。
+  `/api/stations` 增 `include_cities=1`：换乘页联想在城市名匹配时前置返回
+  `{"name":城市,"kind":"city"}` 实体（仅出发/到达两框启用，④档城市条目自动隐藏）。
+- **担当车型（车底）显示**：车型仅存在于车站大屏原始报文——`train_style`（动车组，如
+  CR400BF-Z/CRH380A）与 `jiaolu_train_style`（担当车底；普速 K/Z/T 的 train_style 为空、
+  车底写在此字段，如 25G）。解析入库后由 `transfer._style_map()`（train_no→车型，按
+  query_date 最新者胜，`db.data_version()` 为失效键的只读共享缓存）在 `_enrich()` 单点注入
+  到每条 leg；`/api/station_trains` 经 `SELECT *` 直接带出两列。前端 `styleBadges()` 渲染：
+  `CR数字`/ZL200J=复兴号徽标，`CR4xx…-Z/-AZ/-BZ` 后缀=智能动车（公开接口无标志位，按型号
+  判定），另附灰色车型标签；普速直接显示 25G/25B 等具体车底。旧库升级 `init_db()` 自动
+  ALTER + `_backfill_screen()` 从已存档报文回填，**零联网**。
 - `fkeys`/`tkeys`：出发/到达站的**电报码与站名集合**（兼容不同数据源用码或用名）。
 - 常驻缓存（`_get_graph_cache` / `_get_date_cache`）：全量路网只建一次并跨请求复用——
   `_build_graph_cache` 装入 `n2c`、`cities`（城市分组，用于同城异站换乘）、`cal`
@@ -522,7 +543,8 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 | 换乘最短/最长等待、异站预留 | API `min_wait/max_wait/cross_extra`（异站默认 +60）；`transfer.py` 各引擎 `eff_min` |
 | 多程剪枝/总时长上限/预设/核心枢纽 | `transfer.py`（`PRUNE_PRESETS`、`MAJOR_HUBS`、`DETOUR_FLOOR_MIN`、`SAFE_WAIT_MIN`、`filter_plans`）；`main.py`（`MAX_TIMETABLES`） |
 | 票价估算费率/速度 | `fare.py`（`RATES`/`SPEED`/`load_calibration`） |
-| 城市展开/别名 | `db.py`（`city_stations`、`CITY_PROPER`） |
+| 城市展开/别名/五档选站（含③城市:字样、④混合点选） | `db.py`（`city_stations`、`city_all_stations`、`CITY_PROPER`、`resolve_stations(city_mode)`）；前端 `index.html`（`s-city`、`applyCityMode`、`compField`、`attachAC`） |
+| 担当车型徽标（复兴号/智能动车/车底） | `parsers.parse_station_screen`（train_style/jiaolu_train_style）→ `transfer._style_map`/`_enrich` → 前端 `styleBadges()` |
 | 常驻路网/日期缓存、候选筛选 | `transfer.py`（`_build_graph_cache`/`_get_graph_cache`/`_get_date_cache`、`screen_key_to_tn`/`tt_key_to_tn`）、`db.py`（`data_version`/`bump_data_version`） |
 | SQLite 读盘性能（页缓存/mmap/同步级别） | `db.py` 连接初始化处的 `PRAGMA` |
 | 排序"实际价优先"口径 | 前端 `priceKey`；后端 `transfer.rank` |

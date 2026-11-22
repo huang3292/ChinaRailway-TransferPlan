@@ -156,10 +156,37 @@ def _seat_map(target_date: str | None = None) -> tuple[dict, dict]:
     return out, real_tk
 
 
+_style_cache = {"ver": None, "map": {}}
+
+
+def _style_map() -> dict:
+    """train_no -> 车底车型（如 CR400BF-Z/CRH380A/25G）。
+
+    WHY: 车型只存在于车站大屏原始报文，时刻表接口(czxx)没有该字段，故以大屏为准；
+    普速(K/Z/T)的 train_style 为空、车底写在 jiaolu_train_style（担当车底），需回退取之。
+    同一 train_no 不同日期的车底可能不同，按 query_date 升序最后写入者胜（取最新）。
+    与 screen_all 等共享缓存同理：只读、以 db.data_version() 为失效键，不原地改。
+    """
+    ver = db.data_version()
+    if _style_cache["ver"] != ver:
+        m = {}
+        for tn, st, jl in db.get_conn().execute(
+                "SELECT train_no, train_style, jiaolu_train_style FROM station_trains "
+                "ORDER BY query_date"):
+            v = st or jl
+            if tn and v:
+                m[tn] = v
+        _style_cache["ver"], _style_cache["map"] = ver, m
+    return _style_cache["map"]
+
+
 def _enrich(leg: dict, train_no: str, fno, tno, ftc, ttc, dep_date: str,
             prices: dict, seats: dict, code: str = "", km=None,
             duration_min: int | None = None, cal: dict | None = None,
             sno: dict | None = None) -> dict:
+    st = _style_map().get(train_no)
+    if st:
+        leg["train_style"] = st
     if sno:
         if fno is None and ftc:
             fno = sno.get((train_no, ftc))
@@ -2292,6 +2319,7 @@ def search(from_q: str, to_q: str, date: str,
            include_stations: str = "",
            exclude_stations: str = "",
            include_stations_mode: str = "or",
+           city_mode: str | None = None,
            progress_cb=None, cancel_event=None, sub_cb=None) -> dict:
     preset = PRUNE_PRESETS.get(prune_level, PRUNE_PRESETS["balanced"])
     eff_fk = frontier_k if frontier_k is not None else preset["frontier_k"]
@@ -2362,8 +2390,8 @@ def search(from_q: str, to_q: str, date: str,
             sub_cb(s_done, s_total, text)
 
     step(1, "解析车站与价格/余票索引")
-    fstations = db.resolve_stations(from_q, expand_city)
-    tstations = db.resolve_stations(to_q, expand_city)
+    fstations = db.resolve_stations(from_q, expand_city, city_mode)
+    tstations = db.resolve_stations(to_q, expand_city, city_mode)
     if not fstations or not tstations:
         missing = from_q if not fstations else to_q
         raise ValueError(f"车站/城市“{missing}”不存在，请先在「爬取数据」页更新车站站名表")

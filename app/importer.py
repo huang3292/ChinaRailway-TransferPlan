@@ -111,12 +111,12 @@ def _save_with_conn(conn, api_type: str, records: list[dict], raw_id: int) -> in
             """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
                  station_train_date,start_train_date,station_no,arrive_time,start_time,stopover_time,
                  arrive_day_diff,start_day_diff,start_station_name,start_station_telecode,
-                 end_station_name,end_station_telecode,train_class_name,seat_types,running_fig,
+                 end_station_name,end_station_telecode,train_class_name,seat_types,running_fig,train_style,jiaolu_train_style,
                  start_start_time,end_arrive_time,running_time,distance,raw_id)
                VALUES(:station_telecode,:station_name,:query_date,:station_train_code,:train_no,
                  :station_train_date,:start_train_date,:station_no,:arrive_time,:start_time,:stopover_time,
                  :arrive_day_diff,:start_day_diff,:start_station_name,:start_station_telecode,
-                 :end_station_name,:end_station_telecode,:train_class_name,:seat_types,:running_fig,
+                 :end_station_name,:end_station_telecode,:train_class_name,:seat_types,:running_fig,:train_style,:jiaolu_train_style,
                  :start_start_time,:end_arrive_time,:running_time,:distance,:raw_id)
                ON CONFLICT(station_telecode,station_train_code,station_train_date) DO UPDATE SET
                  station_name=:station_name,query_date=:query_date,
@@ -126,6 +126,7 @@ def _save_with_conn(conn, api_type: str, records: list[dict], raw_id: int) -> in
                  start_station_name=:start_station_name,start_station_telecode=:start_station_telecode,
                  end_station_name=:end_station_name,end_station_telecode=:end_station_telecode,
                  train_class_name=:train_class_name,seat_types=:seat_types,running_fig=:running_fig,
+                 train_style=:train_style,jiaolu_train_style=:jiaolu_train_style,
                  start_start_time=:start_start_time,end_arrive_time=:end_arrive_time,
                  running_time=:running_time,distance=:distance,raw_id=:raw_id""",
             rows_data)

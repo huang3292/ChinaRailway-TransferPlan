@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>12306 智能中转</title>
+<title>中国铁路12306 · 智能中转</title>
+<link rel="icon" type="image/x-icon" href="/static/favicon.ico">
 <style>
 :root{
   --blue:#2676e3;
@@ -27,7 +28,7 @@ body{margin:0;font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-syste
 
 header{background:linear-gradient(90deg,#1a56b8 0%,#2676e3 60%,#2f83ee 100%);color:#fff;padding:0 24px;height:54px;display:flex;align-items:center;gap:24px;border-bottom:2px solid #154596}
 header h1{font-size:17px;font-weight:700;margin:0;letter-spacing:.3px;display:flex;align-items:center;gap:8px;white-space:nowrap}
-header h1 .logo-mark{display:inline-flex;align-items:center;justify-content:center;padding:2px 7px;border-radius:4px;background:rgba(255,255,255,.16);font-size:12px;font-weight:700;letter-spacing:.5px}
+header h1 img.cr-logo{height:32px;display:block;background:#fff;border-radius:5px;padding:1px 8px}
 nav{display:flex;gap:4px;height:100%;align-items:center}
 nav button{background:transparent;border:none;color:rgba(255,255,255,.84);padding:7px 14px;border-radius:5px;cursor:pointer;font-size:14px;font-weight:500;white-space:nowrap;transition:background .15s,color .15s}
 nav button:hover{background:rgba(255,255,255,.12);color:#fff}
@@ -255,6 +256,10 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
 .stats .s b{display:block;font-size:20px;color:var(--blue-dark);font-variant-numeric:tabular-nums;margin-bottom:2px}
 .hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.6}
 .tag{display:inline-block;background:#f1f5f9;border-radius:3px;padding:1px 6px;font-size:12px;margin-right:4px}
+.stx{display:inline-block;border-radius:3px;padding:0 5px;font-size:10px;line-height:16px;margin-right:4px;vertical-align:1px;font-weight:600;letter-spacing:.5px}
+.stx-fx{background:linear-gradient(135deg,#ff8a4a,#ff4d21);color:#fff}
+.stx-smart{background:linear-gradient(135deg,#ffb13c,#ff6a00);color:#fff}
+.stx-style{background:#eef2f7;color:#475569;border:1px solid #e2e8f0;font-weight:500;letter-spacing:0}
 .est{color:#b45309}
 .price{color:var(--orange);font-weight:700}
 
@@ -265,7 +270,7 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
 </head>
 <body>
 <header>
-  <h1><span class="logo-mark">12306</span>智能中转</h1>
+  <h1><img class="cr-logo" src="/static/logo.png" alt="中国铁路12306">智能中转</h1>
   <nav>
     <button data-tab="search" class="active">换乘搜索</button>
     <button data-tab="crawl">爬取数据</button>
@@ -280,9 +285,9 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
 <section class="tab active" id="tab-search">
   <div class="card">
     <div class="row">
-      <div><label>出发地（站名/城市/拼音/电报码）</label><input id="s-from" class="station-ac" placeholder="如：厦门"></div>
+      <div><label>出发地（站名/城市/拼音/电报码）</label><input id="s-from" class="station-ac" placeholder="如：厦门"><input id="s-f-str" placeholder="③档站名字样，如：延平" title="城市+该字样筛选市内车站" style="display:none;margin-top:4px"></div>
       <div class="swap-wrap"><button type="button" class="btn-swap" id="s-swap" title="互换出发到达">⇄</button></div>
-      <div><label>到达地（站名/城市/拼音/电报码）</label><input id="s-to" class="station-ac" placeholder="如：南平市"></div>
+      <div><label>到达地（站名/城市/拼音/电报码）</label><input id="s-to" class="station-ac" placeholder="如：南平市"><input id="s-t-str" placeholder="③档站名字样，如：延平" title="城市+该字样筛选市内车站" style="display:none;margin-top:4px"></div>
       <div style="flex:0 0 148px"><label>出发日期（默认明天）</label><input id="s-date" type="date"></div>
       <div class="narrow transfer-only"><label>最短换乘(分)</label><input id="s-min" type="number" value="30"></div>
       <div class="narrow transfer-only"><label>最长换乘(分)</label><input id="s-max" type="number" value="360"></div>
@@ -303,7 +308,8 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
       <div style="flex:0 0 100px"><label>每页方案数</label>
         <select id="s-size"><option>20</option><option selected>50</option><option>100</option><option>200</option></select></div>
       <div style="flex:3;padding-bottom:4px">
-        <label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0;cursor:pointer"><input type="checkbox" id="s-city" checked style="width:auto"> 城市范围（含同城主要枢纽站）</label>
+        <label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0">车站范围</label>
+        <select id="s-city" style="width:auto" title="①仅该站：站名/电报码精确匹配，绝不换站（12306 输入框会把郊县站引到主站，这里由你显式控制）；②城市名站：泉州→泉州/泉州东/泉州南；③城市+字样：南平+延平→延平/延平东/延平西；④混合多选：在联想里连续点选多个站自动合并；⑤全市所有站：该地级市全部车站含郊县（注意按 city 字段，安溪站会漏）。"><option value="single">① 仅该站（站名/电报码）</option><option value="name" selected>② 城市名站（泉州→泉州/泉州东…）</option><option value="string">③ 城市+站名字样（南平+延平）</option><option value="mixed">④ 混合多选（点选累加车站）</option><option value="all">⑤ 全市所有站（含郊县站）</option></select>
         <label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0 0 0 14px;cursor:pointer"><input type="checkbox" id="s-online" style="width:auto"> 在线模式（搜索前实时抓取）</label>
         <label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0 0 0 14px;cursor:pointer"><input type="checkbox" id="s-live" style="width:auto"> 自动查询票价/余票</label>
       </div>
@@ -701,6 +707,17 @@ function fmtStation(name,tc){return name&&tc?`${name}(${tc})`:(name||tc||'--');}
 function fmtTrain(code,no){return code&&no?`${code}(${no})`:(code||no||'--');}
 function isBlueCode(code){const c=(String(code||'').match(/^[A-Za-z]/)||[''])[0].toUpperCase();return ['G','C','D','Z','T'].includes(c);}
 function trainBadge(code){return `<span class="tcode ${isBlueCode(code)?'blue':'green'}">${esc(code)}</span>`;}
+// 车底徽标：数据来自车站大屏 train_style（普速回退 jiaolu_train_style 担当车底）。
+// 复兴号=CR 开头（CRH 和谐号不算）；智能动车=CR400 系列 -Z/-AZ/-BZ 后缀（公开接口无专用标志位，按车底型号判定）。
+function styleBadges(st){
+  if(!st)return '';
+  const disp=String(st).split('_')[0];
+  const fx=/^(CR\d|ZL200J)/i.test(disp);
+  const smart=/^CR\d{3}[A-Z]*-[A-Z]*Z$/i.test(disp);
+  return (smart?'<span class="stx stx-smart" title="智能型复兴号动车组（按车底型号判定）">智能动车</span>'
+               :(fx?'<span class="stx stx-fx" title="复兴号动车组">复兴号</span>':''))
+    +`<span class="stx stx-style" title="车底车型（车站大屏担当车底）">${esc(disp)}</span>`;
+}
 const yuan=v=>String(Math.round(v*10)/10);
 function avail(v){return v!=null&&v!==''&&v!=='无'&&v!=='--'&&v!=='0'&&v!=='*';}
 
@@ -1031,35 +1048,72 @@ function priceDrawerHtml(l,opts={}){
 }
 
 // 车站自动补全：中文站名为主，附电报码与城市，支持拼音/电报码检索
+// 换乘搜索的出发/到达框额外列出"城市"实体；④混合模式下点选为追加站名而非替换
 function attachAC(inp){
   const wrap=inp.parentElement;wrap.style.position='relative';
   const box=document.createElement('div');box.className='ac';wrap.appendChild(box);
+  const isSearch=inp.id==='s-from'||inp.id==='s-to';
+  const cityMode=()=>{const e=$('s-city');return isSearch&&e?e.value:null;};
   let items=[],sel=-1,timer;
   const hide=()=>{box.style.display='none';sel=-1;};
+  const pick=(it)=>{
+    if(it.kind==='city'){inp.value=it.name;hide();return;}
+    if(cityMode()==='mixed'){
+      const cur=inp.value.trim();
+      const toks=cur?cur.split(/[,，、；;]/).map(t=>t.trim()).filter(Boolean):[];
+      if(!toks.includes(it.name))inp.value=cur?cur+'，'+it.name:it.name;
+      inp.focus();hide();
+      return;
+    }
+    inp.value=it.name;hide();
+  };
   const show=()=>{
     if(!items.length){hide();return;}
-    box.innerHTML=items.map((s,i)=>`<div class="it${i===sel?' sel':''}" data-i="${i}"><b>${esc(s.name)}</b><small>${esc(s.telecode)}${s.city?' · '+esc(s.city):''}</small></div>`).join('');
+    box.innerHTML=items.map((s,i)=>`<div class="it${i===sel?' sel':''}" data-i="${i}"><b>${esc(s.name)}</b><small>${s.kind==='city'?'城市（整市聚合）':esc(s.telecode)+(s.city?' · '+esc(s.city):'')}</small></div>`).join('');
     box.style.display='block';
-    box.querySelectorAll('.it').forEach(el=>el.onmousedown=e=>{e.preventDefault();inp.value=items[+el.dataset.i].name;hide();});
+    box.querySelectorAll('.it').forEach(el=>el.onmousedown=e=>{e.preventDefault();pick(items[+el.dataset.i]);});
   };
   inp.addEventListener('input',()=>{
     clearTimeout(timer);
     const q=inp.value.trim();
     if(!q){items=[];hide();return;}
     timer=setTimeout(async()=>{
-      try{items=await api('/api/stations?q='+encodeURIComponent(q));sel=-1;show();}catch(e){}
+      try{
+        let its=await api('/api/stations?q='+encodeURIComponent(q)+(isSearch?'&include_cities=1':''));
+        if(cityMode()==='mixed')its=its.filter(x=>x.kind!=='city');
+        items=its;sel=-1;show();
+      }catch(e){}
     },150);
   });
   inp.addEventListener('keydown',e=>{
     if(box.style.display!=='block')return;
     if(e.key==='ArrowDown'){sel=Math.min(sel+1,items.length-1);show();e.preventDefault();}
     else if(e.key==='ArrowUp'){sel=Math.max(sel-1,0);show();e.preventDefault();}
-    else if(e.key==='Enter'){if(sel>=0){inp.value=items[sel].name;hide();e.preventDefault();}}
+    else if(e.key==='Enter'){if(sel>=0){pick(items[sel]);e.preventDefault();}}
     else if(e.key==='Escape')hide();
   });
   inp.addEventListener('blur',()=>setTimeout(hide,150));
 }
 document.querySelectorAll('input.station-ac').forEach(attachAC);
+
+// 车站范围五档：③档显示"站名字样"输入框，④档联想改为追加
+function applyCityMode(){
+  const m=$('s-city').value,show=m==='string';
+  $('s-f-str').style.display=show?'':'none';
+  $('s-t-str').style.display=show?'':'none';
+  const ph={single:'如：建阳（绝不换站）',name:'如：南平（→南平市）',string:'城市，如：南平',mixed:'连续点选：延平，建阳',all:'如：泉州（含郊县站）'}[m];
+  $('s-from').placeholder=ph;$('s-to').placeholder=ph;
+}
+$('s-city').addEventListener('change',applyCityMode);
+$('s-swap').addEventListener('click',()=>{
+  if($('s-city').value!=='string')return;
+  const a=$('s-f-str').value;$('s-f-str').value=$('s-t-str').value;$('s-t-str').value=a;
+});
+applyCityMode();
+const compField=(main,str)=>{
+  const v=$(main).value.trim();
+  return $('s-city').value==='string'&&$(str).value.trim()?v+':'+$(str).value.trim():v;
+};
 
 // ---------- 换乘搜索 ----------
 let R=null,page=1,planPoll=null,activePlanJob=null,activeSearchJob=null,searchPoll=null,activeRouteJob=null,activeTicketJob=null,ticketPoll=null,planGen=0,searchGen=0,planCtrl=null,searchCtrl=null;
@@ -1240,9 +1294,9 @@ $('s-go').onclick=async()=>{
     const maxh=rawMaxh<=0?0:Math.min(336,Math.max(1,rawMaxh));
     const fk=Math.min(64,Math.max(0,numVal('s-fk',8)));
     const body={
-      from_station:$('s-from').value,to_station:$('s-to').value,date:$('s-date').value,
+      from_station:compField('s-from','s-f-str'),to_station:compField('s-to','s-t-str'),date:$('s-date').value,
       min_wait:numVal('s-min',30),max_wait:numVal('s-max',360),
-      max_legs:+numVal('s-legs',2),expand_city:$('s-city').checked,
+      max_legs:+numVal('s-legs',2),city_mode:$('s-city').value,
       cross_extra:numVal('s-cross',60),
       prune_level:$('s-prune').value,
       // WHY: 非 custom 时面板值只是预设的镜像，显式下发会被后端当"用户指定"，
@@ -1611,7 +1665,7 @@ function renderMobileLegHtml(l,p,i,effCols,gone){
         <div class="m-stn"><span class="st-tag ${isOri?'ori':'pass'}">${isOri?'始':'过'}</span><span>${esc(l.from)}</span></div>
       </div>
       <div class="m-mid" onclick="toggleTT('${esc(p._k)}',${i})" title="点击展开/收起经停时刻表">
-        <div class="m-code">${trainBadge(l.train)}</div>
+        <div class="m-code">${trainBadge(l.train)}${styleBadges(l.train_style)}</div>
         <div class="m-arrow"><span class="m-arrow-line"></span><span>${fmtMin(l.duration_min)} ${isTTOpen?'▴':'▾'}</span><span class="m-arrow-line"></span></div>
       </div>
       <div class="m-end right">
@@ -2135,7 +2189,7 @@ $('c-st-go').onclick=async()=>{
     const stLabel=list[0]?fmtStation(list[0].station_name||body.station,list[0].station_telecode):body.station;
     msg('c-stn-msg',`【车站大屏】${stLabel}（${body.date}）爬取完成：入库 ${r.saved} 个经由车次（留档 raw_id=${r.raw_id}）${actualDurTxt((performance.now()-t0)/1000)}`);
     $('c-stn-table').innerHTML=`<table class="std-tbl"><tr><th>车次 / 代号</th><th>类型</th><th>始发→终到</th><th>到达</th><th>出发</th><th>跨天</th><th>操作</th></tr>`+
-      list.map(t=>`<tr><td>${trainBadge(t.station_train_code)} <span class="mono" style="color:var(--muted)">${esc(t.train_no||'--')}</span></td><td>${esc(t.train_class_name||'')}</td>
+      list.map(t=>`<tr><td>${trainBadge(t.station_train_code)} <span class="mono" style="color:var(--muted)">${esc(t.train_no||'--')}</span><br>${styleBadges(t.train_style||t.jiaolu_train_style)}</td><td>${esc(t.train_class_name||'')}</td>
         <td>${esc(fmtStation(t.start_station_name,t.start_station_telecode))} → ${esc(fmtStation(t.end_station_name,t.end_station_telecode))}</td>
         <td class="num">${esc(t.arrive_time)}</td><td class="num">${esc(t.start_time)}</td><td class="num">${t.start_day_diff??0}</td>
         <td><button type="button" class="mini" onclick="crawlTT('${esc(t.train_no)}','${esc(t.station_train_code)}')">抓时刻表</button></td></tr>`).join('')+'</table>';

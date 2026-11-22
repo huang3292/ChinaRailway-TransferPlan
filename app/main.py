@@ -290,15 +290,25 @@ def stats():
 
 
 @app.get("/api/stations")
-def stations(q: str = "", limit: int = 30):
+def stations(q: str = "", limit: int = 30, include_cities: bool = False):
     if q:
         like = f"%{q}%"
-        return db.rows("""SELECT * FROM stations WHERE name LIKE ? OR telecode LIKE ? OR pinyin LIKE ?
+        rows = db.rows("""SELECT * FROM stations WHERE name LIKE ? OR telecode LIKE ? OR pinyin LIKE ?
                           OR short LIKE ?
                           ORDER BY CASE WHEN name=? OR telecode=? THEN 0
                                         WHEN name LIKE ? OR pinyin LIKE ? THEN 1 ELSE 2 END, name
                           LIMIT ?""",
-                     (like, like, like, like, q, q.upper(), f"{q}%", f"{q}%", limit))
+                       (like, like, like, like, q, q.upper(), f"{q}%", f"{q}%", limit))
+        if include_cities:
+            cities = db.rows("""SELECT DISTINCT city AS name FROM stations
+                                WHERE city LIKE ? AND city <> ''
+                                ORDER BY CASE WHEN name=? THEN 0 ELSE 1 END, name LIMIT 8""",
+                             (like, q))
+            for c in cities:
+                c["kind"] = "city"
+                c["telecode"] = ""
+            return cities + rows[:max(limit - len(cities), 0)]
+        return rows
     return db.rows("SELECT * FROM stations LIMIT ?", (limit,))
 
 
@@ -835,7 +845,8 @@ def clear_cache(before_date: str | None = None, include_raw: bool = False):
 def _validate_search_params(date: str, max_legs: int, cross_extra: int,
                             frontier_k: int | None, prune_level: str,
                             max_total_min: int | None, detour_ratio: float | None,
-                            include_stations_mode: str = "or"):
+                            include_stations_mode: str = "or",
+                            city_mode: str | None = None):
     _check_date(date)
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
@@ -851,6 +862,8 @@ def _validate_search_params(date: str, max_legs: int, cross_extra: int,
         raise HTTPException(400, "detour_ratio 必须在 0-20 之间")
     if (include_stations_mode or "or").strip().lower() not in ("or", "and"):
         raise HTTPException(400, "include_stations_mode 必须为 or 或 and")
+    if city_mode is not None and city_mode not in ("single", "name", "string", "mixed", "all"):
+        raise HTTPException(400, "city_mode 必须为 single / name / string / mixed / all")
 
 
 # WHY: HTTP 默认必须带上限——两段换乘枚举不设限（深圳→广州实测 37.4 万条），全量 JSON 可达
@@ -871,10 +884,11 @@ def transfers(from_station: str, to_station: str, date: str,
               exclude_prefixes: str = "",
               include_stations: str = "",
               exclude_stations: str = "",
-              include_stations_mode: str = "or"):
+              include_stations_mode: str = "or",
+              city_mode: str | None = None):
     _validate_search_params(
         date, max_legs, cross_extra, frontier_k, prune_level,
-        max_total_min, detour_ratio, include_stations_mode,
+        max_total_min, detour_ratio, include_stations_mode, city_mode,
     )
     return _run(
         transfer.search, from_station, to_station, date,
@@ -883,6 +897,7 @@ def transfers(from_station: str, to_station: str, date: str,
         allow_cross_station, hub_only, hub_stations,
         allow_prefixes, exclude_prefixes,
         include_stations, exclude_stations, include_stations_mode,
+        city_mode,
     )
 
 
@@ -909,6 +924,7 @@ class TransferSearchReq(BaseModel):
     include_stations: str = ""
     exclude_stations: str = ""
     include_stations_mode: str = "or"
+    city_mode: str | None = None
 
 
 def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchReq):
@@ -936,6 +952,7 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
             include_stations=body.include_stations,
             exclude_stations=body.exclude_stations,
             include_stations_mode=body.include_stations_mode,
+            city_mode=body.city_mode,
             progress_cb=on_prog, cancel_event=ev, sub_cb=on_sub,
         )
         if ev.is_set():
@@ -956,10 +973,10 @@ def start_transfers(body: TransferSearchReq):
     _validate_search_params(
         body.date, body.max_legs, body.cross_extra, body.frontier_k,
         body.prune_level, body.max_total_min, body.detour_ratio,
-        body.include_stations_mode,
+        body.include_stations_mode, body.city_mode,
     )
-    fstations = db.resolve_stations(body.from_station, body.expand_city)
-    tstations = db.resolve_stations(body.to_station, body.expand_city)
+    fstations = db.resolve_stations(body.from_station, body.expand_city, body.city_mode)
+    tstations = db.resolve_stations(body.to_station, body.expand_city, body.city_mode)
     if not fstations or not tstations:
         missing = body.from_station if not fstations else body.to_station
         raise HTTPException(400, f"车站/城市“{missing}”不存在，请先在「爬取数据」页更新车站站名表")
