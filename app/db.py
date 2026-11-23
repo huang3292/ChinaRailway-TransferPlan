@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import sqlite3
 import threading
@@ -12,7 +13,11 @@ CN_TZ = ZoneInfo("Asia/Shanghai")
 
 _local = threading.local()
 _gen_lock = threading.Lock()
+_write_lock = threading.Lock()
 _data_gen = 0
+
+MAX_TRANSFER_GROUP_MEMBERS = 30
+MIN_TRANSFER_GROUP_EXTRA_MIN = 5
 
 
 def bump_data_version() -> int:
@@ -54,9 +59,36 @@ CREATE TABLE IF NOT EXISTS stations(
   name TEXT NOT NULL,
   pinyin TEXT,
   short TEXT,
-  city TEXT
+  city TEXT,
+  lat REAL,
+  lon REAL,
+  coord_source TEXT DEFAULT '',
+  coord_updated_at TEXT DEFAULT '',
+  coord_status TEXT DEFAULT 'missing',
+  coord_grid TEXT DEFAULT '',
+  coord_confidence REAL DEFAULT 0,
+  coord_issue TEXT DEFAULT '',
+  transit_zone_id TEXT DEFAULT '',
+  nearest_rail_stop_distance_m INTEGER,
+  rail_access_mode TEXT DEFAULT 'none',
+  is_major_hub INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_stations_name ON stations(name);
+
+CREATE TABLE IF NOT EXISTS rail_transit_stops(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  city TEXT NOT NULL DEFAULT '',
+  transit_zone_id TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT 'subway' CHECK(mode IN ('subway','light_rail','suburban','monorail')),
+  lat REAL NOT NULL,
+  lon REAL NOT NULL,
+  grid_key TEXT DEFAULT '',
+  source TEXT DEFAULT 'overpass',
+  UNIQUE(name, city, mode, lat, lon)
+);
+CREATE INDEX IF NOT EXISTS idx_rts_grid ON rail_transit_stops(grid_key);
+CREATE INDEX IF NOT EXISTS idx_rts_zone ON rail_transit_stops(transit_zone_id);
 
 CREATE TABLE IF NOT EXISTS raw_payloads(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -159,6 +191,37 @@ CREATE TABLE IF NOT EXISTS settings(
   key TEXT PRIMARY KEY,
   value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS transfer_groups(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  default_extra_min INTEGER,
+  note TEXT DEFAULT '',
+  enabled_by_default INTEGER NOT NULL DEFAULT 1,
+  connect_mode TEXT NOT NULL DEFAULT 'full_mesh',
+  hub_telecode TEXT DEFAULT '',
+  created_at TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS transfer_group_members(
+  group_id INTEGER NOT NULL,
+  telecode TEXT NOT NULL,
+  PRIMARY KEY(group_id, telecode),
+  FOREIGN KEY(group_id) REFERENCES transfer_groups(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_tgm_tc ON transfer_group_members(telecode);
+
+CREATE TABLE IF NOT EXISTS transfer_pair_overrides(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  a_telecode TEXT NOT NULL,
+  b_telecode TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK(mode IN ('allow', 'block')),
+  custom_extra_min INTEGER,
+  note TEXT DEFAULT '',
+  created_at TEXT DEFAULT '',
+  updated_at TEXT DEFAULT '',
+  UNIQUE(a_telecode, b_telecode)
+);
 """
 
 
@@ -206,7 +269,7 @@ def tx(bump: bool = True):
 
 
 def init_db():
-    with tx() as conn:
+    with _write_lock, tx() as conn:
         conn.executescript(SCHEMA)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(station_trains)")}
         added = [c for c in ("start_start_time", "end_arrive_time", "running_time", "distance",
@@ -214,6 +277,39 @@ def init_db():
         for c in added:
             typ = "INTEGER" if c == "distance" else "TEXT"
             conn.execute(f"ALTER TABLE station_trains ADD COLUMN {c} {typ}")
+        st_cols = {r[1] for r in conn.execute("PRAGMA table_info(stations)")}
+        st_migrations = (
+            ("lat", "REAL"),
+            ("lon", "REAL"),
+            ("coord_source", "TEXT DEFAULT ''"),
+            ("coord_updated_at", "TEXT DEFAULT ''"),
+            ("coord_status", "TEXT DEFAULT 'missing'"),
+            ("coord_grid", "TEXT DEFAULT ''"),
+            ("coord_confidence", "REAL DEFAULT 0"),
+            ("coord_issue", "TEXT DEFAULT ''"),
+            ("transit_zone_id", "TEXT DEFAULT ''"),
+            ("nearest_rail_stop_distance_m", "INTEGER"),
+            ("rail_access_mode", "TEXT DEFAULT 'none'"),
+            ("is_major_hub", "INTEGER NOT NULL DEFAULT 0"),
+        )
+        for c, typ in st_migrations:
+            if c not in st_cols:
+                conn.execute(f"ALTER TABLE stations ADD COLUMN {c} {typ}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stations_coords ON stations(coord_status, lat, lon)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stations_grid ON stations(coord_grid)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stations_zone ON stations(transit_zone_id)")
+
+        tg_cols = {r[1] for r in conn.execute("PRAGMA table_info(transfer_groups)")}
+        for c, typ in (
+            ("connect_mode", "TEXT NOT NULL DEFAULT 'full_mesh'"),
+            ("hub_telecode", "TEXT DEFAULT ''"),
+        ):
+            if c not in tg_cols:
+                conn.execute(f"ALTER TABLE transfer_groups ADD COLUMN {c} {typ}")
+
+        tp_cols = {r[1] for r in conn.execute("PRAGMA table_info(transfer_pair_overrides)")}
+        if "updated_at" not in tp_cols:
+            conn.execute("ALTER TABLE transfer_pair_overrides ADD COLUMN updated_at TEXT DEFAULT ''")
     if added:
         _backfill_screen()
     bump_data_version()
@@ -489,10 +585,343 @@ def get_setting(key: str, default=None):
     return r[0]["value"] if r else default
 
 
-def set_setting(key: str, value):
-    with tx(bump=False) as conn:
+def set_setting(key: str, value, bump: bool = False):
+    with tx(bump=bump) as conn:
         conn.execute(
             "INSERT INTO settings(key,value) VALUES(?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, str(value)),
         )
+
+
+def grid_key_for(lat: float | None, lon: float | None) -> str:
+    if lat is None or lon is None:
+        return ""
+    return f"{math.floor(float(lat) * 2.0)}_{math.floor(float(lon) * 2.0)}"
+
+
+def rail_access_mode_for(dist_m: int | float | None) -> str:
+    if dist_m is None:
+        return "none"
+    d = float(dist_m)
+    if d <= 800.0:
+        return "walk"
+    if d <= 1500.0:
+        return "short_bus"
+    return "long_bus_or_taxi"
+
+
+def update_station_coords(
+    telecode: str,
+    lat: float | None,
+    lon: float | None,
+    source: str = "manual",
+    status: str = "verified",
+    confidence: float | None = None,
+    issue: str = "",
+    transit_zone_id: str | None = None,
+    nearest_rail_stop_distance_m: int | None = -1,
+    rail_access_mode: str | None = None,
+    is_major_hub: bool | None = None,
+):
+    tc = (telecode or "").strip().upper()
+    if status not in ("ok", "verified", "suspect", "missing"):
+        raise ValueError("coord_status 必须为 ok / verified / suspect / missing")
+    if lat is not None and lon is not None:
+        flat, flon = float(lat), float(lon)
+        grid = grid_key_for(flat, flon)
+        conf = 1.0 if confidence is None and status == "verified" else float(confidence if confidence is not None else 0.9)
+    else:
+        flat, flon, grid = None, None, ""
+        conf = 0.0
+        if status in ("ok", "verified"):
+            status = "missing"
+    now_str = cn_now().isoformat(timespec="seconds")
+    with _write_lock, tx(bump=True) as conn:
+        existing = conn.execute(
+            "SELECT transit_zone_id, nearest_rail_stop_distance_m, rail_access_mode, is_major_hub FROM stations WHERE telecode=?",
+            (tc,),
+        ).fetchone()
+        if not existing:
+            raise ValueError(f"车站电报码“{tc}”不存在")
+        zone_val = existing[0] if transit_zone_id is None else str(transit_zone_id).strip()
+        dist_val = existing[1] if nearest_rail_stop_distance_m == -1 else (
+            None if nearest_rail_stop_distance_m is None else max(0, int(nearest_rail_stop_distance_m))
+        )
+        if rail_access_mode is not None:
+            if rail_access_mode not in ("walk", "short_bus", "long_bus_or_taxi", "none"):
+                raise ValueError("rail_access_mode 必须为 walk / short_bus / long_bus_or_taxi / none")
+            mode_val = rail_access_mode
+        elif nearest_rail_stop_distance_m != -1:
+            mode_val = rail_access_mode_for(dist_val)
+        else:
+            mode_val = existing[2] or "none"
+        hub_val = existing[3] if is_major_hub is None else (1 if is_major_hub else 0)
+        conn.execute(
+            """UPDATE stations
+               SET lat=?, lon=?, coord_source=?, coord_updated_at=?, coord_status=?,
+                   coord_grid=?, coord_confidence=?, coord_issue=?,
+                   transit_zone_id=?, nearest_rail_stop_distance_m=?, rail_access_mode=?, is_major_hub=?
+               WHERE telecode=?""",
+            (flat, flon, source, now_str, status, grid, conf, (issue or "").strip(),
+             zone_val, dist_val, mode_val, hub_val, tc),
+        )
+
+
+def batch_update_station_coords(items: list[dict]) -> int:
+    """单写锁 + 单事务批量更新车站地理与质检字段，避免并发锁冲突与长事务抖动。"""
+    if not items:
+        return 0
+    now_str = cn_now().isoformat(timespec="seconds")
+    payload = []
+    for it in items:
+        lat, lon = it.get("lat"), it.get("lon")
+        grid = it.get("grid") or grid_key_for(lat, lon)
+        conf = float(it.get("confidence", 0.9 if (lat is not None and lon is not None) else 0.0))
+        payload.append((
+            lat,
+            lon,
+            it.get("source") or "geo",
+            it.get("updated_at") or now_str,
+            it.get("status") or ("ok" if lat is not None and lon is not None else "missing"),
+            grid,
+            conf,
+            it.get("issue") or "",
+            it["telecode"],
+        ))
+    with _write_lock, tx(bump=True) as conn:
+        conn.executemany(
+            """UPDATE stations
+               SET lat=?, lon=?, coord_source=?, coord_updated_at=?, coord_status=?,
+                   coord_grid=?, coord_confidence=?, coord_issue=?
+               WHERE telecode=?""",
+            payload,
+        )
+    return len(payload)
+
+
+def batch_update_station_rail_proximity(items: list[dict]) -> int:
+    """批量写入火车站最近重轨距离、接驳方式、圈群及大站标记。"""
+    if not items:
+        return 0
+    payload = []
+    for it in items:
+        dist_m = it.get("nearest_rail_stop_distance_m")
+        d_val = None if dist_m is None else max(0, int(dist_m))
+        mode_val = it.get("rail_access_mode") or rail_access_mode_for(d_val)
+        payload.append((
+            it.get("transit_zone_id") or "",
+            d_val,
+            mode_val,
+            1 if it.get("is_major_hub") else 0,
+            it["telecode"],
+        ))
+    with _write_lock, tx(bump=True) as conn:
+        conn.executemany(
+            """UPDATE stations
+               SET transit_zone_id=?, nearest_rail_stop_distance_m=?, rail_access_mode=?, is_major_hub=?
+               WHERE telecode=?""",
+            payload,
+        )
+    return len(payload)
+
+
+def batch_upsert_rail_stops(stops: list[dict]) -> int:
+    """批量写入 43 城重轨站点（地铁/轻轨/重轨市域/跨座单轨，排除有轨电车）。"""
+    if not stops:
+        return 0
+    payload = []
+    for s in stops:
+        lat, lon = float(s["lat"]), float(s["lon"])
+        mode = s.get("mode") or "subway"
+        if mode not in ("subway", "light_rail", "suburban", "monorail"):
+            continue
+        payload.append((
+            str(s.get("name") or "").strip(),
+            str(s.get("city") or "").strip(),
+            str(s.get("transit_zone_id") or "").strip(),
+            mode,
+            round(lat, 6),
+            round(lon, 6),
+            s.get("grid_key") or grid_key_for(lat, lon),
+            str(s.get("source") or "overpass"),
+        ))
+    if not payload:
+        return 0
+    with _write_lock, tx(bump=True) as conn:
+        conn.executemany(
+            """INSERT OR IGNORE INTO rail_transit_stops(name, city, transit_zone_id, mode, lat, lon, grid_key, source)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            payload,
+        )
+    return len(payload)
+
+
+def list_rail_stops(city: str = "") -> list[dict]:
+    if city:
+        return rows("SELECT * FROM rail_transit_stops WHERE city=? ORDER BY name", (city,))
+    return rows("SELECT * FROM rail_transit_stops")
+
+
+def list_transfer_groups() -> list[dict]:
+    groups = rows(
+        "SELECT id, name, default_extra_min, note, enabled_by_default, connect_mode, hub_telecode, created_at "
+        "FROM transfer_groups ORDER BY id ASC"
+    )
+    if not groups:
+        return []
+    mem_rows = rows(
+        """SELECT m.group_id, m.telecode, s.name, s.city, s.lat, s.lon, s.coord_status
+           FROM transfer_group_members m
+           LEFT JOIN stations s ON s.telecode = m.telecode
+           ORDER BY s.name, m.telecode"""
+    )
+    by_gid: dict[int, list[dict]] = {}
+    for mr in mem_rows:
+        by_gid.setdefault(mr["group_id"], []).append({
+            "telecode": mr["telecode"],
+            "name": mr["name"] or mr["telecode"],
+            "city": mr["city"] or "",
+            "has_coord": mr["lat"] is not None and mr["lon"] is not None,
+            "coord_status": mr["coord_status"] or "missing",
+        })
+    for g in groups:
+        g["enabled_by_default"] = bool(g["enabled_by_default"])
+        g["connect_mode"] = g.get("connect_mode") or "full_mesh"
+        g["hub_telecode"] = g.get("hub_telecode") or ""
+        g["members"] = by_gid.get(g["id"], [])
+    return groups
+
+
+def save_transfer_group(name: str, telecodes: list[str],
+                        default_extra_min: int | None = None,
+                        note: str = "", enabled_by_default: bool = True,
+                        connect_mode: str = "full_mesh",
+                        hub_telecode: str = "",
+                        group_id: int | None = None) -> dict:
+    clean_name = (name or "").strip()
+    if not clean_name:
+        raise ValueError("换乘组名称不能为空")
+    cm = (connect_mode or "full_mesh").strip()
+    if cm not in ("full_mesh", "hub_star"):
+        raise ValueError("connect_mode 必须为 full_mesh 或 hub_star")
+    uniq_tcs = list(dict.fromkeys(str(tc).strip().upper() for tc in telecodes if str(tc).strip()))
+    if len(uniq_tcs) < 2:
+        raise ValueError("换乘组至少需要包含 2 个车站")
+    if len(uniq_tcs) > MAX_TRANSFER_GROUP_MEMBERS:
+        raise ValueError(f"换乘组成员数不能超过 {MAX_TRANSFER_GROUP_MEMBERS} 个（防止全连接组合爆炸）")
+    if default_extra_min is not None:
+        ex_i = int(default_extra_min)
+        if cm == "full_mesh" and ex_i < MIN_TRANSFER_GROUP_EXTRA_MIN:
+            raise ValueError(f"全连通(full_mesh)换乘组加时不能低于 {MIN_TRANSFER_GROUP_EXTRA_MIN} 分钟")
+        if ex_i < 0 or ex_i > 360:
+            raise ValueError("换乘组 default_extra_min 必须在 0-360 分钟之间")
+        default_extra_min = ex_i
+    hub_tc = (hub_telecode or "").strip().upper()
+    if cm == "hub_star":
+        if not hub_tc or hub_tc not in uniq_tcs:
+            raise ValueError("枢纽星型(hub_star)模式必须指定组内的一个核心枢纽站(hub_telecode)")
+    else:
+        hub_tc = ""
+
+    ph = ",".join("?" * len(uniq_tcs))
+    known = {r["telecode"] for r in rows(f"SELECT telecode FROM stations WHERE telecode IN ({ph})", tuple(uniq_tcs))}
+    missing = [tc for tc in uniq_tcs if tc not in known]
+    if missing:
+        raise ValueError(f"换乘组包含未知车站电报码：{', '.join(missing)}")
+    now_str = cn_now().isoformat(timespec="seconds")
+    en_val = 1 if enabled_by_default else 0
+    with _write_lock, tx(bump=True) as conn:
+        if group_id is not None:
+            cur = conn.execute(
+                """UPDATE transfer_groups
+                   SET name=?, default_extra_min=?, note=?, enabled_by_default=?, connect_mode=?, hub_telecode=?
+                   WHERE id=?""",
+                (clean_name, default_extra_min, (note or "").strip(), en_val, cm, hub_tc, group_id),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"换乘组 #{group_id} 不存在")
+            gid = group_id
+            conn.execute("DELETE FROM transfer_group_members WHERE group_id=?", (gid,))
+        else:
+            existing = conn.execute("SELECT id FROM transfer_groups WHERE name=?", (clean_name,)).fetchone()
+            if existing:
+                gid = existing[0]
+                conn.execute(
+                    """UPDATE transfer_groups
+                       SET default_extra_min=?, note=?, enabled_by_default=?, connect_mode=?, hub_telecode=?
+                       WHERE id=?""",
+                    (default_extra_min, (note or "").strip(), en_val, cm, hub_tc, gid),
+                )
+                conn.execute("DELETE FROM transfer_group_members WHERE group_id=?", (gid,))
+            else:
+                cur = conn.execute(
+                    """INSERT INTO transfer_groups(name, default_extra_min, note, enabled_by_default, connect_mode, hub_telecode, created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (clean_name, default_extra_min, (note or "").strip(), en_val, cm, hub_tc, now_str),
+                )
+                gid = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO transfer_group_members(group_id, telecode) VALUES(?,?)",
+            [(gid, tc) for tc in uniq_tcs],
+        )
+    return next(g for g in list_transfer_groups() if g["id"] == gid)
+
+
+def delete_transfer_group(group_id: int) -> bool:
+    with _write_lock, tx(bump=True) as conn:
+        cur = conn.execute("DELETE FROM transfer_groups WHERE id=?", (group_id,))
+        return cur.rowcount > 0
+
+
+def list_transfer_pair_overrides() -> list[dict]:
+    return rows(
+        """SELECT p.id, p.a_telecode, sa.name AS a_name, sa.city AS a_city,
+                  p.b_telecode, sb.name AS b_name, sb.city AS b_city,
+                  p.mode, p.custom_extra_min, p.note, p.created_at, p.updated_at
+           FROM transfer_pair_overrides p
+           LEFT JOIN stations sa ON sa.telecode = p.a_telecode
+           LEFT JOIN stations sb ON sb.telecode = p.b_telecode
+           ORDER BY p.id DESC"""
+    )
+
+
+def save_transfer_pair_override(tc1: str, tc2: str, mode: str,
+                                custom_extra_min: int | None = None,
+                                note: str = "") -> dict:
+    t1 = (tc1 or "").strip().upper()
+    t2 = (tc2 or "").strip().upper()
+    if not t1 or not t2 or t1 == t2:
+        raise ValueError("站对必须包含两个不同的有效车站")
+    if mode not in ("allow", "block"):
+        raise ValueError("站对规则类型必须为 allow 或 block")
+    ex_min = None
+    if mode == "allow" and custom_extra_min is not None:
+        ex_i = int(custom_extra_min)
+        if ex_i < 0 or ex_i > 360:
+            raise ValueError("站对自定义加时必须在 0-360 分钟之间")
+        ex_min = ex_i
+    known = {r["telecode"] for r in rows("SELECT telecode FROM stations WHERE telecode IN (?,?)", (t1, t2))}
+    if t1 not in known or t2 not in known:
+        raise ValueError(f"存在未知车站电报码：{t1}, {t2}")
+    a_tc, b_tc = (t1, t2) if t1 <= t2 else (t2, t1)
+    now_str = cn_now().isoformat(timespec="seconds")
+    with _write_lock, tx(bump=True) as conn:
+        conn.execute(
+            """INSERT INTO transfer_pair_overrides(a_telecode, b_telecode, mode, custom_extra_min, note, created_at, updated_at)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(a_telecode, b_telecode) DO UPDATE SET
+                 mode=excluded.mode, custom_extra_min=excluded.custom_extra_min,
+                 note=excluded.note, updated_at=excluded.updated_at""",
+            (a_tc, b_tc, mode, ex_min, (note or "").strip(), now_str, now_str),
+        )
+    return next(
+        p for p in list_transfer_pair_overrides()
+        if p["a_telecode"] == a_tc and p["b_telecode"] == b_tc
+    )
+
+
+def delete_transfer_pair_override(pair_id: int) -> bool:
+    with _write_lock, tx(bump=True) as conn:
+        cur = conn.execute("DELETE FROM transfer_pair_overrides WHERE id=?", (pair_id,))
+        return cur.rowcount > 0

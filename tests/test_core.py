@@ -210,11 +210,15 @@ class TestTransferFixes(TempDBTestCase):
                 ],
             )
 
-        res_default = transfer.search("甲市", "乙市", "2026-11-20", min_wait=30, max_wait=360, expand_city=True)
+        with db.tx() as conn:
+            conn.execute("UPDATE stations SET lat=31.20, lon=121.40, coord_status='verified' WHERE telecode='M01'")
+            conn.execute("UPDATE stations SET lat=31.28, lon=121.40, coord_status='verified' WHERE telecode='M02'")
+
+        res_default = transfer.search("甲市", "乙市", "2026-11-20", min_wait=30, max_wait=360, expand_city=True, cross_time_mode="fixed")
         # 默认 cross_extra=60，45 分钟异站换乘不满足 30+60=90
         self.assertEqual(len(res_default["transfers"]), 0)
 
-        res_relaxed = transfer.search("甲市", "乙市", "2026-11-20", min_wait=30, max_wait=360, expand_city=True, cross_extra=10)
+        res_relaxed = transfer.search("甲市", "乙市", "2026-11-20", min_wait=30, max_wait=360, expand_city=True, cross_extra=10, cross_time_mode="fixed")
         # 应能枚举出 甲东/甲西 × 乙南/乙北（不止 [0]）
         combos = {(p["legs"][0]["from"], p["legs"][1]["to"]) for p in res_relaxed["transfers"]}
         self.assertIn(("甲西", "乙北"), combos)
@@ -1210,6 +1214,9 @@ class TestAuditFixesAndIncludeModes(TempDBTestCase):
             ("DST", "终点站", "zd", "zd", "终点市"),
         ])
         with db.tx() as conn:
+            conn.execute("UPDATE stations SET lat=26.113, lon=119.320, coord_status='verified' WHERE telecode='FZS'")
+            conn.execute("UPDATE stations SET lat=26.000, lon=119.390, coord_status='verified' WHERE telecode='FYS'")
+        with db.tx() as conn:
             conn.executemany(
                 "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
                 [
@@ -1835,8 +1842,499 @@ class TestNationwideTimetablesAndTicketsAPI(TempDBTestCase):
         self.assertIn("from_city_mode:fcm,to_city_mode:tcm", html_text)
 
 
+class TestSchemeCv2(TempDBTestCase):
+    def _seed_station(self, tc: str, name: str, city: str, *, lat=None, lon=None,
+                      status: str = "missing", zone: str = "", rdist=None,
+                      rmode: str | None = None, hub: int = 0, src: str = "manual"):
+        with db.tx() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO stations(telecode,name,city,pinyin,short) VALUES(?,?,?,?,?)",
+                (tc, name, city, tc.lower(), tc.lower()),
+            )
+        if lat is not None and lon is not None:
+            db.update_station_coords(
+                tc, lat, lon, source=src, status=status, confidence=0.95,
+                transit_zone_id=zone if zone else None,
+                nearest_rail_stop_distance_m=rdist if rdist is not None else -1,
+                rail_access_mode=rmode,
+                is_major_hub=bool(hub),
+            )
+
+    def _add_service(self, train_no: str, code: str, stops: list[tuple[str, str, str, str]]):
+        """stops: [(telecode, name, arr, dep), ...]"""
+        with db.tx() as conn:
+            for idx, (tc, nm, arr, dep) in enumerate(stops, 1):
+                conn.execute(
+                    """INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,
+                                               station_name,telecode,arrive_time,start_time,enabled)
+                       VALUES(?,?,?,?,?,?,?,?,1)""",
+                    (train_no, code, "2026-11-21", idx, nm, tc, arr, dep),
+                )
+
+    def test_five_locked_benchmark_pairs(self):
+        from app import geo
+
+        # 1) 上海虹桥 — 上海南 (~10.5km, SH_KS, 双端 walk, 虹桥枢纽 +5)
+        self._seed_station("AOH", "上海虹桥", "上海", lat=31.1942, lon=121.3189, status="verified", zone="SH_KS", rdist=180, hub=1)
+        self._seed_station("SNH", "上海南", "上海", lat=31.1544, lon=121.4293, status="verified", zone="SH_KS", rdist=150, hub=1)
+        # 2) 深圳北 — 深圳 (~11.9km, 深圳, 双端 walk)
+        self._seed_station("IOQ", "深圳北", "深圳", lat=22.6097, lon=114.0294, status="verified", zone="深圳", rdist=120, hub=1)
+        self._seed_station("SZQ", "深圳", "深圳", lat=22.5326, lon=114.1173, status="verified", zone="深圳", rdist=160, hub=1)
+        # 3) 昆山南 — 安亭北 (~19.8km, 同属 SH_KS 圈群，但双端距11号线>1500m，不触发减时)
+        self._seed_station("KNH", "昆山南", "苏州", lat=31.3529, lon=120.9539, status="verified", zone="SH_KS", rdist=3400, hub=0)
+        self._seed_station("ASH", "安亭北", "上海", lat=31.3064, lon=121.1544, status="verified", zone="SH_KS", rdist=2400, hub=0)
+        # 4) 廊坊 — 北京南 (~50km, 京津排除跨市城轨减时 + 廊坊无重轨邻近)
+        self._seed_station("LJP", "廊坊", "廊坊", lat=39.5094, lon=116.7042, status="verified", zone="廊坊", rdist=None, hub=0)
+        self._seed_station("VNP", "北京南", "北京", lat=39.8651, lon=116.3789, status="verified", zone="北京", rdist=140, hub=1)
+        # 5) 万州北 — 重庆北 (~245km, 同写重庆市但物理相距遥远)
+        self._seed_station("WZB", "万州北", "重庆", lat=30.8586, lon=108.3992, status="verified", zone="万州", rdist=None, hub=0)
+        self._seed_station("CUW", "重庆北", "重庆", lat=29.6095, lon=106.5495, status="verified", zone="重庆", rdist=150, hub=1)
+
+        st_rows = db.rows("SELECT * FROM stations")
+        idx = geo.StationGeoIndex(st_rows, [], [], geo.load_transit_cities())
+        cfg20 = geo.resolve_cross_cfg(cross_radius_km=20.0, fallback_ungeocoded=False, geo_index=idx)
+
+        # Case 1: 上海虹桥 — 上海南
+        e1 = geo.eval_cross_pair("AOH", "SNH", idx, cfg20)
+        self.assertIsNotNone(e1)
+        self.assertEqual(e1["source_rule"], "radius")
+        self.assertEqual(e1["rail_access_mode"], "walk")
+        self.assertEqual(e1["hub_extra"], 5)
+        self.assertEqual(e1["transit_discount"], 15)
+        self.assertEqual(e1["base_extra"] + e1["hub_extra"] - e1["transit_discount"], e1["effective_extra"])
+        self.assertGreaterEqual(e1["effective_extra"], 20)
+        self.assertIn("估算", e1["transit_reason"])
+
+        # Case 2: 深圳北 — 深圳
+        e2 = geo.eval_cross_pair("IOQ", "SZQ", idx, cfg20)
+        self.assertIsNotNone(e2)
+        self.assertEqual(e2["source_rule"], "radius")
+        self.assertEqual(e2["rail_access_mode"], "walk")
+        self.assertEqual(e2["transit_discount"], 15)
+        self.assertGreaterEqual(e2["effective_extra"], 20)
+
+        # Case 3: 昆山南 — 安亭北（反向邻近度拒绝测试）
+        e3 = geo.eval_cross_pair("KNH", "ASH", idx, cfg20)
+        self.assertIsNotNone(e3)
+        self.assertEqual(e3["source_rule"], "radius")
+        self.assertEqual(e3["rail_access_mode"], "long_bus_or_taxi")
+        self.assertEqual(e3["transit_discount"], 0)
+        self.assertEqual(e3["effective_extra"], e3["base_extra"])
+        self.assertIn("邻近度不满足", e3["transit_reason"])
+
+        # Case 4: 廊坊 — 北京南（R=60km 下连通，但京津不享跨市城轨减时）
+        cfg60 = geo.resolve_cross_cfg(cross_radius_km=60.0, fallback_ungeocoded=False, geo_index=idx)
+        e4 = geo.eval_cross_pair("LJP", "VNP", idx, cfg60)
+        self.assertIsNotNone(e4)
+        self.assertEqual(e4["source_rule"], "radius")
+        self.assertEqual(e4["transit_discount"], 0)
+        self.assertEqual(e4["effective_extra"], e4["base_extra"] + e4["hub_extra"])
+
+        # Case 5: 万州北 — 重庆北（默认 fallback=False 且 R=100km 下绝不误连）
+        cfg100 = geo.resolve_cross_cfg(cross_radius_km=100.0, fallback_ungeocoded=False, geo_index=idx)
+        self.assertIsNone(geo.eval_cross_pair("WZB", "CUW", idx, cfg100))
+
+        # 并验证万州北→重庆北仍可通过万州北→达州→重庆北（同站铁路换乘）联通而不产生 fallback 边
+        self._seed_station("DZW", "达州", "达州", lat=31.2100, lon=107.4700, status="verified")
+        self._add_service("T_WD", "G101", [("WZB", "万州北", "08:00", "08:00"), ("DZW", "达州", "08:40", "08:45")])
+        self._add_service("T_DC", "G102", [("DZW", "达州", "09:30", "09:30"), ("CUW", "重庆北", "10:40", "10:40")])
+        res = transfer.search("万州北", "重庆北", "2026-11-21", cross_radius_km=20.0, fallback_ungeocoded=False)
+        self.assertTrue(any(p["transfers"][0]["same"] for p in res["transfers"]))
+        self.assertFalse(any(tr.get("is_fallback") for p in res["transfers"] for tr in p["transfers"]))
+
+    def test_monotonicity_and_arithmetic_identity(self):
+        from app import geo
+
+        for hub in (0, 5):
+            prev = -1
+            for step in range(1, 2001):
+                d = step * 0.05  # 0.05..100.0 km
+                c = geo.compute_smart_extra(d, hub_extra=hub, raw_discount_cap=15)
+                self.assertGreaterEqual(c["effective_extra"], prev, f"非单调 d={d}, hub={hub}")
+                self.assertGreaterEqual(c["effective_extra"], geo.MIN_SAFE_CROSS_EXTRA)
+                self.assertEqual(
+                    c["base_extra"] + c["hub_extra"] - c["transit_discount"],
+                    c["effective_extra"],
+                    f"账本等式破坏 d={d}: {c}",
+                )
+                prev = c["effective_extra"]
+
+        # 验证半开分档边界连续且无倒挂 (2.9km vs 3.1km with discount cap 15)
+        v29 = geo.compute_smart_extra(2.9, hub_extra=0, raw_discount_cap=15)
+        v31 = geo.compute_smart_extra(3.1, hub_extra=0, raw_discount_cap=15)
+        self.assertGreaterEqual(v31["effective_extra"], v29["effective_extra"])
+
+    def test_five_tier_precedence_groups_and_validation(self):
+        from app import geo, main as main_mod
+
+        # 两站相距 ~8km，均步行直连地铁且同城（radius 本应给减时）
+        self._seed_station("STA", "甲站", "测试市", lat=31.200, lon=121.400, status="verified", zone="测试市", rdist=100)
+        self._seed_station("STB", "乙站", "测试市", lat=31.270, lon=121.400, status="verified", zone="测试市", rdist=100)
+        self._seed_station("STC", "丙站", "测试市", lat=31.250, lon=121.460, status="verified", zone="测试市", rdist=100)
+        self._seed_station("STD", "丁站", "测试市", lat=None, lon=None, status="missing")
+
+        # 组约束检验：>30 失败；full_mesh < 5 失败；hub_star 无组内枢纽失败
+        too_many = [f"X{i:02d}" for i in range(31)]
+        for tc in too_many:
+            self._seed_station(tc, f"站{tc}", "测城")
+        with self.assertRaises(ValueError):
+            db.save_transfer_group("超大组", too_many, default_extra_min=30, connect_mode="full_mesh")
+        with self.assertRaises(ValueError):
+            db.save_transfer_group("太短组", ["STA", "STB"], default_extra_min=4, connect_mode="full_mesh")
+        with self.assertRaises(ValueError):
+            db.save_transfer_group("缺枢纽", ["STA", "STB", "STC"], default_extra_min=20, connect_mode="hub_star", hub_telecode="STD")
+
+        # 有效 hub_star 组：核心 STA 连通 STB/STC，但 STB-STC 不直接组连接
+        grp = db.save_transfer_group("星型组", ["STA", "STB", "STC"], default_extra_min=38, connect_mode="hub_star", hub_telecode="STA")
+        gid = grp["id"]
+
+        # 未加 pair override 时，STA-STB 命中 group(38)，不叠加城轨减时
+        idx = geo.StationGeoIndex(db.rows("SELECT * FROM stations"), db.list_transfer_groups(), db.list_transfer_pair_overrides(), geo.load_transit_cities())
+        cfg = geo.resolve_cross_cfg(cross_radius_km=20.0, active_group_ids=[gid], fallback_ungeocoded=True, geo_index=idx)
+        eg = geo.eval_cross_pair("STA", "STB", idx, cfg)
+        self.assertEqual(eg["source_rule"], "group")
+        self.assertEqual(eg["effective_extra"], 38)
+        self.assertEqual(eg["transit_discount"], 0)
+        # STB-STC 在 R=0 下因 hub_star 不互相连通
+        cfg_r0 = geo.resolve_cross_cfg(cross_radius_km=0.0, active_group_ids=[gid], fallback_ungeocoded=False, geo_index=idx)
+        self.assertIsNone(geo.eval_cross_pair("STB", "STC", idx, cfg_r0))
+
+        # Allow override (0m) 压过 group，不叠加减时
+        p_allow = db.save_transfer_pair_override("STA", "STB", "allow", custom_extra_min=0, note="地下同厅极速")
+        idx2 = geo.StationGeoIndex(db.rows("SELECT * FROM stations"), db.list_transfer_groups(), db.list_transfer_pair_overrides(), geo.load_transit_cities())
+        eo = geo.eval_cross_pair("STA", "STB", idx2, cfg)
+        self.assertEqual(eo["source_rule"], "override")
+        self.assertEqual(eo["effective_extra"], 0)
+        self.assertEqual(eo["transit_discount"], 0)
+        self.assertTrue(idx2.has_zero_override)
+
+        # Block override 压过一切（含 allow/group/radius/fallback）
+        db.save_transfer_pair_override("STA", "STB", "block", note="施工禁换")
+        idx3 = geo.StationGeoIndex(db.rows("SELECT * FROM stations"), db.list_transfer_groups(), db.list_transfer_pair_overrides(), geo.load_transit_cities())
+        self.assertIsNone(geo.eval_cross_pair("STA", "STB", idx3, cfg))
+        db.delete_transfer_pair_override(p_allow["id"])
+
+        # Fallback tier (90m) 仅在缺失坐标且同城且 fallback_ungeocoded=True 时生效
+        ef = geo.eval_cross_pair("STA", "STD", idx, cfg)
+        self.assertEqual(ef["source_rule"], "fallback")
+        self.assertEqual(ef["effective_extra"], 90)
+        self.assertTrue(ef["is_fallback"])
+        cfg_nofb = geo.resolve_cross_cfg(cross_radius_km=20.0, active_group_ids=[], fallback_ungeocoded=False, geo_index=idx)
+        self.assertIsNone(geo.eval_cross_pair("STA", "STD", idx, cfg_nofb))
+
+        # HTTP 校验：R=0 且 fallback_ungeocoded=True 返回 400
+        with self.assertRaises(main_mod.HTTPException) as ctx1:
+            main_mod.transfers("STA", "STB", "2026-11-21", cross_radius_km=0.0, fallback_ungeocoded=True)
+        self.assertEqual(ctx1.exception.status_code, 400)
+        with self.assertRaises(main_mod.HTTPException) as ctx2:
+            main_mod.start_transfers(main_mod.TransferSearchReq(
+                from_station="STA", to_station="STB", date="2026-11-21", cross_radius_km=0.0, fallback_ungeocoded=True
+            ))
+        self.assertEqual(ctx2.exception.status_code, 400)
+
+    def test_high_low_latitude_grid_accuracy_and_top25_truncation(self):
+        from app import geo
+
+        # 高纬度 (50°N) 与低纬度 (20°N) 集群，检验格网邻域绝不漏查边界点
+        anchors = [("HI0", 50.1, 127.5, "黑河"), ("LO0", 20.02, 110.35, "海口")]
+        for tc, lat, lon, ct in anchors:
+            self._seed_station(tc, f"中心{tc}", ct, lat=lat, lon=lon, status="verified")
+        pts = [
+            # 50°N 周向不同方位 8km..98km 点
+            ("HI1", 50.1, 127.62, "黑河"),
+            ("HI2", 50.1, 128.85, "黑河"),  # ~96km
+            ("HI3", 50.95, 127.5, "黑河"),  # ~94.5km
+            ("HI4", 50.70, 128.60, "黑河"),
+            # 20°N
+            ("LO1", 20.02, 110.50, "海口"),
+            ("LO2", 20.85, 110.35, "海口"),  # ~92km
+            ("LO3", 20.60, 111.05, "海口"),  # ~97km
+        ]
+        for tc, lat, lon, ct in pts:
+            self._seed_station(tc, f"站{tc}", ct, lat=lat, lon=lon, status="verified")
+
+        st_rows = db.rows("SELECT * FROM stations")
+        idx = geo.StationGeoIndex(st_rows, [], [], geo.load_transit_cities())
+        for R in (10.0, 20.0, 50.0, 100.0):
+            for center_tc, c_lat, c_lon, _ in anchors:
+                expected = sorted(
+                    r["telecode"]
+                    for r in st_rows
+                    if r["telecode"] != center_tc and geo.haversine_km(c_lat, c_lon, r["lat"], r["lon"]) <= R
+                )
+                got = sorted(nb for nb, d in idx.max_neighbors.get(center_tc, ()) if d <= R)
+                self.assertEqual(got, expected, f"纬度格网漏检 center={center_tc}, R={R}")
+
+        # 单站物理邻域 > 25 时触发 Top-25 截断与 radius_truncated 标志
+        for i in range(28):
+            tc = f"N{i:02d}"
+            self._seed_station(tc, f"密集{i}", "密城", lat=31.20 + i * 0.004, lon=121.40 + (i % 3) * 0.003, status="verified")
+        idx_dense = geo.StationGeoIndex(db.rows("SELECT * FROM stations"), [], [], geo.load_transit_cities())
+        avail = {r["telecode"] for r in db.rows("SELECT telecode FROM stations")}
+        cities = ({}, {}, {r["telecode"]: r["telecode"] for r in db.rows("SELECT telecode FROM stations")})
+        cfg = geo.resolve_cross_cfg(cross_radius_km=25.0, geo_index=idx_dense)
+        trunc = [False]
+        cands = geo.cross_candidates("N00", "密集0", avail, cities, idx_dense, cfg, truncation_out=trunc)
+        self.assertTrue(trunc[0])
+        # same(1) + Top-25 radius = 26
+        self.assertEqual(len(cands), 26)
+
+    def test_random_cyclic_graph_multi_leg_parity_and_city_loop(self):
+        from app import geo
+
+        # 1) 真实跨市接驳与绕城检测：昆山南→安亭北→上海、廊坊→北京南→上海、咸阳→西安→北京
+        self._seed_station("KNH", "昆山南", "苏州", lat=31.3529, lon=120.9539, status="verified", zone="SH_KS", rdist=3400)
+        self._seed_station("ASH", "安亭北", "上海", lat=31.3064, lon=121.1544, status="verified", zone="SH_KS", rdist=2400)
+        self._seed_station("SNQ", "上海西", "上海", lat=31.263, lon=121.401, status="verified")
+        self._seed_station("SHH", "上海", "上海", lat=31.249, lon=121.455, status="verified")
+        self._seed_station("LJP", "廊坊", "廊坊", lat=39.5094, lon=116.7042, status="verified")
+        self._seed_station("VNP", "北京南", "北京", lat=39.8651, lon=116.3789, status="verified", rdist=140)
+        self._seed_station("BXP", "北京西", "北京", lat=39.8949, lon=116.3212, status="verified")
+        self._seed_station("SZP", "苏州", "苏州", lat=31.33, lon=120.61, status="verified")
+        self._seed_station("XAY", "咸阳", "咸阳", lat=34.33, lon=108.70, status="verified", zone="XA_XY", rdist=300)
+        self._seed_station("XAYN", "西安", "西安", lat=34.277, lon=108.963, status="verified", zone="XA_XY", rdist=250)
+        self._seed_station("BJP", "北京", "北京", lat=39.902, lon=116.427, status="verified")
+        self._seed_station("CDW", "成都", "成都", lat=30.69, lon=104.07, status="verified")
+
+        # 合法跨市：昆山南 -> (安亭北跨站) -> 上海西 -> 上海
+        self._add_service("TK1", "G701", [("SZP", "苏州", "08:00", "08:00"), ("KNH", "昆山南", "08:15", "08:17")])
+        self._add_service("TK2", "G702", [("ASH", "安亭北", "09:55", "09:55"), ("SNQ", "上海西", "10:12", "10:14"), ("SHH", "上海", "10:25", "10:25")])
+        r_ka = transfer.search("苏州", "上海", "2026-11-21", from_city_mode="single", to_city_mode="single", cross_radius_km=20.0)
+        self.assertTrue(any(p["legs"][0]["to"] == "昆山南" and p["legs"][1]["from"] == "安亭北" for p in r_ka["transfers"]))
+
+        # 廊坊 -> 北京南 -> 上海
+        self._add_service("TL1", "G801", [("LJP", "廊坊", "07:00", "07:00"), ("BXP", "北京西", "07:25", "07:25")])
+        self._add_service("TL2", "G802", [("VNP", "北京南", "09:30", "09:30"), ("SHH", "上海", "14:00", "14:00")])
+        r_lb = transfer.search("廊坊", "上海", "2026-11-21", from_city_mode="single", to_city_mode="single", cross_radius_km=20.0)
+        self.assertTrue(any(p["legs"][0]["to"] == "北京西" and p["legs"][1]["from"] == "北京南" for p in r_lb["transfers"]))
+
+        # 咸阳 -> 西安 -> 北京
+        self._add_service("TX1", "C901", [("XAY", "咸阳", "08:00", "08:00"), ("CDW", "成都", "12:00", "12:00")])
+        self._add_service("TX2", "G902", [("XAYN", "西安", "09:30", "09:30"), ("BJP", "北京", "14:30", "14:30")])
+        # 咸阳 -> 成都 车次不该连上，造 咸阳 -> 西安南(同城) 或 咸阳(上)直接西安跨站：建 宝鸡->咸阳 & 西安->北京
+        self._seed_station("BJY", "宝鸡", "宝鸡", lat=34.36, lon=107.14, status="verified")
+        self._add_service("TX0", "K900", [("BJY", "宝鸡", "06:30", "06:30"), ("XAY", "咸阳", "07:50", "07:50")])
+        r_xx = transfer.search("宝鸡", "北京", "2026-11-21", from_city_mode="single", to_city_mode="single", cross_radius_km=30.0)
+        self.assertTrue(any(p["legs"][0]["to"] == "咸阳" and p["legs"][1]["from"] == "西安" for p in r_xx["transfers"]))
+
+        # 2) 随机有环小图暴力 DFS vs 3-4程无界 BFS 一致性校验（含 0m 覆盖、换乘组与跨市边，严防误剪枝漏解）
+        nodes = [
+            ("G_S", "起点站", "城1", 31.00, 121.00),
+            ("G_A", "中转A", "城2", 31.05, 121.00),
+            ("G_B", "中转B", "城3", 31.08, 121.02),
+            ("G_C", "中转C", "城2", 31.12, 121.05),
+            ("G_D", "中转D", "城4", 31.18, 121.10),
+            ("G_T", "终点站", "城5", 31.40, 121.40),
+        ]
+        for tc, nm, ct, lt, ln in nodes:
+            self._seed_station(tc, nm, ct, lat=lt, lon=ln, status="verified")
+        # 注入 0 分钟 override 与换乘组，检验 min_lb 不高估
+        db.save_transfer_pair_override("G_A", "G_B", "allow", custom_extra_min=0)
+        grp = db.save_transfer_group("小图组", ["G_B", "G_C"], default_extra_min=15, connect_mode="full_mesh")
+        # 构建有环服务（时刻单调、允许跨日）
+        services = [
+            ("MV1", "M1", [("G_S", "起点站", "08:00", "08:00"), ("G_A", "中转A", "08:30", "08:35"), ("G_C", "中转C", "08:50", "08:50")]),
+            ("MV2", "M2", [("G_B", "中转B", "09:05", "09:05"), ("G_C", "中转C", "09:20", "09:25"), ("G_D", "中转D", "09:50", "09:50")]),
+            ("MV3", "M3", [("G_C", "中转C", "10:15", "10:15"), ("G_D", "中转D", "10:40", "10:45"), ("G_T", "终点站", "11:30", "11:30")]),
+            ("MV4", "M4", [("G_D", "中转D", "11:20", "11:20"), ("G_T", "终点站", "12:00", "12:00")]),
+            ("MV5", "M5", [("G_C", "中转C", "11:10", "11:10"), ("G_A", "中转A", "11:30", "11:30")]),  # 反向制造环
+        ]
+        for tn, code, stps in services:
+            self._add_service(tn, code, stps)
+
+        # 用 transfer.search (unbounded, max_legs=4, max_total_min=2000) 搜索
+        bfs_res = transfer.search(
+            "起点站", "终点站", "2026-11-21",
+            from_city_mode="single", to_city_mode="single",
+            max_legs=4, min_wait=30, max_wait=180,
+            cross_radius_km=12.0, active_group_ids=[grp["id"]],
+            prune_level="unbounded", max_total_min=240,
+        )
+        # 紧 max_total_min=240 恰好测试 0m override 下 min_lb 不可误杀 3/4程紧致方案 (08:00 -> 11:30 = 210m, 08:00 -> 12:00 = 240m)
+        self.assertTrue(bfs_res["zero_override_active"])
+        combos = {tuple(l["train_no"] for l in p["legs"]) for p in bfs_res["transfers"]}
+        # G_S --(MV1)--> G_A --(0m override, wait=35m>=30)--> G_B --(MV2)--> G_D --(MV4)--> G_T = 240m!
+        self.assertIn(("MV1", "MV2", "MV4"), combos)
+        # G_S --(MV1)--> G_A --(0m override)--> G_B --(MV2)--> G_C --(MV3)--> G_T = 210m!
+        self.assertIn(("MV1", "MV2", "MV3"), combos)
+
+    def test_scale_latency_crawler_audit_endpoints_and_ui(self):
+        import time
+        from app import geo, main as main_mod
+
+        # 1) 3,400 站合成空间索引构造与单站 R=20/50/100 检索耗时验证
+        st_synth = [
+            {
+                "telecode": f"S{i:04d}",
+                "name": f"测试站{i}",
+                "city": f"市{i // 10}",
+                "lat": 20.0 + (i % 60) * 0.5,
+                "lon": 100.0 + (i // 60) * 0.5,
+                "coord_status": "ok",
+                "coord_confidence": 0.9,
+                "transit_zone_id": "",
+                "nearest_rail_stop_distance_m": None,
+                "rail_access_mode": "none",
+                "is_major_hub": 0,
+            }
+            for i in range(3400)
+        ]
+        t0 = time.monotonic()
+        idx_big = geo.StationGeoIndex(st_synth, [], [], geo.load_transit_cities())
+        build_s = time.monotonic() - t0
+        self.assertLess(build_s, 10.0)
+        avail = {s["telecode"] for s in st_synth}
+        cities = ({}, {}, {})
+        t1 = time.monotonic()
+        for rkm in (20.0, 50.0, 100.0):
+            geo.cross_candidates("S0500", "测试站500", avail, cities, idx_big, geo.resolve_cross_cfg(cross_radius_km=rkm, geo_index=idx_big))
+        self.assertLess(time.monotonic() - t1, 0.5)
+
+        # 2) 合规抓取管道试跑(trial_tiles=3)、断点续跑(不重复抓取)及 Nominatim 手工 1.5s 限频
+        self._seed_station("VNP", "北京南", "北京")
+        self._seed_station("SHH", "上海", "上海")
+        self._seed_station("BAD", "飞站", "北京")
+        state_file = Path(self._tmp.name) / "geo_state.json"
+
+        overpass_calls = []
+        wikidata_calls = []
+
+        def fake_http(url, *, params=None, data=None, headers=None, timeout=60):
+            if "overpass" in url:
+                overpass_calls.append(url)
+                payload = {
+                    "elements": [
+                        {"type": "node", "lat": 39.865, "lon": 116.379, "tags": {"railway": "station", "ref:railway:telecode": "VNP", "name": "北京南站"}},
+                        {"type": "node", "lat": 39.864, "lon": 116.378, "tags": {"railway": "station", "station": "subway", "name": "北京南站地铁", "addr:city": "北京"}},
+                        # 有轨电车严格剔除
+                        {"type": "node", "lat": 39.900, "lon": 116.400, "tags": {"railway": "tram_stop", "station": "tram", "name": "前门有轨"}},
+                    ]
+                }
+                return json.dumps(payload).encode("utf-8")
+            if "wikidata" in url:
+                wikidata_calls.append(url)
+                wd = {
+                    "results": {
+                        "bindings": [
+                            {"stationLabel": {"value": "上海站"}, "coord": {"value": "Point(121.455 31.249)"}},
+                        ]
+                    }
+                }
+                return json.dumps(wd).encode("utf-8")
+            if "nominatim" in url:
+                return json.dumps([{"class": "railway", "type": "station", "lat": "39.865", "lon": "116.379", "display_name": "北京南站"}]).encode("utf-8")
+            return b"{}"
+
+        logs = []
+        cr = geo.GeoCoordCrawler(state_path=state_file, http_fn=fake_http)
+        trial_res = cr.run(trial_tiles=3, overpass_delay=0.0, log_cb=logs.append)
+        self.assertEqual(trial_res["trial_tiles"], 3)
+        self.assertEqual(trial_res["trial_requests"], 3)
+        self.assertEqual(len(overpass_calls), 3)
+        self.assertEqual(len(wikidata_calls), 0)
+        self.assertTrue(any("试跑配额估算" in line for line in logs))
+        # 验证有轨电车未被入库
+        self.assertEqual(db.rows("SELECT COUNT(*) c FROM rail_transit_stops WHERE name='前门有轨'")[0]["c"], 0)
+        self.assertGreaterEqual(db.rows("SELECT COUNT(*) c FROM rail_transit_stops WHERE name='北京南站地铁'")[0]["c"], 1)
+
+        # 断点续跑全量：已完成的前 3 片不再重复请求 Overpass
+        full_res = cr.run(trial_tiles=None, overpass_delay=0.0)
+        self.assertEqual(len(overpass_calls), len(geo.CHINA_OVERPASS_TILES))
+        self.assertEqual(len(wikidata_calls), 1)
+        self.assertGreaterEqual(full_res["matched_wikidata"], 1)
+
+        # 手工 Nominatim 冷却检查
+        with mock.patch.object(geo, "_last_nom_ts", 0.0):
+            nom_ok = geo.manual_nominatim_lookup("VNP", http_fn=fake_http)
+            self.assertEqual(nom_ok["source"], "nominatim_manual")
+            with self.assertRaises(ValueError) as nom_err:
+                geo.manual_nominatim_lookup("SHH", http_fn=fake_http)
+            self.assertIn("礼貌间隔", str(nom_err.exception))
+
+        # 3) >420km/h 异常时速飞站检测 & China bbox / 同城离群隔离
+        self._seed_station("A_ST", "起点A", "某市", lat=31.20, lon=121.40, status="ok", src="overpass")
+        self._seed_station("B_ST", "正常B", "某市", lat=31.80, lon=121.40, status="ok", src="overpass")
+        # 飞到 1500km 外的错误坐标且仅用 10 分钟到达 -> >9000km/h
+        self._seed_station("BAD", "飞站", "北京", lat=23.10, lon=113.20, status="ok", src="overpass")
+        self._add_service("SPD1", "G555", [("A_ST", "起点A", "08:00", "08:00"), ("B_ST", "正常B", "08:30", "08:35"), ("BAD", "飞站", "08:45", "08:45")])
+        aud = geo.audit_station_coords()
+        self.assertGreaterEqual(aud["suspect"], 1)
+        bad_row = db.rows("SELECT coord_status, coord_issue FROM stations WHERE telecode='BAD'")[0]
+        self.assertEqual(bad_row["coord_status"], "suspect")
+        self.assertIn("speed_anomaly", bad_row["coord_issue"])
+        # suspect 站禁止进入 radius 索引
+        idx_aud = geo.StationGeoIndex(db.rows("SELECT * FROM stations"), [], [], geo.load_transit_cities())
+        self.assertNotIn("BAD", idx_aud.coords)
+
+        # 4) Fallback 量化统计 & auto_disable_recommended
+        imp = geo.fallback_impact_stats(idx_aud)
+        self.assertIn("fallback_removed_pairs", imp)
+        self.assertIn("auto_disable_recommended", imp)
+
+        # 5) 后端端点联调
+        st_api = main_mod.geo_status()
+        self.assertEqual(st_api["max_radius_km"], 100.0)
+        st_list = main_mod.geo_stations(status="suspect")
+        self.assertTrue(any(s["telecode"] == "BAD" for s in st_list["stations"]))
+        upd = main_mod.geo_update_station("BAD", main_mod.GeoStationReq(lat=39.90, lon=116.40, coord_status="verified"))
+        self.assertEqual(upd["station"]["coord_status"], "verified")
+        aud_api = main_mod.geo_audit()
+        self.assertIn("audit", aud_api)
+
+        g_api = main_mod.save_transfer_group_api(main_mod.TransferGroupReq(
+            name="HTTP测试组", members=["VNP", "SHH"], default_extra_min=45, connect_mode="full_mesh",
+        ))
+        self.assertEqual(g_api["group"]["name"], "HTTP测试组")
+        p_api = main_mod.save_transfer_pair_api(main_mod.TransferPairReq(
+            a_telecode="VNP", b_telecode="SHH", mode="allow", custom_extra_min=50, note="联调",
+        ))
+        self.assertEqual(p_api["pair"]["mode"], "allow")
+        pv_api = main_mod.preview_transfer_pair(a="VNP", b="SHH", cross_radius_km=20.0)
+        self.assertTrue(pv_api["connected"])
+        self.assertEqual(pv_api["eval"]["source_rule"], "override")
+        main_mod.delete_transfer_pair_api(p_api["pair"]["id"])
+        main_mod.delete_transfer_group_api(g_api["group"]["id"])
+
+        tc_res = main_mod.save_transit_city_api(main_mod.TransitCityReq(city="烟台", label="测试轻轨", enabled=True))
+        self.assertTrue(any(c["city"] == "烟台" for c in tc_res["cities"]))
+        tc_rst = main_mod.reset_transit_cities_api()
+        self.assertFalse(any(c["city"] == "烟台" for c in tc_rst["cities"]))
+
+        # 6) 旧库升级回归：模拟无 Scheme C 新增列的旧版 stations 表调用 init_db() 不崩溃
+        import sqlite3 as _sqlite3
+        leg_db = Path(self._tmp.name) / "legacy.db"
+        c_leg = _sqlite3.connect(leg_db)
+        c_leg.execute("CREATE TABLE stations(telecode TEXT PRIMARY KEY, name TEXT NOT NULL, pinyin TEXT, short TEXT, city TEXT)")
+        c_leg.execute("INSERT INTO stations VALUES('BJP','北京','beijing','bj','北京')")
+        c_leg.commit()
+        c_leg.close()
+        orig_p = db.DB_PATH
+        try:
+            db.close_conn()
+            db.DB_PATH = leg_db
+            db.init_db()
+            migrated_cols = {r["name"] for r in db.rows("PRAGMA table_info(stations)")}
+            for col in ("lat", "lon", "coord_status", "coord_grid", "transit_zone_id", "is_major_hub"):
+                self.assertIn(col, migrated_cols)
+        finally:
+            db.close_conn()
+            db.DB_PATH = orig_p
+
+        # 7) 前端静态接线完整性校验
+        html_text = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        for marker in (
+            'id="s-radius"', 'id="s-cross-mode"', 'id="s-transit-on"',
+            'id="s-fallback"', 'id="s-groups-box"', 'id="s-hide-fallback"',
+            'id="s-hide-suspect"', 'id="geo-card"', 'id="groups-card"',
+            'id="pairs-card"', 'id="transit-card"', 'transferLedgerHtml',
+            'id="s-cross-preview"',
+        ):
+            self.assertIn(marker, html_text, f"前端缺失控件: {marker}")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

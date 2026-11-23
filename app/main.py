@@ -126,7 +126,7 @@ except ImportError:
             self.mounts.append((path.rstrip("/"), app_obj))
 
 
-from . import db, importer, transfer
+from . import db, geo, importer, transfer
 from .crawler import CrawlCancelled, CrawlError, crawler, station_timetable_context
 
 app = FastAPI(title="12306 智能中转")
@@ -930,18 +930,54 @@ def clear_cache(before_date: str | None = None, include_raw: bool = False):
 
 
 # ---------- 换乘搜索 ----------
+def _parse_group_ids(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    if s.lower() in ("none", "-"):
+        return []
+    out: list[int] = []
+    for part in s.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            out.append(int(p))
+        except ValueError:
+            raise HTTPException(400, f"active_group_ids 格式不合法：“{p}”")
+    return out
+
+
 def _validate_search_params(date: str, max_legs: int, cross_extra: int,
                             frontier_k: int | None, prune_level: str,
                             max_total_min: int | None, detour_ratio: float | None,
                             include_stations_mode: str = "or",
                             city_mode: str | None = None,
                             from_city_mode: str | None = None,
-                            to_city_mode: str | None = None):
+                            to_city_mode: str | None = None,
+                            cross_radius_km: float = geo.DEFAULT_CROSS_RADIUS_KM,
+                            cross_time_mode: str = "smart",
+                            transit_discount_on: bool = True,
+                            transit_discount_min: int = geo.DEFAULT_TRANSIT_DISCOUNT_MIN,
+                            transit_proximity_m: int = geo.DEFAULT_TRANSIT_PROXIMITY_M,
+                            fallback_ungeocoded: bool = False):
     _check_date(date)
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
     if cross_extra < 0 or cross_extra > 360:
         raise HTTPException(400, "cross_extra 必须在 0-360 之间")
+    if cross_radius_km < 0 or cross_radius_km > geo.MAX_CROSS_RADIUS_KM:
+        raise HTTPException(400, f"cross_radius_km 必须在 0-{int(geo.MAX_CROSS_RADIUS_KM)} km 之间")
+    if (cross_time_mode or "smart").strip().lower() not in ("smart", "fixed"):
+        raise HTTPException(400, "cross_time_mode 必须为 smart 或 fixed")
+    if transit_discount_min < 0 or transit_discount_min > 60:
+        raise HTTPException(400, "transit_discount_min 必须在 0-60 分钟之间")
+    if transit_proximity_m < 200 or transit_proximity_m > 5000:
+        raise HTTPException(400, "transit_proximity_m 必须在 200-5000 米之间")
+    if cross_radius_km == 0 and fallback_ungeocoded:
+        raise HTTPException(400, "半径 R=0（关闭按距离跨站建边）时不允许开启无坐标同城回退")
     if frontier_k is not None and (frontier_k < 0 or frontier_k > 64):
         raise HTTPException(400, "frontier_k 必须在 0-64 之间（0 表示不限束宽）")
     if prune_level not in ("unbounded", "relaxed", "balanced", "strict", "custom"):
@@ -978,12 +1014,26 @@ def transfers(from_station: str, to_station: str, date: str,
               include_stations_mode: str = "or",
               city_mode: str | None = None,
               from_city_mode: str | None = None,
-              to_city_mode: str | None = None):
+              to_city_mode: str | None = None,
+              cross_radius_km: float = geo.DEFAULT_CROSS_RADIUS_KM,
+              cross_time_mode: str = "smart",
+              transit_discount_on: bool = True,
+              transit_discount_min: int = geo.DEFAULT_TRANSIT_DISCOUNT_MIN,
+              transit_proximity_m: int = geo.DEFAULT_TRANSIT_PROXIMITY_M,
+              active_group_ids: str | None = None,
+              fallback_ungeocoded: bool = False):
     _validate_search_params(
         date, max_legs, cross_extra, frontier_k, prune_level,
         max_total_min, detour_ratio, include_stations_mode,
         city_mode, from_city_mode, to_city_mode,
+        cross_radius_km=cross_radius_km,
+        cross_time_mode=cross_time_mode,
+        transit_discount_on=transit_discount_on,
+        transit_discount_min=transit_discount_min,
+        transit_proximity_m=transit_proximity_m,
+        fallback_ungeocoded=fallback_ungeocoded,
     )
+    gids = _parse_group_ids(active_group_ids)
     return _run(
         transfer.search, from_station, to_station, date,
         min_wait, max_wait, limit, max_legs, expand_city, cross_extra, frontier_k,
@@ -992,6 +1042,8 @@ def transfers(from_station: str, to_station: str, date: str,
         allow_prefixes, exclude_prefixes,
         include_stations, exclude_stations, include_stations_mode,
         city_mode, from_city_mode, to_city_mode,
+        cross_radius_km, cross_time_mode, transit_discount_on,
+        transit_discount_min, transit_proximity_m, gids, fallback_ungeocoded,
     )
 
 
@@ -1021,6 +1073,13 @@ class TransferSearchReq(BaseModel):
     city_mode: str | None = None
     from_city_mode: str | None = None
     to_city_mode: str | None = None
+    cross_radius_km: float = geo.DEFAULT_CROSS_RADIUS_KM
+    cross_time_mode: str = "smart"
+    transit_discount_on: bool = True
+    transit_discount_min: int = geo.DEFAULT_TRANSIT_DISCOUNT_MIN
+    transit_proximity_m: int = geo.DEFAULT_TRANSIT_PROXIMITY_M
+    active_group_ids: list[int] | None = None
+    fallback_ungeocoded: bool = False
 
 
 def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchReq):
@@ -1051,6 +1110,13 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
             city_mode=body.city_mode,
             from_city_mode=body.from_city_mode,
             to_city_mode=body.to_city_mode,
+            cross_radius_km=body.cross_radius_km,
+            cross_time_mode=body.cross_time_mode,
+            transit_discount_on=body.transit_discount_on,
+            transit_discount_min=body.transit_discount_min,
+            transit_proximity_m=body.transit_proximity_m,
+            active_group_ids=body.active_group_ids,
+            fallback_ungeocoded=body.fallback_ungeocoded,
             progress_cb=on_prog, cancel_event=ev, sub_cb=on_sub,
         )
         if ev.is_set():
@@ -1073,6 +1139,12 @@ def start_transfers(body: TransferSearchReq):
         body.prune_level, body.max_total_min, body.detour_ratio,
         body.include_stations_mode, body.city_mode,
         body.from_city_mode, body.to_city_mode,
+        cross_radius_km=body.cross_radius_km,
+        cross_time_mode=body.cross_time_mode,
+        transit_discount_on=body.transit_discount_on,
+        transit_discount_min=body.transit_discount_min,
+        transit_proximity_m=body.transit_proximity_m,
+        fallback_ungeocoded=body.fallback_ungeocoded,
     )
     f_mode = body.from_city_mode or body.city_mode
     t_mode = body.to_city_mode or body.city_mode
@@ -1090,6 +1162,292 @@ def start_transfers(body: TransferSearchReq):
     })
     threading.Thread(target=_transfer_search_job, args=(job_id, ev, body), daemon=True).start()
     return {"job_id": job_id}
+
+
+# ---------- 地理坐标、重轨邻近与换乘规则管理（方案 C v2） ----------
+@app.get("/api/geo/status")
+def geo_status():
+    st = geo.geo_coverage_status()
+    st["max_radius_km"] = geo.MAX_CROSS_RADIUS_KM
+    st["default_radius_km"] = geo.DEFAULT_CROSS_RADIUS_KM
+    st["default_proximity_m"] = geo.DEFAULT_TRANSIT_PROXIMITY_M
+    st["default_discount_min"] = geo.DEFAULT_TRANSIT_DISCOUNT_MIN
+    return st
+
+
+@app.get("/api/geo/stations")
+def geo_stations(status: str = "suspect", q: str = "", limit: int = 80):
+    st_f = (status or "all").strip().lower()
+    if st_f not in ("all", "missing", "suspect", "ok", "verified"):
+        raise HTTPException(400, "status 必须为 all / missing / suspect / ok / verified")
+    lim = max(1, min(500, int(limit)))
+    clauses = []
+    params: list = []
+    if st_f == "missing":
+        clauses.append("(lat IS NULL OR lon IS NULL OR coord_status='missing')")
+    elif st_f != "all":
+        clauses.append("coord_status=?")
+        params.append(st_f)
+    q_s = (q or "").strip()
+    if q_s:
+        like = f"%{q_s}%"
+        clauses.append("(name LIKE ? OR telecode LIKE ? OR city LIKE ? OR pinyin LIKE ?)")
+        params.extend([like, like, like, like])
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    total = db.rows(f"SELECT COUNT(*) c FROM stations {where}", tuple(params))[0]["c"]
+    items = db.rows(
+        f"""SELECT telecode, name, city, lat, lon, coord_source, coord_updated_at,
+                   coord_status, coord_confidence, coord_issue,
+                   transit_zone_id, nearest_rail_stop_distance_m, rail_access_mode, is_major_hub
+            FROM stations {where}
+            ORDER BY CASE coord_status WHEN 'suspect' THEN 0 WHEN 'missing' THEN 1 WHEN 'ok' THEN 2 ELSE 3 END, name
+            LIMIT ?""",
+        (*params, lim),
+    )
+    return {"stations": items, "total": total}
+
+
+class GeoStationReq(BaseModel):
+    lat: float | None = None
+    lon: float | None = None
+    coord_status: str = "verified"
+    transit_zone_id: str | None = None
+    nearest_rail_stop_distance_m: int | None = -1
+    is_major_hub: bool | None = None
+    issue: str = ""
+
+
+@app.post("/api/geo/station/{telecode}")
+def geo_update_station(telecode: str, body: GeoStationReq):
+    tc = (telecode or "").strip().upper()
+    if body.lat is not None and body.lon is not None and not geo.in_china_bbox(body.lat, body.lon):
+        raise HTTPException(400, "经纬度超出中国境内边界，拒绝保存")
+    _run(
+        db.update_station_coords,
+        tc, body.lat, body.lon, "manual", body.coord_status,
+        1.0 if body.coord_status == "verified" else None,
+        body.issue,
+        body.transit_zone_id,
+        body.nearest_rail_stop_distance_m,
+        None,
+        body.is_major_hub,
+    )
+    if body.nearest_rail_stop_distance_m == -1 and body.lat is not None and body.lon is not None:
+        geo.recompute_rail_proximity()
+    row = db.rows("SELECT * FROM stations WHERE telecode=?", (tc,))
+    return {"station": row[0] if row else None, "status": geo.geo_coverage_status()}
+
+
+@app.post("/api/geo/nominatim/{telecode}")
+def geo_manual_nominatim(telecode: str):
+    try:
+        return geo.manual_nominatim_lookup(telecode)
+    except ValueError as e:
+        msg_s = str(e)
+        code = 429 if "礼貌间隔" in msg_s else 400
+        raise HTTPException(code, msg_s)
+    except Exception as e:
+        raise HTTPException(502, f"Nominatim 请求失败：{e}")
+
+
+@app.post("/api/geo/audit")
+def geo_audit():
+    audit = geo.audit_station_coords()
+    prox = geo.recompute_rail_proximity()
+    return {"audit": audit, "proximity": prox, "status": geo.geo_coverage_status()}
+
+
+class GeoCrawlReq(BaseModel):
+    trial_tiles: int | None = None
+    force: bool = False
+    reset_checkpoint: bool = False
+    use_overpass: bool = True
+    use_wikidata: bool = True
+    overpass_delay: float = 3.5
+
+
+def _geo_crawl_job(job_id: str, ev: threading.Event, body: GeoCrawlReq):
+    def on_prog(done_u: int, tot_u: int, cur_msg: str, sub_d: int = 0, sub_t: int = 0):
+        _job_update(job_id, done=done_u, total=tot_u, sub_done=sub_d, sub_total=sub_t, current=cur_msg)
+
+    def on_log(line: str):
+        _job_append(job_id, "log", line)
+
+    try:
+        crawler_geo = geo.GeoCoordCrawler()
+        res = crawler_geo.run(
+            force=body.force,
+            reset_checkpoint=body.reset_checkpoint,
+            use_overpass=body.use_overpass,
+            use_wikidata=body.use_wikidata,
+            trial_tiles=body.trial_tiles,
+            overpass_delay=max(1.0, float(body.overpass_delay)),
+            cancel_event=ev,
+            progress_cb=on_prog,
+            log_cb=on_log,
+        )
+        for err in res.get("errors") or []:
+            _job_append(job_id, "errors", err)
+        if ev.is_set():
+            _job_update(job_id, status="cancelled", result=res)
+        else:
+            _job_update(job_id, status="done", phase="done", result=res)
+    except InterruptedError:
+        _job_update(job_id, status="cancelled")
+    except Exception as e:
+        _job_update(job_id, status="error", error=str(e))
+    finally:
+        db.close_conn()
+
+
+@app.post("/api/geo/crawl/start")
+def geo_crawl_start(body: GeoCrawlReq):
+    if body.trial_tiles is not None and (body.trial_tiles < 1 or body.trial_tiles > len(geo.CHINA_OVERPASS_TILES)):
+        raise HTTPException(400, f"trial_tiles 必须在 1-{len(geo.CHINA_OVERPASS_TILES)} 之间")
+    tot = (body.trial_tiles or len(geo.CHINA_OVERPASS_TILES)) if body.use_overpass else 0
+    if body.use_wikidata and body.trial_tiles is None:
+        tot += 1
+    job_id, ev = _create_job({
+        "status": "running", "phase": "geo", "done": 0, "total": max(1, tot),
+        "sub_done": 0, "sub_total": 0, "current": "准备公共地理数据源抓取…",
+        "log": [], "errors": [], "result": {},
+    })
+    threading.Thread(target=_geo_crawl_job, args=(job_id, ev, body), daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/transfer_groups")
+def get_transfer_groups():
+    return {"groups": db.list_transfer_groups()}
+
+
+class TransferGroupReq(BaseModel):
+    id: int | None = None
+    name: str
+    members: list[str]
+    default_extra_min: int | None = 45
+    enabled_by_default: bool = True
+    connect_mode: str = "full_mesh"
+    hub_telecode: str = ""
+    note: str = ""
+
+
+@app.post("/api/transfer_groups")
+def save_transfer_group_api(body: TransferGroupReq):
+    grp = _run(
+        db.save_transfer_group,
+        body.name, body.members, body.default_extra_min, body.note,
+        body.enabled_by_default, body.connect_mode, body.hub_telecode, body.id,
+    )
+    return {"group": grp, "groups": db.list_transfer_groups()}
+
+
+@app.delete("/api/transfer_groups/{group_id}")
+def delete_transfer_group_api(group_id: int):
+    ok = db.delete_transfer_group(group_id)
+    if not ok:
+        raise HTTPException(404, f"换乘组 #{group_id} 不存在")
+    return {"ok": True, "groups": db.list_transfer_groups()}
+
+
+@app.get("/api/transfer_pairs")
+def get_transfer_pairs():
+    return {"pairs": db.list_transfer_pair_overrides()}
+
+
+class TransferPairReq(BaseModel):
+    a_telecode: str
+    b_telecode: str
+    mode: str = "allow"
+    custom_extra_min: int | None = None
+    note: str = ""
+
+
+@app.post("/api/transfer_pairs")
+def save_transfer_pair_api(body: TransferPairReq):
+    a_st = db.resolve_station(body.a_telecode)
+    b_st = db.resolve_station(body.b_telecode)
+    t1 = a_st["telecode"] if a_st else body.a_telecode
+    t2 = b_st["telecode"] if b_st else body.b_telecode
+    pair = _run(db.save_transfer_pair_override, t1, t2, body.mode, body.custom_extra_min, body.note)
+    return {"pair": pair, "pairs": db.list_transfer_pair_overrides()}
+
+
+@app.delete("/api/transfer_pairs/{pair_id}")
+def delete_transfer_pair_api(pair_id: int):
+    ok = db.delete_transfer_pair_override(pair_id)
+    if not ok:
+        raise HTTPException(404, f"站对覆盖规则 #{pair_id} 不存在")
+    return {"ok": True, "pairs": db.list_transfer_pair_overrides()}
+
+
+@app.get("/api/transfer_pairs/preview")
+def preview_transfer_pair(a: str, b: str,
+                          cross_radius_km: float = geo.DEFAULT_CROSS_RADIUS_KM,
+                          cross_time_mode: str = "smart",
+                          transit_discount_on: bool = True,
+                          transit_discount_min: int = geo.DEFAULT_TRANSIT_DISCOUNT_MIN,
+                          transit_proximity_m: int = geo.DEFAULT_TRANSIT_PROXIMITY_M,
+                          active_group_ids: str | None = None,
+                          fallback_ungeocoded: bool = False):
+    sa, sb = _station_or_400(a), _station_or_400(b)
+    st_rows = db.rows(
+        """SELECT telecode, name, city, lat, lon, coord_status, coord_confidence,
+                  transit_zone_id, nearest_rail_stop_distance_m, rail_access_mode, is_major_hub
+           FROM stations"""
+    )
+    idx = geo.StationGeoIndex(st_rows, db.list_transfer_groups(), db.list_transfer_pair_overrides(), geo.load_transit_cities())
+    cfg = geo.resolve_cross_cfg(
+        cross_extra=60,
+        cross_radius_km=cross_radius_km,
+        cross_time_mode=cross_time_mode,
+        transit_discount_on=transit_discount_on,
+        transit_discount_min=transit_discount_min,
+        transit_proximity_m=transit_proximity_m,
+        active_group_ids=_parse_group_ids(active_group_ids),
+        fallback_ungeocoded=fallback_ungeocoded,
+        geo_index=idx,
+    )
+    tc1, tc2 = sa["telecode"], sb["telecode"]
+    ev_res = geo.eval_cross_pair(tc1, tc2, idx, cfg)
+    c1, c2 = idx.coords.get(tc1), idx.coords.get(tc2)
+    raw_dist = geo.haversine_km(c1[0], c1[1], c2[0], c2[1]) if (c1 and c2) else None
+    return {
+        "a": {"telecode": tc1, "name": sa["name"], "city": sa.get("city", ""), "coord_status": idx.status_of.get(tc1, "missing"), "transit_zone_id": idx.zone_of.get(tc1, ""), "nearest_rail_stop_distance_m": idx.rail_dist_of.get(tc1), "rail_access_mode": idx.access_mode_of.get(tc1, "none"), "is_major_hub": bool(idx.is_hub.get(tc1))},
+        "b": {"telecode": tc2, "name": sb["name"], "city": sb.get("city", ""), "coord_status": idx.status_of.get(tc2, "missing"), "transit_zone_id": idx.zone_of.get(tc2, ""), "nearest_rail_stop_distance_m": idx.rail_dist_of.get(tc2), "rail_access_mode": idx.access_mode_of.get(tc2, "none"), "is_major_hub": bool(idx.is_hub.get(tc2))},
+        "distance_km": raw_dist,
+        "connected": ev_res is not None,
+        "eval": ev_res,
+    }
+
+
+@app.get("/api/transit_cities")
+def get_transit_cities():
+    cities = geo.load_transit_cities()
+    return {
+        "cities": [{"city": k, "label": v} for k, v in sorted(cities.items())],
+        "zones": geo.CROSS_CITY_TRANSIT_ZONES,
+    }
+
+
+class TransitCityReq(BaseModel):
+    city: str
+    label: str | None = "地铁/市域"
+    enabled: bool = True
+
+
+@app.post("/api/transit_cities")
+def save_transit_city_api(body: TransitCityReq):
+    if not (body.city or "").strip():
+        raise HTTPException(400, "城市名称不能为空")
+    cities = geo.save_transit_city_override(body.city, body.label, body.enabled)
+    return {"cities": [{"city": k, "label": v} for k, v in sorted(cities.items())]}
+
+
+@app.post("/api/transit_cities/reset")
+def reset_transit_cities_api():
+    cities = geo.reset_transit_cities()
+    return {"cities": [{"city": k, "label": v} for k, v in sorted(cities.items())]}
 
 
 # ---------- 方案票价/余票实时查询 ----------

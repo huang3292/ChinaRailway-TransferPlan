@@ -287,6 +287,31 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
 .est{color:#b45309}
 .price{color:var(--orange);font-weight:700}
 
+.geo-strip{margin-top:10px;padding:10px 12px;background:#f8fafc;border:1px solid var(--border);border-radius:5px}
+.geo-strip-hd{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;font-size:12px;color:#334155}
+.preset-btns{display:inline-flex;gap:4px;flex-wrap:wrap;align-items:center}
+.chk-inline{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0;cursor:pointer;font-size:12px;font-weight:500}
+.chk-inline input{width:auto;margin:0}
+.grp-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:4px}
+.grp-chk{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;font-size:12px;color:var(--text);cursor:pointer;white-space:nowrap}
+.grp-chk input{width:auto;margin:0}
+.kflag.rule-radius{background:#ecfdf5;color:#15803d;border-color:#bbf7d0}
+.kflag.rule-group{background:#e0f2fe;color:#0369a1;border-color:#bae6fd}
+.kflag.rule-override{background:#e0edff;color:#1d4ed8;border-color:#bfdbfe}
+.kflag.rule-fallback{background:#fffbeb;color:#b45309;border-color:#fde68a}
+.inline-edit{width:95px;padding:3px 6px;font-size:12px}
+.inline-edit.sm{width:68px}
+@media(max-width:768px){
+  header{padding:8px 12px;height:auto;flex-wrap:wrap;gap:6px 10px}
+  header nav{width:100%;height:auto;flex-wrap:wrap;gap:4px}
+  header nav button{padding:5px 10px;font-size:13px}
+  main{padding:0 10px}
+  .row>div{min-width:100%}
+  .row>div.narrow{flex:1 1 46%;min-width:120px}
+  .od-box{min-width:100%}
+  .swap-wrap{padding-top:0 !important}
+}
+
 #modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:40}
 #modal .inner{background:#fff;max-width:740px;margin:48px auto;border-radius:6px;padding:18px;max-height:80vh;overflow:auto;border:1px solid var(--border)}
 #modal h3{margin:0 0 10px;font-size:15px}
@@ -372,7 +397,7 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
         <select id="s-size"><option>20</option><option selected>50</option><option>100</option><option>200</option></select></div>
       <div class="narrow transfer-only"><label>最短换乘(分)</label><input id="s-min" type="number" value="30"></div>
       <div class="narrow transfer-only"><label>最长换乘(分)</label><input id="s-max" type="number" value="360"></div>
-      <div class="narrow transfer-only"><label>异站加时(分)</label><input id="s-cross" type="number" value="60" min="0" max="360"></div>
+      <div class="narrow transfer-only"><label>固定加时(分)</label><input id="s-cross" type="number" value="60" min="0" max="360" title="仅当“异站计价”切至固定加时模式时生效"></div>
       <div style="flex:2;min-width:210px;padding-bottom:4px">
         <label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0;cursor:pointer"><input type="checkbox" id="s-online" style="width:auto"> 在线模式（搜索前实时抓取）</label>
         <label style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--text);margin:0 0 0 14px;cursor:pointer"><input type="checkbox" id="s-live" style="width:auto"> 自动查询票价/余票</label>
@@ -393,8 +418,8 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
       <div style="flex:1.4"><label>必经换乘站/城市（搜索条件）</label>
         <div style="display:flex;gap:4px"><input id="s-inc-tst" placeholder="如 福州,南昌（精确站名/城市）" title="与排除换乘站/车型头等其它条件组之间为 AND；组内按右侧下拉 OR/AND；AND 要求每个 token 各被一个换乘对命中，站数超过换乘次数时自动提高程数（最多 5 程）"><select id="s-inc-mode" style="flex:0 0 98px;width:auto" title="多个必经换乘条件的组合逻辑：OR=任一换乘对命中任一 token；AND=每个 token 都须被某换乘对命中，站数不够时自动提高程数"><option value="or" selected>任一(OR)</option><option value="and">全部(AND)</option></select></div></div>
       <div><label>排除换乘站/城市（搜索条件）</label><input id="s-exc-tst" placeholder="如 北京南,天津（精确排除）" title="任一换乘对(下车站或上车站)命中任一 token 即排除(OR)；先于必经判定，与必经之间为 AND"></div>
-      <div style="flex:0 0 130px"><label>换乘类型</label>
-        <select id="s-same"><option value="">不限</option><option value="1">同站换乘</option><option value="0">异站换乘(同城)</option></select></div>
+      <div style="flex:0 0 150px"><label>换乘类型</label>
+        <select id="s-same"><option value="">不限</option><option value="1">同站换乘</option><option value="0">异站换乘(物理半径/组)</option></select></div>
       <div style="flex:0 0 175px"><label>树枝剪枝级别（搜前）</label>
         <select id="s-prune">
           <option value="balanced" selected>均衡剪枝（默认）</option>
@@ -405,6 +430,52 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
         </select></div>
       <div style="flex:0"><label>&nbsp;</label><button type="button" class="btn sec" id="s-prune-toggle" style="padding:6px 12px">剪枝参数 ▾</button></div>
     </div>
+    <div class="geo-strip transfer-only" id="s-cross-strip">
+      <div class="geo-strip-hd">
+        <b>跨站异站换乘（物理距离 + 城轨邻近估算 + 换乘组）</b>
+        <span class="mono" id="s-cross-preview" style="color:var(--muted);font-size:11px">分档分段线性基础加时 + 枢纽(+5m) - 双端重轨邻近估算减时 ≥ 20m</span>
+      </div>
+      <div class="row">
+        <div style="flex:1.2;min-width:210px">
+          <label>物理搜索半径 R(km, 0–100)</label>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <input id="s-radius" type="number" step="0.5" min="0" max="100" value="20" style="width:82px;flex:0 0 82px">
+            <div class="preset-btns" id="s-radius-presets">
+              <button type="button" class="mini" data-rad="0">0(关闭)</button>
+              <button type="button" class="mini" data-rad="10">10</button>
+              <button type="button" class="mini" data-rad="15">15</button>
+              <button type="button" class="mini active" data-rad="20">20</button>
+              <button type="button" class="mini" data-rad="30">30</button>
+              <button type="button" class="mini" data-rad="50">50</button>
+            </div>
+          </div>
+        </div>
+        <div style="flex:0 0 185px">
+          <label>异站耗时计价模式</label>
+          <select id="s-cross-mode">
+            <option value="smart" selected>智能(按距离+城轨邻近)</option>
+            <option value="fixed">固定加时(采用上方数值)</option>
+          </select>
+        </div>
+        <div class="narrow">
+          <label>最高减时(分)</label>
+          <input id="s-transit-disc" type="number" min="0" max="60" value="15">
+        </div>
+        <div style="flex:0 0 125px">
+          <label>重轨邻近阈值(m)</label>
+          <input id="s-transit-prox" type="number" min="200" max="5000" step="100" value="1500" title="两站各自到最近地铁/轻轨/重轨市域站点距离均须在此阈值内才触发减时（默认1500m；≤800m全额，801-1500m折半）">
+        </div>
+      </div>
+      <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center">
+        <label class="chk-inline"><input type="checkbox" id="s-transit-on" checked> 启用城轨减时「估算」</label>
+        <label class="chk-inline" title="仅对缺失坐标的车站回退同名城市硬绑定并固定加时 90m；默认关闭以避免远郊站跨百公里误连"><input type="checkbox" id="s-fallback"> 无坐标旧版同城回退(+90m)</label>
+        <span id="s-fallback-badge" class="toolbar-warn" style="display:none;font-size:11px;padding:1px 6px"></span>
+      </div>
+      <div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span style="font-size:12px;color:var(--muted);font-weight:500">启用换乘组：</span>
+        <div id="s-groups-box" class="grp-pills"><span class="hint" style="margin:0">暂无已建换乘组（可在「爬取数据」页新建）</span></div>
+      </div>
+    </div>
     <div class="row transfer-only" style="margin-top:8px;align-items:center">
       <div style="flex:0 0 auto"><label style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap;color:var(--text);margin:0;cursor:pointer"><input type="checkbox" id="s-hub-only" style="width:auto"> 仅经枢纽/指定站换乘（搜前收窄）</label></div>
       <div id="s-hub-box" style="display:none;flex:1;align-items:center;gap:6px">
@@ -414,17 +485,17 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
     </div>
     <div id="s-prune-panel" class="transfer-only" style="display:none;margin-top:10px;padding:10px 12px;background:#f8fafc;border:1px solid var(--border);border-radius:4px">
       <div class="row">
-        <div class="narrow"><label>每站束宽 (0不限)</label><input id="s-fk" type="number" min="0" max="64" value="8" title="每层每个中转站保留的最优分支数(frontier_k)，0 表示不限"></div>
-        <div class="narrow"><label>总历时上限(时,0不限)</label><input id="s-maxh" type="number" min="0" max="336" value="48" title="总耗时超过该小时数直接剪除，0 表示不限"></div>
-        <div class="narrow"><label>绕行倍率上限</label><input id="s-detour" type="number" step="0.1" min="0" max="20" value="0" title="0表示不限；如填2.0则剪除超过最短方案2倍耗时的分支"></div>
+        <div class="narrow" style="flex:0 0 118px"><label>每站束宽(0不限)</label><input id="s-fk" type="number" min="0" max="64" value="8" title="每层每个中转站保留的最优分支数(frontier_k)，0 表示不限"></div>
+        <div class="narrow" style="flex:0 0 132px"><label>总耗时上限(时,0不限)</label><input id="s-maxh" type="number" min="0" max="336" value="48" title="总耗时超过该小时数直接剪除，0 表示不限"></div>
+        <div class="narrow" style="flex:0 0 112px"><label>绕行倍率上限</label><input id="s-detour" type="number" step="0.1" min="0" max="20" value="0" title="0表示不限；如填2.0则剪除超过最短方案2倍耗时的分支"></div>
         <div style="flex:2;padding-bottom:4px">
-          <label style="display:inline-flex;align-items:center;gap:5px;color:var(--text);margin:0"><input type="checkbox" id="s-allow-cross" checked style="width:auto"> 允许同城异站分支</label>
+          <label style="display:inline-flex;align-items:center;gap:5px;color:var(--text);margin:0"><input type="checkbox" id="s-allow-cross" checked style="width:auto"> 允许异站换乘分支</label>
           <label style="display:inline-flex;align-items:center;gap:5px;color:var(--text);margin:0 0 0 14px" title="同中转站出发不早且到达不晚且程数不少的劣势分支自动剪除"><input type="checkbox" id="s-dom" style="width:auto"> 耗时劣势支配剪枝</label>
         </div>
       </div>
       <div class="hint" style="margin-top:6px">重复车次、折返已乘车站、同城空转、绕回已离城市、过终点后再绕等防死循环规则在底层全局强制剪除；车型头与换乘站条件修改后即时本地过滤并自动重搜：约束生效时搜前自动关闭束宽/支配剪枝，保证必经/排除/车型方案不被误剪；必经 AND 站数超过换乘次数时自动提高程数（最多 5 程）。</div>
     </div>
-    <div class="hint">时间基准：北京时间(UTC+8)；异站换乘默认额外预留 60 分钟；点击表内 <b>车次</b> 或 <b>席位余票/票价单元格</b> 可仿国铁样式展开时刻表与各席别明细。</div>
+    <div class="hint">时间基准：北京时间(UTC+8)；默认启用物理半径 20km（单站最多保留最近 25 个邻站）+ 重轨邻近估算减时；点击表内 <b>车次</b> 或 <b>席位余票/票价单元格</b> 可仿国铁样式展开时刻表与各席别明细。</div>
     <div style="display:flex;gap:8px;align-items:center"><div class="msg" id="s-msg" style="flex:1"></div><button class="btn sec" id="s-cancel" style="display:none;margin-top:10px">停止任务</button></div>
     <div class="prog" id="s-prog"><div></div></div>
     <pre class="logbox" id="s-log"></pre>
@@ -493,6 +564,108 @@ tr.rail-drawer-row td{padding:0 !important;background:#f7faff;border-bottom:1px 
     <div style="display:flex;gap:8px;align-items:center"><div class="msg" id="c-t-msg" style="flex:1"></div><button class="btn sec" id="c-t-cancel" style="display:none;margin-top:10px">停止任务</button></div>
     <div class="prog" id="c-t-prog"><div></div></div>
     <div class="scroll" id="c-t-table" style="margin-top:10px"></div>
+  </div>
+
+  <!-- 方案 C v2：地理坐标采集、质检、城轨邻近与规则管理 -->
+  <div class="card" id="geo-card">
+    <h3>车站地理坐标与重轨邻近（Overpass + Wikidata 合规采集）</h3>
+    <div class="stats" id="g-stats"></div>
+    <div id="geo-fallback-box" class="toolbar-note" style="margin-top:8px"></div>
+    <div class="row" style="margin-top:10px;align-items:center">
+      <div style="flex:0 0 auto"><button type="button" class="btn sec" id="g-trial">Overpass 试跑 5 切片并估算</button></div>
+      <div style="flex:0 0 auto"><button type="button" class="btn" id="g-crawl">断点续跑全量 (Overpass+Wikidata)</button></div>
+      <div style="flex:0 0 auto"><button type="button" class="btn sec" id="g-reset-crawl">重置断点全量重抓</button></div>
+      <div style="flex:0 0 auto"><button type="button" class="btn sec" id="g-audit">运行多维质检 + 重算城轨邻近</button></div>
+      <div style="flex:0 0 auto"><button type="button" class="btn sec" id="g-cancel" style="display:none">停止地理抓取</button></div>
+    </div>
+    <div class="msg" id="g-msg"></div>
+    <div class="prog" id="g-prog"><div></div></div>
+    <pre class="logbox" id="g-log"></pre>
+
+    <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border-light)">
+      <div style="flex:0 0 155px">
+        <label>人工核查筛选</label>
+        <select id="g-st-filter">
+          <option value="suspect" selected>可疑坐标 (suspect)</option>
+          <option value="missing">缺失坐标 (missing)</option>
+          <option value="ok">自动入库 (ok)</option>
+          <option value="verified">人工锁定 (verified)</option>
+          <option value="all">全部车站</option>
+        </select>
+      </div>
+      <div><label>关键词搜索（站名 / 电报码 / 城市）</label><input id="g-st-q" placeholder="如 昆山南 / KNH / 重庆"></div>
+      <div style="flex:0"><label>&nbsp;</label><button type="button" class="btn sec" id="g-st-load">刷新列表</button></div>
+    </div>
+    <div class="scroll" id="g-st-table" style="margin-top:10px"></div>
+    <div class="hint" id="g-attrib">坐标与重轨站点源自 OpenStreetMap (ODbL) &amp; Wikidata (CC0)；批量流严禁调用 Nominatim，单站「Nominatim 点查」仅限人工逐站低频补盲（强制 ≥1.5s 间隔）。</div>
+  </div>
+
+  <div class="card" id="groups-card">
+    <h3>自定义换乘组（最多 30 站 / 支持全连通与枢纽星型）</h3>
+    <input type="hidden" id="grp-id" value="">
+    <div class="row">
+      <div style="flex:1.2"><label>组名</label><input id="grp-name" placeholder="如：长三角沪昆换乘组"></div>
+      <div style="flex:0 0 165px">
+        <label>连通模式</label>
+        <select id="grp-mode">
+          <option value="full_mesh" selected>全连通 (≥5分)</option>
+          <option value="hub_star">枢纽星型 (hub_star)</option>
+        </select>
+      </div>
+      <div style="flex:0 0 120px" id="grp-hub-wrap"><label>枢纽站电报码</label><input id="grp-hub" placeholder="如 SHH" disabled></div>
+      <div class="narrow"><label>默认加时(分)</label><input id="grp-extra" type="number" min="0" max="360" value="45"></div>
+      <div style="flex:0 0 120px;padding-bottom:5px"><label class="chk-inline"><input type="checkbox" id="grp-def-on" checked> 默认搜索启用</label></div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <div style="flex:2"><label>成员车站（电报码或站名，逗号分隔，2–30 个）</label><input id="grp-members" placeholder="如：AOH,SHH,SNH 或 上海虹桥,上海,上海南"></div>
+      <div style="flex:1"><label>备注（可选）</label><input id="grp-note" placeholder="说明"></div>
+      <div style="flex:0"><label>&nbsp;</label><button type="button" class="btn" id="grp-save">保存换乘组</button></div>
+      <div style="flex:0"><label>&nbsp;</label><button type="button" class="btn sec" id="grp-clear">清空</button></div>
+    </div>
+    <div class="msg" id="grp-msg"></div>
+    <div class="scroll" id="grp-table" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card" id="pairs-card">
+    <h3>站对覆盖规则（优先级最高：block &gt; allow &gt; 换乘组 &gt; 半径 &gt; 回退）</h3>
+    <div class="row">
+      <div><label>站点 A（站名或电报码）</label><input id="pr-a" class="station-ac" placeholder="如：上海虹桥"></div>
+      <div><label>站点 B（站名或电报码）</label><input id="pr-b" class="station-ac" placeholder="如：上海南"></div>
+      <div style="flex:0 0 155px">
+        <label>覆盖规则</label>
+        <select id="pr-mode">
+          <option value="allow" selected>强制连通 (allow)</option>
+          <option value="block">强制屏蔽 (block)</option>
+        </select>
+      </div>
+      <div style="flex:0 0 135px"><label>专属加时(分, 可空)</label><input id="pr-extra" type="number" min="0" max="360" placeholder="留空按智能公式"></div>
+      <div><label>备注（可选）</label><input id="pr-note" placeholder="如：站内通道直连"></div>
+      <div style="flex:0"><label>&nbsp;</label><button type="button" class="btn sec" id="pr-preview-btn">规则预演</button></div>
+      <div style="flex:0"><label>&nbsp;</label><button type="button" class="btn" id="pr-save">保存规则</button></div>
+    </div>
+    <div class="msg" id="pr-msg"></div>
+    <div id="pr-preview-out" class="toolbar-note" style="display:none;margin-top:8px"></div>
+    <div class="scroll" id="pr-table" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card" id="transit-card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--border-light);padding-bottom:8px;margin-bottom:8px">
+      <h3 style="margin:0;border:none;padding:0">重轨城市与都市圈名录（估算减时准入池）</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="tc-summary" class="hint" style="margin:0">加载中…</span>
+        <button type="button" class="btn sec" id="tc-toggle">展开名录 ▾</button>
+      </div>
+    </div>
+    <div id="tc-drawer" style="display:none">
+      <div class="row">
+        <div><label>城市名</label><input id="tc-city" placeholder="如：昆山"></div>
+        <div><label>轨道类型标签</label><input id="tc-label" value="地铁/市域" placeholder="如：地铁/市域"></div>
+        <div style="flex:0"><label>&nbsp;</label><button type="button" class="btn sec" id="tc-save">添加 / 启用</button></div>
+        <div style="flex:0"><label>&nbsp;</label><button type="button" class="btn sec" id="tc-reset">恢复默认名录</button></div>
+      </div>
+      <div class="msg" id="tc-msg"></div>
+      <div id="tc-list" class="grp-pills" style="margin-top:10px"></div>
+    </div>
   </div>
 </section>
 
@@ -728,7 +901,7 @@ function switchTab(tabName){
   document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('active',x.dataset.tab===tabName));
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.id==='tab-'+tabName));
   if(tabName==='browse')loadStats();
-  if(tabName==='crawl')loadRate();
+  if(tabName==='crawl'){loadRate();loadGeoAll();}
   if(tabName==='display')renderDisplaySettings();
 }
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
@@ -1684,6 +1857,93 @@ function formatPruneStats(st,cfg){
   return items.length?` · 树枝剪枝${limitTxt}：${items.join(' / ')}`:(limitTxt?` · 树枝剪枝${limitTxt}`:'');
 }
 
+let hideFallbackPlans=false,hideSuspectPlans=false,groupsLoaded=false,cachedGroups=[];
+function refreshCrossPreview(){
+  const rad=Math.max(0,Math.min(100,numVal('s-radius',20)));
+  const mode=$('s-cross-mode').value;
+  const allowCross=$('s-allow-cross').checked;
+  const discOn=$('s-transit-on').checked;
+  const discMin=numVal('s-transit-disc',15);
+  const proxM=numVal('s-transit-prox',1500);
+  const fb=$('s-fallback');
+  if(!allowCross||rad===0){
+    fb.checked=false;
+    fb.disabled=true;
+  }else{
+    fb.disabled=false;
+  }
+  $('s-cross').disabled=(mode!=='fixed')||!allowCross;
+  $('s-transit-disc').disabled=(mode==='fixed')||!discOn||!allowCross;
+  $('s-transit-prox').disabled=(mode==='fixed')||!discOn||!allowCross;
+  $('s-transit-on').disabled=(mode==='fixed')||!allowCross;
+  document.querySelectorAll('#s-radius-presets button[data-rad]').forEach(btn=>{
+    btn.classList.toggle('active',Math.abs((+btn.dataset.rad)-rad)<1e-6);
+  });
+  const pv=$('s-cross-preview');
+  if(!allowCross){
+    pv.textContent='已禁止异站换乘分支';
+  }else if(mode==='fixed'){
+    pv.textContent=`固定加时模式：半径 ${rad}km，所有跨站换乘一律要求额外 ≥ ${numVal('s-cross',60)}m`;
+  }else{
+    const trPart=discOn?` - 双端重轨≤${proxM}m估算减免(最高${discMin}m，≤800m全额)`:'（已关闭城轨减时）';
+    pv.textContent=`智能计价(R=${rad}km)：分段线性基础加时 + 大站枢纽(+5m)${trPart}，有效要求 ≥20m`;
+  }
+}
+document.querySelectorAll('#s-radius-presets button[data-rad]').forEach(btn=>{
+  btn.onclick=()=>{
+    $('s-radius').value=btn.dataset.rad;
+    refreshCrossPreview();
+  };
+});
+['s-radius','s-cross','s-transit-disc','s-transit-prox'].forEach(id=>{
+  $(id).addEventListener('input',refreshCrossPreview);
+  $(id).addEventListener('change',refreshCrossPreview);
+});
+['s-cross-mode','s-transit-on','s-fallback'].forEach(id=>{
+  $(id).addEventListener('change',refreshCrossPreview);
+});
+
+async function loadSearchCrossMeta(){
+  try{
+    const [gr,gs]=await Promise.all([api('/api/transfer_groups'),api('/api/geo/status')]);
+    cachedGroups=gr.groups||[];
+    groupsLoaded=true;
+    const box=$('s-groups-box');
+    if(!cachedGroups.length){
+      box.innerHTML='<span class="hint" style="margin:0">暂无自定义换乘组（可在「爬取数据」页新建）</span>';
+    }else{
+      const prevChecked=new Set([...box.querySelectorAll('input[data-gid]:checked')].map(el=>+el.dataset.gid));
+      const hadExisting=box.querySelectorAll('input[data-gid]').length>0;
+      box.innerHTML=cachedGroups.map(g=>{
+        const chk=hadExisting?prevChecked.has(g.id):!!g.enabled_by_default;
+        const exTxt=g.default_extra_min!=null?`${g.default_extra_min}m`:'智能';
+        const modeTxt=g.connect_mode==='hub_star'?'星型':'全连通';
+        return `<label class="grp-chk" title="${esc((g.members||[]).map(m=>m.name).join('、'))}">
+          <input type="checkbox" data-gid="${g.id}" ${chk?'checked':''}>
+          <span>${esc(g.name)}</span>
+          <small style="color:var(--muted)">${modeTxt}·${exTxt}·${(g.members||[]).length}站</small>
+        </label>`;
+      }).join('');
+    }
+    const fi=gs.fallback_impact||{};
+    const badge=$('s-fallback-badge');
+    if(fi.fallback_removed_pairs>0){
+      badge.style.display='';
+      badge.textContent=`若开回退将放行 ${fi.fallback_removed_pairs} 对无坐标同城站（覆盖率 ${fi.ok_pct||0}%）`;
+    }else if(gs.total>0){
+      badge.style.display='';
+      badge.textContent=`有效坐标 ${gs.pct||0}%`+(fi.auto_disable_recommended?'（已达 ≥98%，建议关闭回退）':'');
+    }else{
+      badge.style.display='none';
+    }
+  }catch(_e){}
+}
+
+function getSelectedGroupIds(){
+  if(!groupsLoaded)return null;
+  return [...document.querySelectorAll('#s-groups-box input[data-gid]:checked')].map(el=>+el.dataset.gid);
+}
+
 $('s-go').onclick=async()=>{
   const btn=$('s-go');btn.disabled=true;$('s-result').innerHTML='';
   clearTimeout(autoTimer);planGen++;
@@ -1704,12 +1964,21 @@ $('s-go').onclick=async()=>{
     const rawMaxh=numVal('s-maxh',48);
     const maxh=rawMaxh<=0?0:Math.min(336,Math.max(1,rawMaxh));
     const fk=Math.min(64,Math.max(0,numVal('s-fk',8)));
+    const rad=Math.max(0,Math.min(100,numVal('s-radius',20)));
+    const gids=getSelectedGroupIds();
     const body={
       from_station:fq,to_station:tq,date:$('s-date').value,
       min_wait:numVal('s-min',30),max_wait:numVal('s-max',360),
       max_legs:+numVal('s-legs',2),
       from_city_mode:fcm,to_city_mode:tcm,...(cm?{city_mode:cm}:{}),
       cross_extra:numVal('s-cross',60),
+      cross_radius_km:rad,
+      cross_time_mode:$('s-cross-mode').value,
+      transit_discount_on:$('s-transit-on').checked,
+      transit_discount_min:Math.max(0,Math.min(60,numVal('s-transit-disc',15))),
+      transit_proximity_m:Math.max(200,Math.min(5000,numVal('s-transit-prox',1500))),
+      fallback_ungeocoded:$('s-fallback').checked&&!$('s-fallback').disabled,
+      ...(gids!==null?{active_group_ids:gids}:{}),
       prune_level:$('s-prune').value,
       // WHY: 非 custom 时面板值只是预设的镜像，显式下发会被后端当"用户指定"，
       // 从而跳过约束生效时的搜前自动放宽(auto_relaxed)；故仅 custom 下发这四项覆盖。
@@ -1747,7 +2016,9 @@ function applyTypeUI(){
   document.querySelectorAll('.transfer-only').forEach(el=>el.style.display=direct?'none':'');
   if(direct){$('s-inc-tst').value='';$('s-exc-tst').value='';$('s-same').value='';$('s-prune-panel').style.display='none';refreshPruneToggleBadge();}
   refreshHubBox();
+  refreshCrossPreview();
 }
+$('s-allow-cross').addEventListener('change',refreshCrossPreview);
 applyTypeUI();
 refreshPruneToggleBadge();
 ['s-inc-pfx','s-exc-pfx','s-filter','s-dep1','s-dep2','s-arr1','s-arr2','s-inc-tst','s-exc-tst'].forEach(id=>$(id).oninput=()=>{page=1;render();refreshAutoQuery();if(id==='s-inc-tst')autoLegsForAnd();if(['s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'].includes(id))scheduleCondResearch();});
@@ -1867,6 +2138,8 @@ function filterPlans(list){
     if(a2&&arr>a2)return false;
     if(p._type==='transfer'){
       const ts=p.transfers||[];
+      if(hideFallbackPlans&&ts.some(t=>t.is_fallback||t.source_rule==='fallback'))return false;
+      if(hideSuspectPlans&&ts.some(t=>t.is_suspect))return false;
       if(same==='1'&&!(ts.length&&ts.every(t=>t.same)))return false;
       if(same==='0'&&!ts.some(t=>!t.same))return false;
       if(excSt.length||incSt.length){
@@ -2098,6 +2371,42 @@ function renderMobileLegHtml(l,p,i,effCols,gone){
   </div>`;
 }
 
+const RULE_LABEL_MAP={radius:'半径建边',group:'换乘组',override:'站对覆盖',fallback:'低置信回退'};
+const ACCESS_MODE_LABEL={walk:'重轨步行≤800m',short_bus:'重轨短驳≤1.5km',long_bus_or_taxi:'重轨远驳/打车',none:'无重轨数据'};
+function transferLedgerHtml(tr,nextLeg){
+  const fromLabel=fmtStation(tr.station,tr.telecode);
+  const waitVal=tr.wait_min||0;
+  if(tr.same){
+    return {
+      main:`⏱ 同站换乘 · ${esc(fromLabel)}`,
+      right:`实际停 <b>${fmtMin(waitVal)}</b>`,
+      title:''
+    };
+  }
+  const toLabel=fmtStation(tr.to_station||(nextLeg&&nextLeg.from)||'',tr.to_telecode||(nextLeg&&nextLeg.from_telecode)||'');
+  const rule=tr.source_rule||tr.cross_source||'radius';
+  const ruleCls='rule-'+(RULE_LABEL_MAP[rule]?rule:'radius');
+  const ruleText=RULE_LABEL_MAP[rule]||rule;
+  const distTxt=tr.distance_km!=null?`${Number(tr.distance_km).toFixed(1)}km`:'距离未知';
+  const accTxt=ACCESS_MODE_LABEL[tr.rail_access_mode]||'';
+  const baseEx=tr.base_extra!=null?tr.base_extra:(tr.effective_extra??tr.effective_cross_extra??0);
+  const hubEx=tr.hub_extra||0;
+  const disc=tr.transit_discount??tr.transit_discount_min??0;
+  const effEx=tr.effective_extra??tr.effective_cross_extra??baseEx;
+  const bufVal=tr.min_buffer!=null?tr.min_buffer:(waitVal-effEx);
+  const parts=[`基础${baseEx}m`];
+  if(hubEx>0)parts.push(`+枢纽${hubEx}m`);
+  if(disc>0)parts.push(`-城轨估算${disc}m`);
+  const formula=(hubEx>0||disc>0||rule==='radius')?`${parts.join('')}=${effEx}m`:`要求额外${effEx}m`;
+  const suspectBadge=tr.is_suspect?' <span class="kflag gone">含可疑坐标</span>':'';
+  const reasonTip=tr.transit_reason||'';
+  return {
+    main:`⏱ <span class="kflag ${ruleCls}">${esc(ruleText)}</span>${suspectBadge} ${esc(fromLabel)} → ${esc(toLabel)} <span class="num" style="color:var(--muted)">(${esc(distTxt)}${accTxt?' · '+esc(accTxt):''})</span> · <span class="mono">${esc(formula)}</span>`,
+    right:`实际停 <b>${fmtMin(waitVal)}</b> · 净候车 <b class="num">${bufVal}m</b>`,
+    title:reasonTip
+  };
+}
+
 function render(){
   if(!R)return;
   const list=sortPlans(filterPlans([...R.direct,...R.transfers]));
@@ -2108,8 +2417,17 @@ function render(){
   const nd=list.filter(p=>p._type==='direct').length;
   const nt=list.length-nd;
   const diag=pruneDiagHtml(list.length,nt);
+  const warns=[];
+  if(R.radius_truncated)warns.push('<span class="toolbar-warn">部分中转站物理半径内邻站超过 25 个，已按距离保留最近 25 个；如需更远站请改用换乘组或站对覆盖</span>');
+  if(R.zero_override_active)warns.push('<span class="toolbar-warn">已启用 0 分钟站对覆盖，多程搜索已自动下探最小跨站下界</span>');
+  if(R.fallback_impact&&R.fallback_impact.auto_disable_recommended&&R.prune_config&&R.prune_config.fallback_ungeocoded){
+    warns.push(`<span class="toolbar-warn">全库坐标有效覆盖率 ${R.fallback_impact.ok_pct}% ≥ 98%，建议关闭无坐标同城回退</span>`);
+  }
+  const warnBar=warns.length?`<div class="toolbar-note">${warns.join('')}</div>`:'';
+  const filterControls=`<label class="chk-inline"><input type="checkbox" id="s-hide-fallback" ${hideFallbackPlans?'checked':''} onchange="hideFallbackPlans=this.checked;page=1;render();refreshAutoQuery()"> 过滤含回退边方案</label>
+    <label class="chk-inline"><input type="checkbox" id="s-hide-suspect" ${hideSuspectPlans?'checked':''} onchange="hideSuspectPlans=this.checked;page=1;render();refreshAutoQuery()"> 过滤含可疑坐标</label>`;
   if(!list.length){
-    $('s-result').innerHTML=`<div class="card">无匹配方案。若选了“席位”筛选，需先查询余票；或在“爬取数据”页抓取两端大屏/时刻表。${diag}</div>`;
+    $('s-result').innerHTML=`<div class="card"><div class="res-toolbar"><span>无匹配方案。若选了“席位”筛选，需先查询余票；或在“爬取数据”页抓取两端大屏/时刻表。</span><div style="display:flex;gap:10px;flex-wrap:wrap">${filterControls}</div></div>${warnBar}${diag}</div>`;
     return;
   }
   const pagePlans=list.slice((page-1)*size,page*size);
@@ -2122,6 +2440,7 @@ function render(){
     <div class="res-toolbar">
       <div><b>共 <span class="num">${list.length}</span> 个方案</b>（直达 <span class="num">${nd}</span> / 换乘 <span class="num">${nt}</span>），按${sortName}排序${elapsedBadge}</div>
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        ${filterControls}
         <div class="seg-group" title="切换国铁网页多列表格与手机 12306 紧凑卡片">
           <button type="button" class="${vmSel==='auto'?'active':''}" onclick="setViewMode('auto')">自适应</button>
           <button type="button" class="${vmSel==='web'?'active':''}" onclick="setViewMode('web')">国铁表格</button>
@@ -2130,6 +2449,7 @@ function render(){
         <label style="display:inline-flex;align-items:center;gap:5px;margin:0;color:var(--text);cursor:pointer"><input type="checkbox" id="s-show-prices" ${displayCfg.showGridPrices?'checked':''} style="width:auto" onchange="displayCfg.showGridPrices=this.checked;saveDisplayCfg();render()"> 显示票价</label>
       </div>
     </div>
+    ${warnBar}
     ${colInfoSummaryHtml(lastSearchColInfo,expandAllSearchCols,'toggleSearchExpandCols',true)}
     ${transferOnlyNote()}${diag}${pagerHtml(pages)}
   </div>`;
@@ -2142,9 +2462,13 @@ function planHtml(p,effCols,viewMode){
   const gone=departed(p);
   const trs=p._type==='transfer'?(p.transfers||[]):[];
   const tagTransfer=trs.length?(trs.every(t=>t.same)?'全程同站换乘':(trs.every(t=>!t.same)?'全程异站换乘':'含异站换乘')):'';
+  const hasFb=trs.some(t=>t.is_fallback||t.source_rule==='fallback');
+  const hasSusp=trs.some(t=>t.is_suspect);
   const flags=[
     `<span class="kflag ${p._type==='direct'?'direct':'xfer'}">${p._type==='direct'?'直达':`换乘${trs.length}次`}</span>`,
     tagTransfer?`<span class="kflag xfer">${tagTransfer}</span>`:'',
+    hasFb?`<span class="kflag rule-fallback">含低置信回退</span>`:'',
+    hasSusp?`<span class="kflag gone">含可疑坐标</span>`:'',
     p.date_assumed
       ?`<span class="kflag est" title="源日期: ${esc(p.source_date||'时刻表')}">推算${p.source_date?'('+esc(p.source_date)+')':''}</span>`
       :`<span class="kflag real">实测日期</span>`,
@@ -2167,8 +2491,8 @@ function planHtml(p,effCols,viewMode){
       chunks.push(renderMobileLegHtml(p.legs[i],p,i,effCols,gone));
       if(i<p.legs.length-1){
         const tr=trs[i]||{station:'',same:true,wait_min:0};
-        const fromLabel=fmtStation(tr.station,tr.telecode),toLabel=fmtStation(p.legs[i+1].from,p.legs[i+1].from_telecode);
-        chunks.push(`<div class="m-wait-bar"><span>⏱ ${tr.same?'同站换乘':'<b>异站换乘</b>'} · ${esc(fromLabel)}${tr.same?'':' → '+esc(toLabel)}</span><b>停留 ${fmtMin(tr.wait_min||0)}</b></div>`);
+        const lg=transferLedgerHtml(tr,p.legs[i+1]);
+        chunks.push(`<div class="m-wait-bar" title="${esc(lg.title)}"><span>${lg.main}</span><span>${lg.right}</span></div>`);
       }
     }
     bodyHtml=`<div class="m-legs">${chunks.join('')}</div>`;
@@ -2226,8 +2550,8 @@ function planHtml(p,effCols,viewMode){
 
       if(i<p.legs.length-1){
         const tr=trs[i]||{station:'',same:true,wait_min:0};
-        const fromLabel=fmtStation(tr.station,tr.telecode),toLabel=fmtStation(p.legs[i+1].from,p.legs[i+1].from_telecode);
-        rowsHtml+=`<tr class="rail-wait-row"><td colspan="${colSpan}">⏱ 中转衔接：${tr.same?'同站换乘':'<b>异站换乘（含同城跨站交通）</b>'} · ${esc(fromLabel)}${tr.same?'':' → '+esc(toLabel)} · 换乘预留 <b>${fmtMin(tr.wait_min||0)}</b></td></tr>`;
+        const lg=transferLedgerHtml(tr,p.legs[i+1]);
+        rowsHtml+=`<tr class="rail-wait-row" title="${esc(lg.title)}"><td colspan="${colSpan}"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><span>${lg.main}</span><span>${lg.right}</span></div></td></tr>`;
       }
     }
     bodyHtml=`<div class="scroll"><table class="rail-tbl">${railTableHeadHtml(effCols)}<tbody>${rowsHtml}</tbody></table></div>`;
@@ -2920,6 +3244,343 @@ $('b-go').onclick=async()=>{
   }catch(e){msg('b-msg',e.message,false);}
 };
 
+// ---------- 方案 C v2：地理坐标、重轨邻近、换乘组、站对覆盖与重轨城市 ----------
+let geoPoll=null,activeGeoJob=null;
+async function loadGeoAll(){
+  await Promise.all([loadGeoStatus(),loadGeoStations(),loadTransferGroups(),loadTransferPairs(),loadTransitCities()]);
+}
+async function loadGeoStatus(){
+  try{
+    const s=await api('/api/geo/status');
+    const cp=s.checkpoint||{};
+    $('g-stats').innerHTML=[
+      ['有效坐标',`${s.ok_coords||0} / ${s.total||0} (${s.pct||0}%)`],
+      ['人工锁定',s.verified_coords||0],
+      ['可疑待审',s.suspect||0],
+      ['缺失坐标',s.missing||0],
+      ['重轨站点',s.rail_stops_count||0],
+      ['接驳已测算',s.rail_proximity_ready||0],
+      ['切片断点',`${cp.tiles_done||0}/${cp.tiles_total||0}${cp.wikidata_done?' +WD':''}`]
+    ].map(([k,v])=>`<div class="s"><b class="num">${esc(v)}</b>${esc(k)}</div>`).join('');
+    const fi=s.fallback_impact||{};
+    const citiesTxt=(fi.top_affected_cities||[]).slice(0,5).map(c=>`${c.city}(${c.fallback_pairs}对)`).join('、');
+    const fbBox=$('geo-fallback-box');
+    if(s.total===0){
+      fbBox.innerHTML='<span class="hint" style="margin:0">站名表为空，请先点击上方「更新车站站名表」。</span>';
+    }else{
+      const rec=fi.auto_disable_recommended
+        ?`<span class="kflag real">有效覆盖 ${fi.ok_pct}% ≥ 98%，建议关闭回退</span>`
+        :`<span class="kflag est">当前关闭同城回退</span>`;
+      fbBox.innerHTML=`${rec} <span>无坐标同城站对共 <b class="num">${fi.fallback_removed_pairs||0}</b> 对${citiesTxt?'（主要城市：'+esc(citiesTxt)+'）':''}；建议补全坐标或通过换乘组/站对显式放行。</span>`;
+    }
+    if(s.attribution)$('g-attrib').textContent=s.attribution;
+  }catch(_e){}
+}
+async function loadGeoStations(){
+  const tbl=$('g-st-table');if(!tbl)return;
+  try{
+    const st=$('g-st-filter').value,q=$('g-st-q').value.trim();
+    const d=await api(`/api/geo/stations?status=${encodeURIComponent(st)}&q=${encodeURIComponent(q)}&limit=80`);
+    const list=d.stations||[];
+    if(!list.length){
+      tbl.innerHTML=`<div class="hint">当前筛选条件(${esc(st)})下暂无匹配车站（总数 ${d.total||0}）。</div>`;
+      return;
+    }
+    tbl.innerHTML=`<div class="hint" style="margin:0 0 6px">匹配 <b class="num">${d.total}</b> 站，显示前 ${list.length} 站</div>
+      <table class="std-tbl"><thead><tr><th>站名 / 电报码</th><th>城市 / 都市圈</th><th>纬度 lat / 经度 lon</th><th>状态 & 质检说明</th><th>重轨距(m) / 枢纽</th><th>操作</th></tr></thead><tbody>`+
+      list.map(r=>{
+        const tc=r.telecode;
+        const badgeCls=r.coord_status==='verified'?'real':(r.coord_status==='ok'?'upd':(r.coord_status==='suspect'?'gone':'est'));
+        return `<tr data-gtc="${esc(tc)}">
+          <td><b>${esc(r.name)}</b> <span class="mono" style="color:var(--muted)">${esc(tc)}</span></td>
+          <td>${esc(r.city||'--')}<br><input class="inline-edit sm" data-gf="zone" value="${esc(r.transit_zone_id||'')}" placeholder="圈群"></td>
+          <td>
+            <div style="display:flex;gap:4px">
+              <input class="inline-edit" data-gf="lat" type="number" step="0.000001" value="${r.lat!=null?r.lat:''}" placeholder="lat">
+              <input class="inline-edit" data-gf="lon" type="number" step="0.000001" value="${r.lon!=null?r.lon:''}" placeholder="lon">
+            </div>
+          </td>
+          <td><span class="kflag ${badgeCls}">${esc(r.coord_status)}</span> <small class="mono">${esc(r.coord_source||'')}</small>${r.coord_issue?`<br><small style="color:#dc2626">${esc(r.coord_issue)}</small>`:''}</td>
+          <td>
+            <div style="display:flex;gap:6px;align-items:center">
+              <input class="inline-edit sm" data-gf="rdist" type="number" min="0" value="${r.nearest_rail_stop_distance_m!=null?r.nearest_rail_stop_distance_m:''}" placeholder="自动">
+              <label class="chk-inline"><input type="checkbox" data-gf="hub" ${r.is_major_hub?'checked':''}>枢纽</label>
+            </div>
+          </td>
+          <td>
+            <div style="display:flex;gap:4px">
+              <button type="button" class="mini" onclick="saveGeoRow('${esc(tc)}')">保存锁定</button>
+              <button type="button" class="mini orange" onclick="nomLookupRow('${esc(tc)}')" title="单站低频人工点查（≥1.5s 间隔）">Nominatim点查</button>
+            </div>
+          </td>
+        </tr>`;
+      }).join('')+'</tbody></table>';
+  }catch(e){tbl.innerHTML=`<div class="hint" style="color:#dc2626">${esc(e.message)}</div>`;}
+}
+async function saveGeoRow(tc){
+  const tr=document.querySelector(`tr[data-gtc="${CSS.escape(tc)}"]`);
+  if(!tr)return;
+  const latV=tr.querySelector('[data-gf="lat"]').value.trim();
+  const lonV=tr.querySelector('[data-gf="lon"]').value.trim();
+  const zoneV=tr.querySelector('[data-gf="zone"]').value.trim();
+  const distV=tr.querySelector('[data-gf="rdist"]').value.trim();
+  const hubV=tr.querySelector('[data-gf="hub"]').checked;
+  try{
+    await post('/api/geo/station/'+encodeURIComponent(tc),{
+      lat:latV===''?null:+latV,
+      lon:lonV===''?null:+lonV,
+      coord_status:(latV!==''&&lonV!=='')?'verified':'missing',
+      transit_zone_id:zoneV,
+      nearest_rail_stop_distance_m:distV===''?-1:+distV,
+      is_major_hub:hubV
+    });
+    msg('g-msg',`【人工校对】已保存并锁定 ${tc}`);
+    await loadGeoStatus();
+    await loadGeoStations();
+  }catch(e){msg('g-msg',e.message,false);}
+}
+async function nomLookupRow(tc){
+  const tr=document.querySelector(`tr[data-gtc="${CSS.escape(tc)}"]`);
+  if(!tr)return;
+  msg('g-msg',`【Nominatim 点查】正在检索 ${tc}…`);
+  try{
+    const d=await post('/api/geo/nominatim/'+encodeURIComponent(tc),{});
+    tr.querySelector('[data-gf="lat"]').value=d.lat;
+    tr.querySelector('[data-gf="lon"]').value=d.lon;
+    msg('g-msg',`【Nominatim 点查】命中 ${d.name}(${tc})：${d.lat}, ${d.lon}（${d.display_name||'已填入表格，请确认无误后点“保存锁定”'}）`);
+  }catch(e){msg('g-msg',e.message,false);}
+}
+async function startGeoCrawl(opts){
+  if(geoPoll){clearInterval(geoPoll);geoPoll=null;}
+  setProg('g-prog',0,1);
+  $('g-log').innerHTML='';$('g-log').className='logbox';
+  msg('g-msg','【地理抓取】正在提交公共数据源抓取任务…');
+  try{
+    const r=await post('/api/geo/crawl/start',opts);
+    activeGeoJob=r.job_id;
+    setCancelBtn('g-cancel',r.job_id,()=>{clearInterval(geoPoll);geoPoll=null;activeGeoJob=null;setProg('g-prog',null);msg('g-msg','【地理抓取】已中断任务',false);});
+    const tick=async()=>{
+      try{
+        const j=await api('/api/jobs/'+r.job_id);
+        renderJobLog($('g-log'),j);
+        setProg('g-prog',j.done,j.total);
+        if(j.status==='running'){
+          const pct=j.total?Math.round(j.done*100/j.total):0;
+          msg('g-msg',`【地理抓取】${j.done}/${j.total} (${pct}%)${etaTxt(j)}${j.current?' — '+j.current:''}`);
+          return;
+        }
+        clearInterval(geoPoll);geoPoll=null;activeGeoJob=null;setCancelBtn('g-cancel',null);setProg('g-prog',null);
+        if(j.status==='cancelled'){msg('g-msg',`【地理抓取】任务已停止${actualDurTxt(j.elapsed_sec)}`,false);}
+        else if(j.status==='error'){msg('g-msg',(j.error||'地理抓取失败')+actualDurTxt(j.elapsed_sec),false);}
+        else{
+          const res=j.result||{};
+          const trialNote=res.trial_tiles?`；试跑 ${res.trial_requests} 请求 ${res.trial_mb}MB，推算全国全量约 ${res.estimated_full_requests} 次/${res.estimated_full_mb}MB`:'';
+          msg('g-msg',`【地理抓取完成】国铁 +${res.total_matched||0} 站（Overpass ${res.matched_overpass||0} / Wikidata ${res.matched_wikidata||0}），重轨 +${res.matched_rail_stops||0} 站${trialNote}${actualDurTxt(j.elapsed_sec)}`);
+        }
+        await loadGeoStatus();
+        await loadGeoStations();
+      }catch(e){clearInterval(geoPoll);geoPoll=null;activeGeoJob=null;setCancelBtn('g-cancel',null);setProg('g-prog',null);msg('g-msg',e.message,false);}
+    };
+    tick();
+    geoPoll=setInterval(tick,1000);
+  }catch(e){setProg('g-prog',null);msg('g-msg',e.message,false);}
+}
+$('g-trial').onclick=()=>startGeoCrawl({trial_tiles:5,use_overpass:true,use_wikidata:false});
+$('g-crawl').onclick=()=>startGeoCrawl({use_overpass:true,use_wikidata:true});
+$('g-reset-crawl').onclick=()=>startGeoCrawl({force:true,reset_checkpoint:true,use_overpass:true,use_wikidata:true});
+$('g-audit').onclick=async()=>{
+  msg('g-msg','正在执行多维坐标质检与重轨邻近计算…');
+  try{
+    const r=await post('/api/geo/audit',{});
+    const a=r.audit||{},p=r.proximity||{};
+    msg('g-msg',`【质检完成】核查 ${a.checked||0} 站，标疑 ${a.suspect||0} 站；重轨接驳：步行 ${p.walk||0} / 短驳 ${p.short_bus||0} / 远驳 ${p.long_bus_or_taxi||0}`);
+    await loadGeoStatus();
+    await loadGeoStations();
+  }catch(e){msg('g-msg',e.message,false);}
+};
+$('g-st-filter').onchange=loadGeoStations;
+$('g-st-load').onclick=loadGeoStations;
+
+// 换乘组管理
+$('grp-mode').onchange=()=>{
+  const isStar=$('grp-mode').value==='hub_star';
+  $('grp-hub').disabled=!isStar;
+  if(isStar&&numVal('grp-extra',45)<5)$('grp-extra').value='20';
+};
+function clearGroupForm(){
+  $('grp-id').value='';$('grp-name').value='';$('grp-mode').value='full_mesh';
+  $('grp-hub').value='';$('grp-hub').disabled=true;$('grp-extra').value='45';
+  $('grp-def-on').checked=true;$('grp-members').value='';$('grp-note').value='';
+}
+$('grp-clear').onclick=clearGroupForm;
+async function loadTransferGroups(){
+  try{
+    const d=await api('/api/transfer_groups');
+    const list=d.groups||[];
+    const tbl=$('grp-table');
+    if(!list.length){
+      tbl.innerHTML='<div class="hint">暂无自定义换乘组。</div>';
+    }else{
+      tbl.innerHTML=`<table class="std-tbl"><thead><tr><th>组名</th><th>模式</th><th>加时</th><th>默认</th><th>成员(数量)</th><th>操作</th></tr></thead><tbody>`+
+        list.map(g=>{
+          const mTxt=(g.members||[]).map(m=>`${m.name}(${m.telecode})`).join('、');
+          const modeLabel=g.connect_mode==='hub_star'?`星型(${esc(g.hub_telecode)})`:'全连通';
+          return `<tr>
+            <td><b>${esc(g.name)}</b>${g.note?`<br><small style="color:var(--muted)">${esc(g.note)}</small>`:''}</td>
+            <td>${modeLabel}</td>
+            <td class="num">${g.default_extra_min!=null?g.default_extra_min+'分':'智能'}</td>
+            <td>${g.enabled_by_default?'<span class="kflag real">是</span>':'<span class="kflag">否</span>'}</td>
+            <td style="white-space:normal;max-width:420px"><b class="num">${(g.members||[]).length}站</b>：${esc(mTxt)}</td>
+            <td>
+              <button type="button" class="mini" onclick="editGroup(${g.id})">编辑</button>
+              <button type="button" class="mini orange" onclick="deleteGroup(${g.id})">删除</button>
+            </td>
+          </tr>`;
+        }).join('')+'</tbody></table>';
+    }
+    loadSearchCrossMeta();
+  }catch(_e){}
+}
+function editGroup(gid){
+  const g=cachedGroups.find(x=>x.id===gid);
+  if(!g)return;
+  $('grp-id').value=String(g.id);
+  $('grp-name').value=g.name||'';
+  $('grp-mode').value=g.connect_mode||'full_mesh';
+  $('grp-hub').disabled=($('grp-mode').value!=='hub_star');
+  $('grp-hub').value=g.hub_telecode||'';
+  $('grp-extra').value=g.default_extra_min!=null?String(g.default_extra_min):'';
+  $('grp-def-on').checked=!!g.enabled_by_default;
+  $('grp-members').value=(g.members||[]).map(m=>m.telecode).join(',');
+  $('grp-note').value=g.note||'';
+}
+async function deleteGroup(gid){
+  try{
+    await api('/api/transfer_groups/'+gid,{method:'DELETE'});
+    msg('grp-msg',`已删除换乘组 #${gid}`);
+    await loadTransferGroups();
+  }catch(e){msg('grp-msg',e.message,false);}
+}
+$('grp-save').onclick=async()=>{
+  const rawMems=$('grp-members').value.trim().split(/[,，\s]+/).filter(Boolean);
+  const idVal=$('grp-id').value.trim();
+  const exVal=$('grp-extra').value.trim();
+  try{
+    await post('/api/transfer_groups',{
+      id:idVal?+idVal:null,
+      name:$('grp-name').value.trim(),
+      connect_mode:$('grp-mode').value,
+      hub_telecode:$('grp-hub').value.trim(),
+      default_extra_min:exVal===''?null:+exVal,
+      enabled_by_default:$('grp-def-on').checked,
+      members:rawMems,
+      note:$('grp-note').value.trim()
+    });
+    msg('grp-msg','【换乘组】保存成功');
+    clearGroupForm();
+    await loadTransferGroups();
+  }catch(e){msg('grp-msg',e.message,false);}
+};
+
+// 站对覆盖规则
+async function loadTransferPairs(){
+  try{
+    const d=await api('/api/transfer_pairs');
+    const list=d.pairs||[];
+    const tbl=$('pr-table');
+    if(!list.length){
+      tbl.innerHTML='<div class="hint">暂无站对覆盖规则。</div>';
+      return;
+    }
+    tbl.innerHTML=`<table class="std-tbl"><thead><tr><th>站对 A ↔ B</th><th>规则</th><th>专属加时</th><th>备注</th><th>操作</th></tr></thead><tbody>`+
+      list.map(p=>`<tr>
+        <td><b>${esc(fmtStation(p.a_name,p.a_telecode))}</b> ↔ <b>${esc(fmtStation(p.b_name,p.b_telecode))}</b></td>
+        <td><span class="kflag ${p.mode==='allow'?'rule-override':'gone'}">${p.mode==='allow'?'强制连通':'强制屏蔽'}</span></td>
+        <td class="num">${p.mode==='block'?'--':(p.custom_extra_min!=null?p.custom_extra_min+'分':'按智能公式')}</td>
+        <td>${esc(p.note||'')}</td>
+        <td><button type="button" class="mini orange" onclick="deletePair(${p.id})">删除</button></td>
+      </tr>`).join('')+'</tbody></table>';
+  }catch(_e){}
+}
+async function deletePair(pid){
+  try{
+    await api('/api/transfer_pairs/'+pid,{method:'DELETE'});
+    msg('pr-msg',`已删除站对规则 #${pid}`);
+    await loadTransferPairs();
+  }catch(e){msg('pr-msg',e.message,false);}
+}
+$('pr-preview-btn').onclick=async()=>{
+  const a=$('pr-a').value.trim(),b=$('pr-b').value.trim();
+  const out=$('pr-preview-out');
+  if(!a||!b){msg('pr-msg','请填写站点 A 与站点 B',false);return;}
+  try{
+    const rad=Math.max(0,Math.min(100,numVal('s-radius',20)));
+    const p=new URLSearchParams({a,b,cross_radius_km:String(rad),cross_time_mode:$('s-cross-mode').value});
+    const r=await api('/api/transfer_pairs/preview?'+p);
+    out.style.display='';
+    const ev=r.eval;
+    const dStr=r.distance_km!=null?`${Number(r.distance_km).toFixed(2)}km`:'无有效坐标';
+    const saInfo=`${r.a.name}(${r.a.telecode}) [${r.a.coord_status} · 圈群:${r.a.transit_zone_id||'--'} · 重轨:${r.a.nearest_rail_stop_distance_m!=null?r.a.nearest_rail_stop_distance_m+'m':'未知'}${r.a.is_major_hub?' · 大枢纽':''}]`;
+    const sbInfo=`${r.b.name}(${r.b.telecode}) [${r.b.coord_status} · 圈群:${r.b.transit_zone_id||'--'} · 重轨:${r.b.nearest_rail_stop_distance_m!=null?r.b.nearest_rail_stop_distance_m+'m':'未知'}${r.b.is_major_hub?' · 大枢纽':''}]`;
+    if(!ev){
+      out.innerHTML=`<span class="toolbar-warn">当前未连通</span> <span>${esc(saInfo)} ↔ ${esc(sbInfo)}（物理距离 ${esc(dStr)}）</span>`;
+    }else{
+      out.innerHTML=`<span class="kflag rule-${esc(ev.source_rule)}">${esc(RULE_LABEL_MAP[ev.source_rule]||ev.source_rule)}</span> <b>${esc(dStr)}</b> · 基础${ev.base_extra}m + 枢纽${ev.hub_extra}m - 城轨估算${ev.transit_discount}m = <b>要求额外 ${ev.effective_extra}m</b> · ${esc(ev.transit_reason||'')} ｜ ${esc(saInfo)} ↔ ${esc(sbInfo)}`;
+    }
+  }catch(e){out.style.display='none';msg('pr-msg',e.message,false);}
+};
+$('pr-save').onclick=async()=>{
+  const a=$('pr-a').value.trim(),b=$('pr-b').value.trim();
+  const mode=$('pr-mode').value,ex=$('pr-extra').value.trim();
+  try{
+    await post('/api/transfer_pairs',{
+      a_telecode:a,b_telecode:b,mode,
+      custom_extra_min:(mode==='allow'&&ex!=='')?+ex:null,
+      note:$('pr-note').value.trim()
+    });
+    msg('pr-msg','【站对规则】保存成功');
+    await loadTransferPairs();
+  }catch(e){msg('pr-msg',e.message,false);}
+};
+
+// 重轨城市名录
+$('tc-toggle').onclick=()=>{
+  const d=$('tc-drawer');
+  const show=d.style.display==='none';
+  d.style.display=show?'block':'none';
+  $('tc-toggle').textContent=show?'收起名录 ▴':'展开名录 ▾';
+};
+async function loadTransitCities(){
+  try{
+    const d=await api('/api/transit_cities');
+    const list=d.cities||[];
+    $('tc-summary').textContent=`已收录 ${list.length} 个重轨/市域城市`;
+    $('tc-list').innerHTML=list.map(c=>`<span class="od-chip">${esc(c.city)} <small style="opacity:.7">${esc(c.label)}</small><button type="button" title="从名录移除" onclick="removeTransitCity('${esc(c.city)}')">×</button></span>`).join('');
+  }catch(_e){}
+}
+async function removeTransitCity(city){
+  try{
+    await post('/api/transit_cities',{city,enabled:false});
+    msg('tc-msg',`已移除重轨城市「${city}」`);
+    await loadTransitCities();
+  }catch(e){msg('tc-msg',e.message,false);}
+}
+$('tc-save').onclick=async()=>{
+  try{
+    await post('/api/transit_cities',{city:$('tc-city').value.trim(),label:$('tc-label').value.trim()||'地铁/市域',enabled:true});
+    msg('tc-msg','已更新重轨城市名录');
+    $('tc-city').value='';
+    await loadTransitCities();
+  }catch(e){msg('tc-msg',e.message,false);}
+};
+$('tc-reset').onclick=async()=>{
+  try{
+    await post('/api/transit_cities/reset',{});
+    msg('tc-msg','已恢复默认重轨城市名录');
+    await loadTransitCities();
+  }catch(e){msg('tc-msg',e.message,false);}
+};
+
 // 回车快捷提交（自动避让已展开且选中的自动补全下拉框）
 function attachEnter(ids,btnId){
   ids.forEach(id=>{
@@ -2931,11 +3592,13 @@ function attachEnter(ids,btnId){
     });
   });
 }
-attachEnter(['s-from','s-to','s-f-str','s-t-str','s-from-mix','s-to-mix','s-date','s-min','s-max','s-cross','s-filter','s-fk','s-maxh','s-detour','s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'],'s-go');
+attachEnter(['s-from','s-to','s-f-str','s-t-str','s-from-mix','s-to-mix','s-date','s-min','s-max','s-cross','s-radius','s-transit-disc','s-transit-prox','s-filter','s-fk','s-maxh','s-detour','s-inc-pfx','s-exc-pfx','s-inc-tst','s-exc-tst'],'s-go');
 attachEnter(['w-from','w-to','w-date'],'w-go');
 attachEnter(['c-station','c-date'],'c-st-go');
 attachEnter(['c-from','c-to','c-t-date'],'c-t-go');
 attachEnter(['b-q'],'b-go');
+attachEnter(['g-st-q'],'g-st-load');
+loadSearchCrossMeta();
 </script>
 </body>
 </html>

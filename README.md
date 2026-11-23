@@ -74,15 +74,17 @@ app/
   crawler.py         12306 抓取 + 自适应/手动限速
   parsers.py         各接口原始返回 -> 结构化记录（字段索引与官方一致）
   importer.py        留档(raw_payloads) + 解析 + 入库（爬虫与手动导入共用）
-  db.py              SQLite 连接/事务/建表/车站与城市解析/设置
-  transfer.py        换乘搜索引擎（A 大屏 / B 时刻表 / C 余票 / D 多程）
+  db.py              SQLite 连接/事务/建表/车站与城市解析/换乘组与站对规则/设置
+  geo.py             方案 C 地理邻接索引（0.5° 动态空间格网）、连续单调计价、3 档重轨邻近减时、合规抓取与质检
+  transfer.py        换乘搜索引擎（A 大屏 / B 时刻表 / C 余票 / D 多程，含地理半径+5 层优先级异站模型）
   fare.py            本地票价估算 + 用实际票价反推费率校准
 static/
-  index.html         前端单页（换乘搜索 / 爬取数据 / 导入数据 / 数据浏览 四个页签）
+  index.html         前端单页（换乘搜索 / 爬取数据 / 导入数据 / 数据浏览 / 显示设置 五个页签）
 tests/
-  test_core.py       核心单元测试（解析、剪枝、缓存失效、HTTP 路由回归）
+  test_core.py       核心单元测试（解析、剪枝、缓存失效、方案 C 计价/格网/优先级/抓取质检、HTTP 路由回归）
 crawl_nationwide.py     全国全量离线爬取脚本（旧版简洁版）
 crawl_all_timetables.py  全国全量车站经由车次 + 去重全车次时刻表爬取脚本（默认明天、支持分阶段/按站筛选/已有时刻表跳过/断点重试）
+crawl_geo_coords.py      车站地理坐标与 43 城重轨站点合规批量抓取 CLI（Overpass 切片+Wikidata 补盲+多维质检，支持试跑与断点续跑）
 init_crawl.py          一键初始化（体检→复用 crawl_all_timetables 跑完全部车站大屏+全部车次时刻表→收尾核对），见 §4「初始化全量爬取」
 package.json             dev/start 启动脚本（调用 python3 -m app.server --port 3000）
 data/rail.db         本地数据库
@@ -95,7 +97,8 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 ```
 12306 接口 ──crawler──▶ 原始文本 ──importer.ingest──▶ raw_payloads(留档)
                                    └─parsers.parse_*─▶ 结构化记录 ─▶ 业务表
-业务表 ──transfer.search──▶ 直达/换乘方案 ──前端渲染──▶ 排序/筛选/自动查价
+OSM Overpass / Wikidata ──geo/crawl_geo_coords──▶ stations 经纬度 + rail_transit_stops ─▶ 多维质检
+业务表 + 地理/规则表 ──transfer.search──▶ 直达/换乘方案 ──前端渲染──▶ 排序/筛选/自动查价
 ```
 
 ---
@@ -104,13 +107,18 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 | 表 | 含义 | 唯一键 | 来源接口 |
 |---|---|---|---|
-| `stations` | 车站站名表（电报码/拼音/城市） | `telecode` | `station_name.js` |
+| `stations` | 车站站名表（电报码/拼音/城市 + 经纬度、coord_status 质检态、coord_grid、transit_zone_id、重轨距 `nearest_rail_stop_distance_m` / `rail_access_mode`、`is_major_hub`） | `telecode` | `station_name.js` + Overpass/Wikidata |
+| `rail_transit_stops` | **城市重轨站点**：全国 ~43 城地铁/轻轨/市域/单轨站点（已剔除纯有轨电车） | `(name, city, mode, lat, lon)` | Overpass 切片同步采集 |
 | `station_trains` | **车站大屏**：某站某日经由的所有车次（含到发时刻/跨天/累计里程） | `(station_telecode, station_train_code, station_train_date)` | `bigScreen/queryTrainByStation` |
 | `train_stops` | **车次时刻表**：某车次全部经停站 | `(train_no, train_date, station_no)` | `czxx/queryByTrainNo` |
 | `tickets` | **站间余票**：某 OD 某日的车次与席别余票 | `(train_no, train_date, from_telecode, to_telecode)` | `leftTicket/query` |
 | `prices` | **票价**：某车次某区间某席别价格 | `(train_no, train_date, from_station_no, to_station_no, seat_type)` | `leftTicket/queryTicketPrice` |
+| `transfer_groups` / `transfer_group_members` | **自定义换乘组**：用户手动维护的多站换乘组（上限 30 站，`full_mesh` 最小 `>=5m` / `hub_star` 放射） | `name` / `(group_id, telecode)` | UI / API |
+| `transfer_pair_overrides` | **站对强控规则**：任意两站强制连通（`allow`，可设 `custom_extra_min>=0`）或禁止换乘（`block`） | `(a_telecode, b_telecode)`（有序去重） | UI / API |
 | `raw_payloads` | 原始返回留档（api_type/params/source/fetched_at/payload） | 自增 id | 所有 |
-| `settings` | 键值设置（如限速模式） | `key` | — |
+| `settings` | 键值设置（如限速模式、`transit_city_overrides` 等） | `key` | — |
+
+> **旧库迁移顺序不变量（`db.init_db`）**：`SCHEMA` 字符串内**不可包含**依赖新增列（如 `coord_status`、`coord_grid`、`transit_zone_id`）的 `CREATE INDEX`；旧版 `rail.db` 升库时必须先在 `init_db()` 跑完 `ALTER TABLE stations ADD COLUMN ...` 迁移并填好默认值后，再创建 `idx_stations_coords` / `idx_stations_grid` / `idx_stations_zone`，否则旧库首次启动即因列不存在报错（见 §12 第 18 条）。
 
 ### 两个极易混淆的标识（二次修改务必注意）
 
@@ -199,6 +207,26 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 - 只爬车站大屏与车次时刻表，**不碰余票与票价**（那两类按 §8 的接口即时查询），
   与"联网只按需抓取公开接口"的产品口径一致。
 
+### 车站地理坐标与重轨站点合规抓取（`app/geo.py` + `crawl_geo_coords.py`）
+
+为支撑方案 C 物理距离异站换乘与 3 档重轨邻近减时，提供合规、可断点续跑的 CLI 工具与后台任务 `/api/geo/crawl/start`：
+
+```bash
+python3 crawl_geo_coords.py --trial-tiles 2     # 先试跑 2 个切片估算配额与带宽，不做 Wikidata 全量
+python3 crawl_geo_coords.py                     # 12 个 Overpass 区域切片 → Wikidata 补漏 → 重轨距离重算 → 多维质检
+python3 crawl_geo_coords.py --audit-only        # 仅离线运行多维质检与重轨距离重算（不联网）
+```
+
+- **两阶段合规批量流水线**：
+  1. **Overpass 12 区域切片**（`CHINA_OVERPASS_TILES`）：按中国大陆 12 块 BBox 串行拉取 `railway~station|halt`（默认请求间隔 `3.5s`，支持备用端点切换与 `--delay` 调整），同一次响应**同步采集国铁车站与交通运输部 2025 口径约 43 个核心城市重轨站点**（地铁/轻轨/市域铁路/单轨写入 `rail_transit_stops`，**显式剔除纯有轨电车城市**如红河、文山、嘉兴市区等，避免低频电车误触发重轨减时）。
+  2. **Wikidata SPARQL 一次性补漏**：针对仍无坐标的国铁站，单次 SPARQL 查询境内车站（`wd:Q55488` + `wdt:P17 wd:Q148` + `wdt:P625`）批量补盲。
+- **Nominatim 合规硬约束**：**严禁**在任何批量抓取流中调用 Nominatim（触发 OSM 1 req/s 使用政策封禁）；`POST /api/geo/nominatim/{telecode}` 仅开放给 UI「疑似/缺坐标站维护」表格的单站人工点查，内置强制 `≥1.5s` 全局冷却锁（`NOMINATIM_COOLDOWN_SEC=1.5`）。
+- **断点与人工保护**：断点落 `data/crawl_geo_coords_state.json`（记录已完成切片、`wikidata_done`、流量统计），`--reset`/`--force` 可重置；`coord_status='verified'` 的人工校准站永久受保护，不会被批量流覆盖。
+- **多维坐标质检（`audit_station_coords`）**：入库后自动跑三道校验并标出 `coord_status='suspect'`（搜前自动隔离，仅展示于维护队列）：
+  1. 中国边界盒检验（`CHINA_BBOX`）；
+  2. 同城中位离群检验（同 `city` 站距城市坐标中位数 `>150km` 标疑，附带 12306「站挂邻县市」豁免意识提示）；
+  3. **`train_stops` 物理速度校验**：遍历同车次相邻经停站，若 `球面距离 / 时刻差 > 420km/h`（飞站异常）自动标记相关站点 `suspect` 与 `coord_issue` 供人工核查。
+
 ---
 
 ## 5. 解析（`app/parsers.py`）[内核]
@@ -222,7 +250,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 
 ## 6. 换乘搜索引擎（`app/transfer.py`，核心）[内核]
 
-入口 `search(from_q, to_q, date, min_wait=30, max_wait=360, limit=0, max_legs=2, expand_city=True, cross_extra=60, frontier_k=None, prune_level="balanced", max_total_min=None, detour_ratio=None, prune_dominated=None, allow_cross_station=True, hub_only=False, hub_stations="", allow_prefixes="", exclude_prefixes="", include_stations="", exclude_stations="", include_stations_mode="or", city_mode=None, progress_cb=None, cancel_event=None, sub_cb=None)`；独立后置过滤器 `filter_plans(...)`。
+入口 `search(from_q, to_q, date, min_wait=30, max_wait=360, limit=0, max_legs=2, expand_city=True, cross_extra=60, frontier_k=None, prune_level="balanced", max_total_min=None, detour_ratio=None, prune_dominated=None, allow_cross_station=True, hub_only=False, hub_stations="", allow_prefixes="", exclude_prefixes="", include_stations="", exclude_stations="", include_stations_mode="or", city_mode=None, from_city_mode=None, to_city_mode=None, cross_radius_km=20.0, cross_time_mode="smart", transit_discount_on=True, transit_discount_min=15, transit_proximity_m=1500, active_group_ids=None, fallback_ungeocoded=False, progress_cb=None, cancel_event=None, sub_cb=None)`；独立后置过滤器 `filter_plans(...)`。
 
 ### 6.1 准备
 
@@ -248,13 +276,15 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
   ALTER + `_backfill_screen()` 从已存档报文回填，**零联网**。
 - `fkeys`/`tkeys`：出发/到达站的**电报码与站名集合**（兼容不同数据源用码或用名）。
 - 常驻缓存（`_get_graph_cache` / `_get_date_cache`）：全量路网只建一次并跨请求复用——
-  `_build_graph_cache` 装入 `n2c`、`cities`（城市分组，用于同城异站换乘）、`cal`
+  `_build_graph_cache` 装入 `n2c`、`cities`（城市分组，用于无坐标兜底回退）、`geo_index`（`geo.StationGeoIndex`：
+  含全国站坐标与状态、0.5°×0.5° 动态空间格网 `k=ceil(max_r / (111*cos(lat)*0.5))+1` 高低纬适配邻域、
+  预构建 `≤100km` 物理近邻与站对强控/活跃换乘组映射）、`cal`
   （`fare.load_calibration()` 费率校准）、`sno_base`（train_no+电报码→station_no）、`screen_all`
   （大屏）、`tt_all`（时刻表）、`services_all`（引擎 D 车次服务），并为每次查询附
   `screen_key_to_tn`/`tt_key_to_tn` 两张「站→车次」倒排索引，`search()` 靠它挑候选，
   不再遍历无关车次；`_get_date_cache` 再按日期缓存 `_price_map`（票价）、`_seat_map`（余票）、
   `real_tk` 与当日 `sno` 覆盖。失效口径为 `db.data_version()`（进程内写入代数 + 库文件与
-  `-wal` 的 mtime/size），变更后自动重建；响应里的 `cache_hit` 标明本次是否复用。
+  `-wal` 的 mtime/size），站坐标/重轨距/换乘组/站对规则修改后均经 `db.tx()` 自增版本触发重建；响应里的 `cache_hit` 标明本次是否复用。
 - `real_tk`：当日已爬到的权威余票 OD→车次集合，用于剔除与实际冲突的推算方案。
 - `_complete_screen_from_tt(screen, tt)`：大屏只记录"那天拍到的几个站"，行残缺。用 `train_no`
   （匹配不到再退回 `(车次码, 始发站, 终到站)`）找到停站更全的时刻表班次，把大屏缺的站补进 `obs`
@@ -278,11 +308,23 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
   另有 `DETOUR_FLOOR_MIN=480`（8 小时保底上限，防短途高铁误杀普速与低价中转）与 `SAFE_WAIT_MIN=30`（安全缓冲支配保护）；`frontier_k>0` 时每站每层保留"最快到达 + 最低费用"双路 top-`frontier_k`（未开启支配剪枝时走"入桶即截断"的有界桶压内存峰值）。非末程与末程统一按 `not is_last` / `is_last` 做过终点折返（`loopback`）、城市绕回、同城空转（如 `北京→北京南` 再换乘）与 `dur<=0` 防护校验，同时允许同车多个目的站展开。
 - 当 `max_legs=1` 时，`need_transfers=False` 跳过所有 2 程与多程扩展，仅返回直达方案（`transfers=[]`）。
 
-### 6.3 换乘约束、搜前枢纽收窄与后置过滤
+### 6.3 换乘约束、方案 C 异站建边、搜前枢纽收窄与后置过滤
 
-- 换乘等待 `wait` 须满足 `min_wait <= wait <= max_wait`；**同城异站换乘额外加时 `cross_extra`（默认 +60 分钟）**
-  （`eff_min = min_wait if same else min_wait + cross_extra`），也可设 `allow_cross_station=False` 禁绝异站。
-- 跨天：`n = ceil((到达 + eff_min - 第二程发车) / 1440)` 自动取下一班。
+- **五层非叠加异站规则（方案 C v2，`geo.eval_cross_pair`）**：同站换乘额外缓冲恒为 `0`；异站换乘仅当 `allow_cross_station=True` 时生效，按**严格非叠加优先级**仲裁一对 `(到达站 A, 出发站 B)`：
+  1. `block`（站对黑名单 `transfer_pair_overrides`）：一票否决，即使同城或在半径内也不连通；
+  2. `allow`（站对白名单，优先于半径）：强制连通，使用 `custom_extra_min`（`≥0`；若某激活规则设 `0m`，`search()` 标记 `zero_override_active=True` 并按最小实际缓冲计算可达下界）；
+  3. `active_group`（启用中的自定义换乘组）：同组两站强制连通，`full_mesh` 模式下额外加时保底 `≥5m`（`hub_star` 仅中心枢纽 ↔ 成员站连通）；
+  4. `radius`（物理直线距离半径 `0 ≤ cross_radius_km ≤ 100`）：仅接纳 `coord_status IN ('ok','verified')` 车站（**自动隔离 `suspect`/`missing`**），且每站邻近最多保留距其最近的 **Top-25**（`MAX_RADIUS_NEIGHBORS=25`）——若发生截断，响应标注 `radius_truncated=True` 并在 UI 提示收窄半径；
+  5. `fallback`（无坐标旧版同城兜底，**默认关闭 `fallback_ungeocoded=False`**）：开启后**仅对至少一端无可用坐标的同城站对**以固定 `+90m`（`FALLBACK_FIXED_EXTRA_MIN`）回退，并标 `is_fallback=True`；**当 `R=0` 时接口直接返回 HTTP 400 拒绝同时开启回退**（防误以为零半径禁绝异站却仍暗自连同城）。当站表 `ok` 覆盖率 `≥98%` 或回退命中过多时，响应附带 `fallback_impact.auto_disable_recommended` 劝关提示。
+- **单调连续距离计价与 3 档重轨邻近减时（`cross_time_mode="smart"` 默认 vs `"fixed"`）**：
+  - `fixed` 模式：按传统固定 `cross_extra`（默认 +60 分钟）；
+  - `smart` 模式：基于 `DISTANCE_TIER_BREAKPOINTS` `(0,3]→25–32m`, `(3,10]→32–48m`, `(10,20]→48–65m`, `(20,35]→65–85m`, `(35,100]→85–125m` 半开区间连续线性插值得到 `base_extra`，**若任一端为大型枢纽（`is_major_hub=1` 或在 `DEFAULT_MAJOR_HUB_NAMES`）加 `hub_extra=+5m`**，再按 `_round_half_up`（半入整舍，保证对整数平移不变）计算最终额外加时：
+    - **3 档重轨邻近减时（均标「估算」）**：需同时满足 `transit_discount_on=True`、两端属于同一可联通轨道圈群（支持如 `SH_KS` 沪昆、`GZ_FS` 广佛、`XA_XY` 西咸、`CD_ZY` 成资、`NJ_CZ` 宁滁等同城/圈群交集；**明确排除京津跨市地铁减时**），且依据 `nearest_rail_stop_distance_m` 决定折减系数：`walk`（≤800m）折算系数 1.0、`short_bus`（800m ~ `transit_proximity_m` 默认 1500m）折算系数 0.5、`>proximity_m` 归 0。**仅双端均满足邻近度**才取两端最小因子折扣（双端 `walk` 满减 15m、混配减半；例如**昆山南—安亭北**因安亭北距 11 号线安亭站 `>1500m`，反向验证不触发减时、`transit_reason="双端邻近度不满足"`）。
+    - **全局单调防倒挂**：`d ≤ 3km` 不减时；`3 < d ≤ 8km` 减时随距离从 0 线性坡升至上限，并对 `d=3.0km` 处取值做前缀上包络且保底 `MIN_SAFE_CROSS_EXTRA=20m`，数学上严格保证任意 `d2 > d1` 必有 `effective_extra(d2) >= effective_extra(d1)` 且恒等式 `base_extra + hub_extra - transit_discount == effective_extra` 成立。
+- **多程下界可容许性与同城跨站反剪枝**：
+  - 引擎 A/B/D 的异站边统一由 `geo.cross_candidates(geo_index, cfg)` 在搜索前物化；引擎 D 反向最短可达时间 `rev_dist`（剪枝下界）通过 `min_possible_cross_extra(geo_index, cfg)` 动态取同站 `0` 与活跃异站边最小额外加时（若存在 `0m` 自定义站对，下界精确降为 `0` 而不致漏解）。
+  - 经过 `A → B`（如 `昆山南(苏州) → 安亭北(上海)`）异站换乘抵达 `B` 城后，允许在 `B` 站上车继续走完 `B` 城路线——多程状态剔除「抵达城市」标签避免后续合法同市延伸被误判 `city_loop`（见 §12 第 15 条）。
+- 换乘等待 `wait` 须满足 `min_wait <= wait <= max_wait`；`eff_min = min_wait + effective_extra`。跨天：`n = ceil((到达 + eff_min - 第二程发车) / 1440)` 自动取下一班。
 - **防死循环与无意义分支硬剪枝**：重复车次（`repeat_train`）、重访出发/已乘车站及过终点后再绕回已乘车站的**过头折返**（`loopback`）、绕回已离开城市（`city_loop`）、刚上车未出城即在同城下一站换乘的**同城内耗空转**（`city_loop` / 首程 `loopback`）、已到目的站后再继续换乘（`passed_dest`）、以及 `dur <= 0` 脏停站边。
 - **指定枢纽站搜前收窄（`hub_only` / `hub_stations`）**：独立开关，开启后在图搜索阶段（引擎 A/B/D）仅允许经 `MAJOR_HUBS`（31 个直辖市/省会/首府 + 23 个重要干线铁路枢纽，共 54 处）或用户增删后的 `hub_stations` 换乘，拦截数计入 `prune_stats["hub_filter"]`。
 - **车次头与换乘站精确后置过滤（`filter_plans()`）**：`allow_prefixes`/`exclude_prefixes` 按车次头过滤；`include_stations`/`exclude_stations` 通过 `_match_station_tokens` 精确匹配**电报码、完整站名（含可选单后缀`站`）或所属城市名**（不做子串扩散，例如排除「北京南」不扩散到全北京，「南平市」不匹配同城「延平」），多个 `include_stations` 支持 `or`/`and`。该过滤已与图搜索解耦：前端在返回结果后即时本地执行，修改无需重搜；`search()` 响应附带 `station_cities` 与 `city_suffix_stations` 供前端精准复用。
@@ -304,7 +346,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 - `rank(p)`：**有真实票价的优先**，其次非推算（真实日期）优先。
 - 最终按 `total_min` 升序。`limit > 0` 是**直达+换乘的合计上限**（直达优先占额度），截断发生在
   `departed`/`date_assumed` 归一与 `station_cities` 汇总**之前**，因此这两处逐方案统计只作用于返回的方案。
-  返回含 `direct`/`transfers`/`direct_total`/`transfers_total`（截断前命中数）/`screen_trains`/`timetable_trains`/`cache_hit`/`prune_config`/`prune_stats`/`note`。
+  返回含 `direct`/`transfers`/`direct_total`/`transfers_total`（截断前命中数）/`screen_trains`/`timetable_trains`/`cache_hit`/`prune_config`/`prune_stats`/`radius_truncated`/`zero_override_active`/`fallback_impact`/`coord_coverage`/`note`。每条 `transfers[i]` 的换乘节点对象附带透明计价账本（`base_extra`/`hub_extra`/`transit_discount`/`effective_extra`/`source_rule`/`distance_km`/`rail_access_mode`/`transit_reason`/`is_fallback`/`is_suspect`）。
 - **默认值分两层**：`search()` 本身 `limit=0`（不限，脚本自行负责）；HTTP 层 `/api/transfers` 与
   `/api/transfers/start` 默认 `limit=1000`，前端不传即用该值。原因：两段枚举不设上限，实测
   深圳→广州命中 37.4 万条换乘，全量 JSON 数百 MB 会同时打死服务端与浏览器。要全量请显式传 `limit=0`。
@@ -316,7 +358,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 2. 无真实票价 → `fare.estimate` 得 `price_est`（估算区间）。
 3. 查 `_seat_map`（train_no+OD+日期）得 `seats`/`can_web_buy`。
 
-> 修改换乘行为的关键参数：`min_wait/max_wait/cross_extra`（API 传入，异站默认 +60）、`PRUNE_PRESETS`、`DETOUR_FLOOR_MIN`、`SAFE_WAIT_MIN`、`MAX_TIMETABLES`（main.py 向导封顶）。
+> 修改换乘行为的关键参数：`min_wait/max_wait/cross_extra`（固定模式默认 +60）、`cross_radius_km`（默认 20km，上限 100km）、`cross_time_mode`（`smart`/`fixed`）、`transit_discount_on`/`transit_discount_min`/`transit_proximity_m`、`fallback_ungeocoded`（默认 `False`）；`geo.py` 中的 `DISTANCE_TIER_BREAKPOINTS`/`RAIL_TRANSIT_CITIES`/`CROSS_CITY_TRANSIT_ZONES`/`MAX_RADIUS_NEIGHBORS`；`transfer.py` 中的 `PRUNE_PRESETS`、`DETOUR_FLOOR_MIN`、`SAFE_WAIT_MIN`、`MAX_TIMETABLES`。
 
 ### 6.6 缓存与过期策略
 
@@ -503,9 +545,22 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 | `GET /api/tickets?from_station=&to_station=&date=` | 浏览余票（批量附带匹配实测票价 `prices`/`price_date`/`price_stale`） |
 | `GET /api/prices?train_no=` | 浏览票价 |
 | `DELETE /api/cache` | 清理过期数据与内存缓存（`?before_date=必填&include_raw=`） |
-| `GET /api/transfers?...` | 同步换乘搜索（见 §6 参数） |
+| `GET /api/transfers?...` | 同步换乘搜索（见 §6 参数，含 `cross_radius_km`/`cross_time_mode`/`transit_*`/`active_group_ids`/`fallback_ungeocoded`） |
 | `POST /api/transfers/start` | 异步换乘搜索 → job（支持进度查询与中断） |
 | `POST /api/plan_tickets` | 方案实时查价/余票 → job |
+| `GET /api/geo/status` | 站坐标覆盖率（`ok`/`verified`/`suspect`/`missing`）、重轨停靠站总数与断点状态 |
+| `GET /api/geo/stations?status=&q=&limit=` | 按坐标状态（如 `suspect`/`missing`/`ok`/`verified`）分页浏览车站维护列表 |
+| `POST /api/geo/station/{telecode}` | 人工更新/校准车站坐标与 `is_major_hub`/`transit_zone_id`/`verified` 状态并自动重算重轨邻近度 |
+| `POST /api/geo/nominatim/{telecode}` | **仅 UI 单站人工点查** Nominatim（带 `≥1.5s` 强制冷却锁，返回候选供确认） |
+| `POST /api/geo/audit` | 立即重算全部站重轨邻近度并运行多维坐标质检 |
+| `POST /api/geo/crawl/start` | 后台启动 Overpass/Wikidata 批量地理采集 → job（支持 `trial_tiles`/`force`/`reset_checkpoint`） |
+| `GET/POST /api/transfer_groups` | 查询/新建或更新自定义换乘组（上限 30 站，`full_mesh` 最小 `>=5m` / `hub_star`） |
+| `DELETE /api/transfer_groups/{group_id}` | 删除自定义换乘组 |
+| `GET/POST /api/transfer_pairs` | 查询/保存任意两站强制连通（`allow`）或禁止（`block`）规则 |
+| `DELETE /api/transfer_pairs/{pair_id}` | 删除站对覆盖规则 |
+| `GET /api/transfer_pairs/preview?a=&b=&...` | 实时预览任意两站按当前半径/规则算出的直线距离、3 档重轨邻近度与计价明细 |
+| `GET/POST /api/transit_cities` | 读取 ~43 个内置核心重轨城市列表及自定义覆盖 |
+| `POST /api/transit_cities/reset` | 重置重轨城市覆盖配置为默认口径 |
 
 ---
 
@@ -519,6 +574,7 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 - `filterPlans`：统一后置本地过滤（即时生效、不重跑图搜索）——只含/排除车型头（`#s-inc-pfx`/`#s-exc-pfx`）、车次包含（`#s-filter`）、必经/排除换乘站（`#s-inc-tst` + `#s-inc-mode` OR/AND、`#s-exc-tst`，利用响应附带的 `station_cities` 与 `city_suffix_stations` 复现精确站名/城市匹配）、换乘类型（`#s-same`）、席位（`#s-seat`）、出发到达时间等。
   （"直达 0"通常是开了"仅换乘"、"同/异站换乘"或"必经换乘站"筛选所致，非 bug。）
 - 剪枝与指定枢纽收窄（搜前）：`#s-prune` 提供均衡 / 严格 / 高度宽松 / 无限制（仅防死循环） / 自定义五种策略，`#s-hub-only` 与 `#s-hubs`（可点「填入省会+大枢纽预设」自由增删）控制搜前仅经指定枢纽换乘；`#s-prune-panel` 仅保留纯数值/图参数（束宽 0=不限、总历时 0=不限、绕行倍率、异站分支、支配剪枝），不再混入后置过滤框。`pruneDiagHtml` 按需提供扩展 3 程、放宽至高度宽松/无限制、关闭仅枢纽重搜，以及一键 `清除后置筛选`（0ms 本地生效）。
+- **方案 C 异站配置条（`#s-cross-strip`）与透明账本**：搜索主面板集成物理搜寻半径预设（0 / 10 / 20 / 35 / 50 / 100 km）、计价模式（智能连续+重轨减时 / 固定 `+Xm`）、3 档重轨估算减时开关与邻近阈值（默认 1500m）、无坐标回退复选框（**默认关闭**；当 `R=0` 时联动禁用，开启时触发琥珀色低置信提示；当 `ok>=98%` 时展示劝关提醒）与已启用换乘组多选标签。结果列表新增 `#s-hide-fallback` / `#s-hide-suspect` 本地筛选，顶栏按需告警 `radius_truncated`（单站超 25 个邻近截断）与 `zero_override_active`（0m 强控规则放宽了 BFS 下界）；桌面端与手机端方案卡片统一渲染 `transferLedgerHtml`，就地展开 `基础 Xm + 枢纽 Ym - 重轨估算 Zm = 有效 Wm` 与规则来源徽标（规则/换乘组/半径+距离/低置信回退）。
 - **日期、双端视图与动态席位设置（`#tab-display`）**：所有查询/爬取日期输入项默认取北京时间**明天（+1 天）**（缓存清理基线维持今天避免误清）。结果区支持**国铁 12306 网页多列席别表格**与**铁路 12306 手机紧凑卡片**切换/自适应（`viewMode`）；第 5 页签「显示设置」支持配置：
   - **整页无数据冷门席位自动折叠**（`foldEmpty`）及手动单席位隐藏（支持在结果栏一键临时展开全部列）；
   - **互斥席位合并**（预设 `硬座-二等座`、`软座-一等座`、`动卧-二等卧(硬卧)`、`高级软卧-商务座` 及自定义合并），其中 **`商务座` 与 `特等座` 强制拆分为独立席位**；`KNOWN_COEXIST_PAIRS` 与 `computeEffectiveColumns()` 双重防线会在配置与渲染阶段拦截或自动拆分任何同车并存的席位组合。
@@ -526,9 +582,9 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
   `POST /api/plan_tickets` → `pollPlanJob` → `applyTickets` 按 key 回填真实价/余票。
 - `refreshAutoQuery()`：排序/筛选/翻页变化后防抖 900ms 重查（仅勾选"自动查询票价/余票"时）。
 - 时刻表与票价展开：`toggleTT`/`renderTT`/`ttTable`（升级为纵向圆点时间线 `●──○──●`，自动淡化上/下车之外经停站）与 `togglePriceRow`/`priceDrawerHtml`（见 §9）。
-- 爬取页：`crawlTT`/`showTimetable`（模态框）、`renderTickets`/`drawTicketsTable`（复用动态席位折叠与合并规则的国铁表格与行内展开）等。
+- 爬取页（`#tab-crawl`）：除大屏/时刻表/余票抓取外，集成 4 个方案 C 管理面板——`#geo-card`（覆盖率统计、Overpass/Wikidata 抓包与试跑、`suspect/missing` 人工维护 + Nominatim 单站校准）、`#groups-card`（自定义换乘组）、`#pairs-card`（站对允许/禁止与实时公式预览）、`#transit-card`（~43 城重轨名单维护）及 `crawlTT`/`showTimetable`（模态框）、`renderTickets`/`drawTicketsTable`（复用动态席位折叠与合并规则）。
 
-> 改前端排序/筛选/自动查询逻辑都在 `index.html` 的 `priceKey/sortPlans/filterPlans/autoQuery` 几处。
+> 改前端排序/筛选/自动查询逻辑都在 `index.html` 的 `priceKey/sortPlans/filterPlans/autoQuery` 几处；异站规则条与账本渲染在 `syncCrossStripUI/renderGroupPills/transferLedgerHtml`。
 
 ---
 
@@ -538,7 +594,9 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
 |---|---|
 | 12306 字段/接口改版 | `parsers.py`（`LT`/`SEAT_FIELDS`/`PRICE_KEYS`/`_find_stop_list`）、`crawler.py`（URL/参数） |
 | 限速快慢/风控策略 | `crawler.py`（`MIN_FLOOR/MAX_CEIL`、`_note_ok/_note_throttled`） |
-| 换乘最短/最长等待、异站预留 | API `min_wait/max_wait/cross_extra`（异站默认 +60）；`transfer.py` 各引擎 `eff_min` |
+| 换乘最短/最长等待、方案 C 异站建边与计价 | `geo.py`（`DISTANCE_TIER_BREAKPOINTS`/`compute_smart_extra`/`eval_cross_pair`/`StationGeoIndex`）；`transfer.py`（`eff_min`/`cross_candidates`）；API 半径与减时参数 |
+| 地理坐标采集、43 城重轨名单与多维质检 | `geo.py`（`GeoCoordCrawler`/`RAIL_TRANSIT_CITIES`/`CROSS_CITY_TRANSIT_ZONES`/`audit_station_coords`/`manual_nominatim_lookup`）；`crawl_geo_coords.py` |
+| 自定义换乘组、站对强制/禁止规则 | `db.py`（`transfer_groups`/`transfer_group_members`/`transfer_pair_overrides`）；`main.py`（`/api/transfer_groups*`/`/api/transfer_pairs*`） |
 | 多程剪枝/总时长上限/预设/核心枢纽 | `transfer.py`（`PRUNE_PRESETS`、`MAJOR_HUBS`、`DETOUR_FLOOR_MIN`、`SAFE_WAIT_MIN`、`filter_plans`）；`main.py`（`MAX_TIMETABLES`） |
 | 票价估算费率/速度 | `fare.py`（`RATES`/`SPEED`/`load_calibration`） |
 | 城市展开/别名/五档选站（含③城市+字样、④芯片多选、实时预览） | `db.py`（`city_stations`、`city_all_stations`、`CITY_PROPER`、`resolve_stations(city_mode)`）；`main.py`（`/api/stations/resolve`、`only_cities`、`from_city_mode`/`to_city_mode`）；前端 `index.html`（`initSidePicker`、`odState`、`schedulePreview`） |
@@ -575,6 +633,11 @@ diagnostics/         本地一次性诊断/基准脚本（被 .gitignore 忽略�
     `detour_ratio`/`prune_dominated` 在时刻表引擎是元组级早筛、在大屏引擎只在汇总阶段事后筛（且支配
     比较是平方级）。UI 上"束宽 8"对默认的最多 2 程根本不起作用。完整作用域矩阵与推论见 §6.7，
     返回体积的兜底靠 HTTP 层 `limit`（§6.4），不是靠档位。
+14. **重轨减时“双端邻近”反向样本与 Nominatim 批量禁令**：**昆山南—安亭北**虽跨入 `SH_KS` 圈群且距 11 号线不远，但安亭北距最近重轨站（安亭站）实际 >1500m，默认参数下**必须拒绝减时**（`transit_reason="双端邻近度不满足"`，不得为了凑减时放宽阈值）；京津虽有高铁城际但无同网地铁直连，明确排除跨市减时。此外 **Nominatim 严禁接入任何批量地理抓取脚本/队列**，只允许前端单站人工点击。
+15. **多程跨城换乘不可被误杀为 `city_loop`**：经 `A → B` 异站进入 `B` 城后（如 `昆山南→安亭北→上海`），状态剪枝计算已闭合城市集时必须排除落脚站 `B` 所在城市（`eff_closed = closed_cities - {dk_city}`），否则刚从异站接入 `B` 的后续合法出发车次会被误判绕回；且多程到达下界 `min_lb` 必须用 `min_possible_cross_extra()` 动态计入 `0m` 自定义放行规则。
+16. **智能计价必须用半入整舍 `_round_half_up`**：Python 内置 `round()` 是银行家偶舍入，在 `.5` 边界会导致 `round(base + hub) - round(base) != hub`（如 `28.5→28` 而 `33.5→34`），破坏 `base_extra + hub_extra - transit_discount == effective_extra` 账本恒等式与单调性；改 `geo.py` 时务必保持 `_round_half_up` + `3→8km` 前缀上包络。
+17. **默认关闭 `fallback_ungeocoded` 且与 `R=0` 互斥**：旧版仅靠 `city` 列绑定换乘正是万州北↔重庆北等百公里行政边界误连的根源，迁移期默认保持 `False`；且 `_validate_search_params` 在 `cross_radius_km == 0` 时禁止同时开启回退（HTTP 400）。
+18. **`init_db()` 旧库升库必须“先加列、再建索引”**：`SCHEMA` 常量里禁止放引用新地理列（`coord_status`/`coord_grid`/`transit_zone_id`）的索引；所有新增列索引须写在 `db.init_db()` 执行完 `ALTER TABLE` 迁移之后，保证携带历史数据的 `data/rail.db` 无痛升级。
 
 ---
 
