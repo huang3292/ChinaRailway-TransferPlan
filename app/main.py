@@ -1164,8 +1164,8 @@ class TransferSearchReq(BaseModel):
     fallback_ungeocoded: bool = False
     tree_prune_mode: str = "off"
     province_mode: str = "off"
-    allow_provinces: list[str] = []
-    exclude_provinces: list[str] = []
+    allow_provinces: list[str] | str = []
+    exclude_provinces: list[str] | str = []
     block_unknown_prov: bool = False
 
 

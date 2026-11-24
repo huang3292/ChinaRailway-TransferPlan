@@ -1203,7 +1203,13 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 async function api(url,opt){
   const r=await fetch(url,opt);
   const j=await r.json().catch(()=>({detail:'返回非JSON'}));
-  if(!r.ok)throw new Error(j.detail||r.status);
+  if(!r.ok){
+    let msgTxt=String(r.status);
+    if(Array.isArray(j.detail))msgTxt=j.detail.map(x=>typeof x==='object'&&x?`${(x.loc||[]).slice(-1)[0]||''}: ${x.msg||JSON.stringify(x)}`:String(x)).join('; ');
+    else if(j.detail&&typeof j.detail==='object')msgTxt=JSON.stringify(j.detail);
+    else if(j.detail!=null)msgTxt=String(j.detail);
+    throw new Error(msgTxt);
+  }
   return j;
 }
 function post(url,body,opt={}){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),...opt});}
@@ -2715,7 +2721,6 @@ function deriveSearchConfig(raw){
   const effFallback=fallbackAllowed&&!!raw.fallbackUngeocoded;
   const isCustomPrune=!isDirect&&raw.pruneLevel==='custom';
   const effProvMode=(!isDirect&&['allow','exclude'].includes(raw.provinceMode))?raw.provinceMode:'off';
-  const effProvList=(effProvMode==='off')?'':(raw.selectedProvinces||[]).join(',');
 
   const validationFields=['from','to','date'];
   if(!isDirect){
@@ -2763,8 +2768,8 @@ function deriveSearchConfig(raw){
     hub_only:!isDirect&&!!raw.hubOnly,
     hub_stations:(!isDirect&&raw.hubOnly)?raw.hubStations:'',
     province_mode:effProvMode,
-    allow_provinces:effProvMode==='allow'?effProvList:'',
-    exclude_provinces:effProvMode==='exclude'?effProvList:'',
+    allow_provinces:effProvMode==='allow'?[...(raw.selectedProvinces||[])]:[],
+    exclude_provinces:effProvMode==='exclude'?[...(raw.selectedProvinces||[])]:[],
     block_unknown_prov:(effProvMode!=='off'&&!!raw.blockUnknownProv),
     allow_prefixes:raw.incPfx,
     exclude_prefixes:raw.excPfx,
