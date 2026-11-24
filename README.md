@@ -541,7 +541,8 @@ python3 crawl_geo_coords.py --audit-only        # 仅离线运行多维质检与
 | `POST /api/crawl/tickets` | 抓站间余票 `{from_station,to_station,date,with_prices?}` |
 | `POST /api/crawl/price` | 抓单票价 `{train_no,from_station_no,to_station_no,seat_types,date}` |
 | `POST /api/import/route` | 一键导入向导 `{from_city,to_city,date,deep}` → job |
-| `GET /api/jobs/{id}` | 任务进度（含子进度 `sub_done`/`sub_total`） |
+| `GET /api/jobs/{id}` | 任务进度（含子进度 `sub_done`/`sub_total` 与分支树快照 `tree_snapshot`） |
+| `POST /api/jobs/{id}/prune_tree` | 对运行中或暂停的 `>=3` 程任务实时下发人工剪枝/恢复/继续指令（`prune_cities`/`prune_stations`/`prune_paths`/`action`） |
 | `POST /api/jobs/{id}/cancel` | 中断运行中的后台任务 |
 | `GET /api/station_trains?station=&date=` | 浏览大屏车次 |
 | `GET /api/timetable?train_no=` | 时刻表（含大屏退回） |
@@ -575,7 +576,8 @@ python3 crawl_geo_coords.py --audit-only        # 仅离线运行多维质检与
 - 搜索：`#s-go` → `deriveSearchConfig(raw)` + `validateSearchConfig(derived)` 校验活跃可见字段 → （在线模式先 `runRouteImport`）→ `POST /api/transfers/start` + 轮询 `/api/jobs/{id}` → 记录 `_serverFingerprint`/`_directBaseFingerprint`/`_rulesVersion` → 给方案打 `_k/_type` → `render()`；任务运行中实时展示 `已用` 与阶段 `预计剩余`（`sub_eta_sec`/`eta_sec`），结束后固定展示 `实际用时`（同时写入搜索结果顶栏）。
 - **单一真源配置与条件门控（`deriveSearchConfig` + `transferSearch:v2`）**：
   - 换乘方式采用三态互斥选择器 `#s-scope-seg`（桌面端分段 / `<=768px` 移动端 `#s-scope-mobile-btn` 仅展示模式文案并唤起底栏弹层 `#scope-sheet`）：**同站+异站** / **仅限同站** / **仅异站（当前页）**。
-  - 首屏仅保留 OD/日期/搜索主按钮与 `排序 / 方案类型 / 最大段数 / 每页 / 在线 / 自动查票` 常用控制行，高级参数收进 3 个默认折叠的细线抽屉（`#s-cross-drawer` 异站、 `#s-filter-drawer` 筛选、 `#s-prune-drawer` 剪枝）。
+  - 首屏仅保留 OD/日期/搜索主按钮与 `排序 / 方案类型 / 最大段数 / [>=3程]分支树剪枝 / 每页 / 在线 / 自动查票` 常用控制行，高级参数收进 3 个默认折叠的细线抽屉（`#s-cross-drawer` 异站、 `#s-filter-drawer` 筛选、 `#s-prune-drawer` 剪枝）。
+  - **交互式多程分支树剪枝（`#s-tree-mode` + `#s-tree-panel`）**：`>=3` 程可选 `关闭（全速）` / `逐程暂停审阅` / `实时热砍不暂停`（运行中可点击随时互切），按城市→站点的聚合路径展示实时分支数/最快历时/最低价并支持一键砍分支/屏蔽城市/站点并立即释放对应前沿状态内存。
   - `#s-summary-bar` 将**只读模式指示（`#s-mode-readout`，点击跳转定位）**与**可移除参数/过滤 chip（`#s-param-chips` 含 `×`）**分离。
   - **动态隐藏语义区分**：互斥替代项（如固定加时 vs 智能+城轨减时、非 `custom` 剪枝覆盖）隐藏时同步禁用并排除出请求 `payload` 与 `validationFields`；正交项（如 `仅直达` 下冻结 `transferScope`/异站/剪枝配置）仅冻结不入参而不覆盖用户原偏好。
   - 偏好持久化至 `localStorage('transferSearch:v2')`，首次访问且无 v2 键时自动从旧键幂等迁移（`migratedFixedNotice` 一次提示自定义固定加时已保留）。
@@ -617,8 +619,8 @@ python3 crawl_geo_coords.py --audit-only        # 仅离线运行多维质检与
 | 城市展开/别名/五档选站（含③城市+字样、④芯片多选、实时预览） | `db.py`（`city_stations`、`city_all_stations`、`CITY_PROPER`、`resolve_stations(city_mode)`）；`main.py`（`/api/stations/resolve`、`only_cities`、`from_city_mode`/`to_city_mode`）；前端 `index.html`（`initSidePicker`、`odState`、`schedulePreview`） |
 | 担当车型徽标（复兴号/智能动车/车底） | `parsers.parse_station_screen`（train_style/jiaolu_train_style）→ `transfer._style_map`/`_enrich` → 前端 `styleBadges()` |
 | 普速车次改头（2026-11-25 乘车日起 K/T/Z→V 等，`train_no` 同步变） | `main._train_digits`/`find_tk`：实时匹配 miss 时按数字段+同区间+同日期兜底，多行取最后爬取；输出 `live_train`，前端席别面板「实时车次」徽标；`crawl_price`/票价回查按实时 `train_no` 对齐 |
-| 常驻路网/日期缓存、候选筛选 | `transfer.py`（`_build_graph_cache`/`_get_graph_cache`/`_get_date_cache`、`screen_key_to_tn`/`tt_key_to_tn`）、`db.py`（`data_version`/`bump_data_version`） |
-| SQLite 读盘性能（页缓存/mmap/同步级别） | `db.py` 连接初始化处的 `PRAGMA` |
+| 常驻路网/日期/站点缓存、Top-K 延迟丰富化 | `transfer.py`（`_build_graph_cache`/`_get_graph_cache`/`_get_date_cache`、`TreePruneController`、`result_limit` Top-K）、`db.py`（`data_version`/`_get_stations_mem`、`idx_rp_id_fetched`） |
+| SQLite 读盘与虚拟内存预算（页缓存 16MB / `mmap_size=0`） | `db.py` 连接初始化处的 `PRAGMA`；`main.py` 搜索结果淘汰上限 `MAX_SEARCH_RESULTS_KEPT` |
 | 排序"实际价优先"口径 | 前端 `priceKey`；后端 `transfer.rank` |
 | 时刻表退回/完整性 | `main.py` `/api/timetable`；前端 `renderTT` |
 | 新增一类接口 | `parsers.parse_x` + `importer.ingest/_save` + `crawler.crawl_x` + `main` 路由 + `db` 建表 |

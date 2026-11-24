@@ -345,6 +345,42 @@ button.drawer-btn .cnt{display:inline-block;background:var(--blue);color:#fff;bo
 .scope-opt.active{background:#eef5ff;border-color:var(--blue);color:var(--blue-dark)}
 .scope-opt small{display:block;color:var(--muted);font-size:11px;margin-top:2px;font-weight:400}
 
+/* 交互式多程分支剪枝树面板（实时热砍 / 逐程暂停审阅） */
+.tree-panel{background:#fff;border:1px solid var(--border);border-radius:6px;margin-bottom:14px;overflow:hidden}
+.tree-hd{background:#f7faff;border-bottom:1px solid var(--border);padding:10px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.tree-hd-left{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px;color:#0f172a}
+.tree-status{display:inline-block;padding:1px 7px;border-radius:3px;font-size:11px;font-weight:600;border:1px solid var(--border)}
+.tree-status.paused{background:#fffbeb;color:#b45309;border-color:#fde68a}
+.tree-status.running{background:#eef5ff;color:var(--blue-dark);border-color:#bfdbfe}
+.tree-status.done{background:#f1f5f9;color:#475569;border-color:#cbd5e1}
+.tree-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.tree-filter-bar{padding:8px 14px;background:#f8fafc;border-bottom:1px solid var(--border-light);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.tree-filter-bar input{width:auto;min-width:170px;padding:4px 8px;font-size:12px}
+.tree-rules-bar{padding:7px 14px;background:#fffaf0;border-bottom:1px solid #fde68a;font-size:12px;color:#92400e;display:none;align-items:center;gap:6px;flex-wrap:wrap}
+.tree-rules-bar.show{display:flex}
+.tree-rule-tag{display:inline-flex;align-items:center;gap:4px;background:#fff;border:1px solid #fcd34d;border-radius:3px;padding:1px 6px;color:#78350f;font-size:11px}
+.tree-rule-tag button{border:none;background:transparent;color:#b45309;cursor:pointer;padding:0 2px;font-size:12px;line-height:1}
+.tree-rule-tag button:hover{color:#dc2626}
+.tree-body{max-height:420px;overflow:auto;padding:8px 14px}
+.tree-node{border-bottom:1px solid #f1f5f9}
+.tree-node:last-child{border-bottom:none}
+.tree-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 4px;font-size:12px;flex-wrap:wrap}
+.tree-row:hover{background:#f8fafc}
+.tree-row-main{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+.tree-tog{width:20px;height:20px;border:1px solid #cbd5e1;border-radius:3px;background:#fff;color:#475569;cursor:pointer;font-size:11px;line-height:1;padding:0;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.tree-tog:hover{border-color:var(--blue);color:var(--blue)}
+.tree-tog.leaf{visibility:hidden}
+.tree-label{font-weight:600;color:#0f172a}
+.tree-kind{font-size:11px;color:var(--muted)}
+.tree-meta{color:#475569;font-size:11px;font-variant-numeric:tabular-nums}
+.tree-row-ops{display:inline-flex;gap:4px;flex-wrap:wrap;flex-shrink:0}
+.tree-cut{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:3px;padding:2px 7px;font-size:11px;cursor:pointer;white-space:nowrap}
+.tree-cut:hover{background:#fee2e2;border-color:#fca5a5}
+.tree-cut.sec{background:#fff;color:#475569;border-color:#cbd5e1}
+.tree-cut.sec:hover{background:#fef2f2;color:#b91c1c;border-color:#fecaca}
+.tree-children{padding-left:20px;border-left:1px solid #e2e8f0;margin-left:9px}
+.tree-more{padding:4px 6px;font-size:11px;color:var(--muted)}
+
 @media(max-width:768px){
   header{padding:6px 12px;height:auto;flex-wrap:wrap;gap:6px 10px}
   header h1{font-size:15px}
@@ -450,6 +486,12 @@ button.drawer-btn .cnt{display:inline-block;background:var(--blue);color:#fff;bo
         <select id="s-type"><option value="">全部</option><option value="direct">仅直达</option><option value="transfer">仅换乘</option></select></div>
       <div style="flex:0 0 130px" id="s-legs-wrap"><label for="s-legs">最多程数</label>
         <select id="s-legs"><option value="2" selected>2程(1次换乘)</option><option value="3">3程(2次换乘)</option><option value="4">4程(3次换乘)</option><option value="5">5程(4次换乘)</option></select></div>
+      <div style="flex:0 0 165px;display:none" id="s-tree-mode-wrap"><label for="s-tree-mode">分支树剪枝(≥3程)</label>
+        <select id="s-tree-mode" title="仅当最多程数 ≥ 3 时生效：逐程暂停可先砍掉不合理中转分支并立即释放内存再继续；实时热砍则不停顿但边搜边展示与人工剪枝">
+          <option value="off" selected>关闭（全速）</option>
+          <option value="step">逐程暂停审阅</option>
+          <option value="live">实时热砍不暂停</option>
+        </select></div>
       <div style="flex:0 0 92px"><label for="s-size">每页方案</label>
         <select id="s-size"><option>20</option><option selected>50</option><option>100</option><option>200</option></select></div>
       <div style="flex:2;min-width:220px;padding-top:16px;display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center">
@@ -617,6 +659,31 @@ button.drawer-btn .cnt{display:inline-block;background:var(--blue);color:#fff;bo
     <div style="display:flex;gap:8px;align-items:center"><div class="msg" id="s-msg" style="flex:1"></div><button type="button" class="btn sec" id="s-cancel" style="display:none;margin-top:10px">停止任务</button></div>
     <div class="prog" id="s-prog"><div></div></div>
     <pre class="logbox" id="s-log"></pre>
+  </div>
+  <div id="s-tree-panel" class="tree-panel" style="display:none">
+    <div class="tree-hd">
+      <div class="tree-hd-left">
+        <b>交互分支树</b>
+        <span id="s-tree-status" class="tree-status running">运行中</span>
+        <span id="s-tree-meta" class="num" style="color:var(--muted);font-size:12px"></span>
+      </div>
+      <div class="tree-actions" id="s-tree-actions"></div>
+    </div>
+    <div class="tree-filter-bar" id="s-tree-filter-bar">
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <input id="s-tree-filter" placeholder="过滤展示城市/站点/车次…">
+        <button type="button" class="mini" id="s-tree-exp-all">全部展开</button>
+        <button type="button" class="mini" id="s-tree-col-all">全部收起</button>
+        <span class="hint" style="margin:0">仅展示按耗时排序的头部中转分支；未出现在下方也可直接输入手动剪除</span>
+      </div>
+      <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap" id="s-tree-manual-wrap">
+        <input id="s-tree-manual" placeholder="输入城市或站名…" style="width:140px;min-width:120px">
+        <button type="button" class="mini" id="s-tree-cut-city">全局剪城市</button>
+        <button type="button" class="mini" id="s-tree-cut-stn">剪站点</button>
+      </div>
+    </div>
+    <div id="s-tree-rules" class="tree-rules-bar"></div>
+    <div id="s-tree-body" class="tree-body"></div>
   </div>
   <div id="s-result"></div>
 </section>
@@ -1922,6 +1989,282 @@ async function cancelActivePlanJob(silent=false){
   try{await post(`/api/jobs/${oldId}/cancel`,{});}catch(e){}
   if(!silent){setProg('s-prog',null);msg('s-msg','【票价/余票】任务已中断');}
 }
+const treeExpandedPaths=new Set();
+let lastTreeSig='';
+let activeTreeJobId=null;
+let lastTreeStatusObj=null;
+let treeBodyCollapsed=false;
+
+function hideTreePanel(){
+  const p=$('s-tree-panel');
+  if(p)p.style.display='none';
+  lastTreeSig='';
+  activeTreeJobId=null;
+  treeBodyCollapsed=false;
+}
+
+async function sendTreePruneCmd(jobId,cmd){
+  if(!jobId)return;
+  try{
+    const res=await post(`/api/jobs/${jobId}/prune_tree`,cmd);
+    if(res&&res.ok){
+      const nextSt={
+        status:'running',
+        tree_paused:res.tree_paused,
+        tree_paused_depth:res.tree_paused_depth,
+        tree_pause_after_layer:res.tree_pause_after_layer,
+        tree_pruned_count:res.tree_pruned_count,
+        tree_pruned_rules:res.tree_pruned_rules,
+        tree_snapshot:res.tree_snapshot
+      };
+      lastTreeStatusObj=nextSt;
+      renderTreePanel(jobId,nextSt);
+    }
+  }catch(e){
+    msg('s-msg','分支树指令失败：'+(e.message||e),false);
+  }
+}
+
+function collectTreeExpandablePaths(nodes,out){
+  (nodes||[]).forEach(n=>{
+    const children=n.children||[];
+    if(children.length){
+      out.push((n.path||[]).join('>'));
+      collectTreeExpandablePaths(children,out);
+    }
+  });
+}
+
+function treeNodeMatchesFilter(node,q){
+  if(!q)return true;
+  const hay=[node.label,node.city,node.station_key,...(node.samples||[]),...(node.path||[])].join(' ').toLowerCase();
+  if(hay.includes(q))return true;
+  return (node.children||[]).some(ch=>treeNodeMatchesFilter(ch,q));
+}
+
+function renderTreeNodeHtml(node,q,isDone){
+  if(!treeNodeMatchesFilter(node,q))return '';
+  const pathKey=(node.path||[]).join('>');
+  const children=node.children||[];
+  const hasCh=children.length>0;
+  const isExp=hasCh&&(treeExpandedPaths.has(pathKey)||!!q);
+  const metaParts=[`分支 ${node.count}`];
+  if(node.min_elapsed_min!=null)metaParts.push(`最快 ${fmtMin(node.min_elapsed_min)}`);
+  if(node.min_cost!=null)metaParts.push(`最低 ¥${node.min_cost}`);
+  if(node.samples&&node.samples.length)metaParts.push(`代表 ${node.samples.join('/')}`);
+  let opsHtml='';
+  if(!isDone){
+    const pathJson=esc(JSON.stringify(node.path||[]));
+    if(node.kind==='station'){
+      opsHtml=`<button type="button" class="tree-cut" data-cut-station="${esc(node.station_key||node.label)}">剪此站</button>`
+        +`<button type="button" class="tree-cut sec" data-cut-path="${pathJson}">仅砍此分枝</button>`;
+    }else{
+      opsHtml=`<button type="button" class="tree-cut" data-cut-path="${pathJson}">砍此分枝</button>`
+        +`<button type="button" class="tree-cut sec" data-cut-city="${esc(node.city||node.label)}">全局屏蔽 ${esc(node.city||node.label)}</button>`;
+    }
+  }
+  const chHtml=isExp
+    ?(`<div class="tree-children">${children.map(ch=>renderTreeNodeHtml(ch,q,isDone)).join('')}${node.more_children>0?`<div class="tree-more">… 还有 ${node.more_children} 个下级分支（可用上方过滤或手动输入剪除）</div>`:''}</div>`)
+    :'';
+  return `<div class="tree-node">`
+    +`<div class="tree-row">`
+    +`<div class="tree-row-main">`
+    +`<button type="button" class="tree-tog${hasCh?'':' leaf'}" data-tog-path="${esc(pathKey)}">${isExp?'▾':'▸'}</button>`
+    +`<span class="tree-label">${esc(node.label)}</span>`
+    +`<span class="tree-kind">${node.kind==='station'?'车站':'城市'}</span>`
+    +`<span class="tree-meta">${esc(metaParts.join(' · '))}</span>`
+    +`</div>`
+    +(opsHtml?`<div class="tree-row-ops">${opsHtml}</div>`:'')
+    +`</div>${chHtml}</div>`;
+}
+
+function renderTreePanel(jobId,j){
+  const p=$('s-tree-panel');
+  if(!p)return;
+  const snap=j.tree_snapshot;
+  if(!snap){
+    if(j.status!=='running')hideTreePanel();
+    return;
+  }
+  p.style.display='block';
+  activeTreeJobId=jobId;
+  lastTreeStatusObj=j;
+
+  const isDone=j.status!=='running';
+  const q=String($('s-tree-filter')?$('s-tree-filter').value:'').trim().toLowerCase();
+  const topDigest=(snap.nodes||[]).map(n=>`${n.label}:${n.count}:${(n.children||[]).length}`).join('|');
+  const sig=JSON.stringify([
+    j.status,!!j.tree_paused,j.tree_paused_depth||0,!!j.tree_pause_after_layer,
+    j.tree_pruned_count||0,j.tree_pruned_rules||null,
+    snap.depth,snap.phase,snap.total_states,topDigest,q,[...treeExpandedPaths].join(','),treeBodyCollapsed
+  ]);
+  // WHY: live 模式 350ms 轮询且采样未更新时跳过 DOM 重建，既避免页面抖动，也配合事件委托确保点击不因重绘丢失。
+  if(sig===lastTreeSig)return;
+  lastTreeSig=sig;
+
+  const stEl=$('s-tree-status');
+  if(stEl){
+    stEl.className='tree-status '+(isDone?'done':(j.tree_paused?'paused':'running'));
+    stEl.textContent=isDone
+      ?`搜索已完成（人工已剪 ${Number(j.tree_pruned_count||0).toLocaleString()} 条）`
+      :(j.tree_paused?`第 ${j.tree_paused_depth||snap.depth}/${snap.max_legs} 程已暂停`:`第 ${snap.depth}/${snap.max_legs} 程计算中`);
+  }
+  const metaEl=$('s-tree-meta');
+  if(metaEl){
+    metaEl.textContent=isDone
+      ?`最后快照保留 ${Number(snap.total_states||0).toLocaleString()} 个活跃分支`
+      :`当前活跃分支 ${Number(snap.total_states||0).toLocaleString()} 个 · 人工已剪 ${Number(j.tree_pruned_count||0).toLocaleString()} 条`;
+  }
+
+  const actEl=$('s-tree-actions');
+  if(actEl){
+    if(isDone){
+      actEl.innerHTML=`<button type="button" class="mini" data-tree-act="toggle-body">${treeBodyCollapsed?'展开最后快照':'收起最后快照'}</button>`
+        +'<button type="button" class="mini" data-tree-act="close">收起树面板</button>';
+    }else if(j.tree_paused){
+      actEl.innerHTML='<button type="button" class="btn" data-tree-act="continue" style="padding:4px 12px;font-size:12px">继续下一程</button>'
+        +'<button type="button" class="btn sec" data-tree-act="continue_all" style="padding:4px 10px;font-size:12px">跑完剩余程</button>';
+    }else if(j.tree_pause_after_layer){
+      actEl.innerHTML='<button type="button" class="mini" data-tree-act="continue_all">改为不暂停直跑到底</button>';
+    }else{
+      actEl.innerHTML='<button type="button" class="mini orange" data-tree-act="pause">下一程完成时暂停</button>';
+    }
+  }
+
+  const fBar=$('s-tree-filter-bar');
+  const mWrap=$('s-tree-manual-wrap');
+  if(fBar)fBar.style.display=(isDone&&treeBodyCollapsed)?'none':'flex';
+  if(mWrap)mWrap.style.display=isDone?'none':'flex';
+
+  const rulesBar=$('s-tree-rules');
+  const rules=j.tree_pruned_rules||{cities:[],stations:[],paths:[]};
+  const rTags=[];
+  (rules.cities||[]).forEach(c=>rTags.push(`<span class="tree-rule-tag">屏蔽城市: ${esc(c)}${isDone?'':`<button type="button" data-unprune-city="${esc(c)}" title="恢复">×</button>`}</span>`));
+  (rules.stations||[]).forEach(s=>rTags.push(`<span class="tree-rule-tag">屏蔽站: ${esc(s)}${isDone?'':`<button type="button" data-unprune-stn="${esc(s)}" title="恢复">×</button>`}</span>`));
+  (rules.paths||[]).forEach(pt=>rTags.push(`<span class="tree-rule-tag">砍分支: ${esc(pt.join(' → '))}${isDone?'':`<button type="button" data-unprune-path="${esc(JSON.stringify(pt))}" title="恢复">×</button>`}</span>`));
+  if(rulesBar){
+    if(rTags.length){
+      rulesBar.classList.add('show');
+      rulesBar.innerHTML=`<span>${isDone?'本次搜索已生效剪枝：':'已生效剪枝：'}</span>${rTags.join('')}`;
+    }else{
+      rulesBar.classList.remove('show');
+      rulesBar.innerHTML='';
+    }
+  }
+
+  const bodyEl=$('s-tree-body');
+  if(bodyEl){
+    if(isDone&&treeBodyCollapsed){
+      bodyEl.style.display='none';
+    }else{
+      bodyEl.style.display='block';
+      const prevScroll=bodyEl.scrollTop;
+      const html=(snap.nodes||[]).map(n=>renderTreeNodeHtml(n,q,isDone)).join('')
+        +(snap.more_top>0?`<div class="tree-more">… 顶层还折叠了 ${snap.more_top} 个耗时更长城市（可用上方过滤或手动剪除）</div>`:'');
+      bodyEl.innerHTML=html||'<div class="hint" style="margin:6px 0">当前无匹配树节点（或已被全部剪除）</div>';
+      bodyEl.scrollTop=prevScroll;
+    }
+  }
+}
+
+function initTreePanelEvents(){
+  const actEl=$('s-tree-actions');
+  if(actEl&&!actEl.dataset.bound){
+    actEl.dataset.bound='1';
+    actEl.addEventListener('click',e=>{
+      const btn=e.target.closest('[data-tree-act]');
+      if(!btn)return;
+      const act=btn.dataset.treeAct;
+      if(act==='close'){hideTreePanel();return;}
+      if(act==='toggle-body'){
+        treeBodyCollapsed=!treeBodyCollapsed;
+        lastTreeSig='';
+        if(activeTreeJobId&&lastTreeStatusObj)renderTreePanel(activeTreeJobId,lastTreeStatusObj);
+        return;
+      }
+      if(activeTreeJobId&&['continue','continue_all','pause'].includes(act)){
+        sendTreePruneCmd(activeTreeJobId,{action:act});
+      }
+    });
+  }
+  const rulesBar=$('s-tree-rules');
+  if(rulesBar&&!rulesBar.dataset.bound){
+    rulesBar.dataset.bound='1';
+    rulesBar.addEventListener('click',e=>{
+      if(!activeTreeJobId)return;
+      const bc=e.target.closest('[data-unprune-city]');
+      if(bc){sendTreePruneCmd(activeTreeJobId,{unprune_cities:[bc.dataset.unpruneCity],action:'prune'});return;}
+      const bs=e.target.closest('[data-unprune-stn]');
+      if(bs){sendTreePruneCmd(activeTreeJobId,{unprune_stations:[bs.dataset.unpruneStn],action:'prune'});return;}
+      const bp=e.target.closest('[data-unprune-path]');
+      if(bp){sendTreePruneCmd(activeTreeJobId,{unprune_paths:[JSON.parse(bp.dataset.unprunePath)],action:'prune'});}
+    });
+  }
+  const bodyEl=$('s-tree-body');
+  if(bodyEl&&!bodyEl.dataset.bound){
+    bodyEl.dataset.bound='1';
+    bodyEl.addEventListener('click',e=>{
+      const tog=e.target.closest('[data-tog-path]');
+      if(tog){
+        const pk=tog.dataset.togPath;
+        if(treeExpandedPaths.has(pk))treeExpandedPaths.delete(pk);
+        else treeExpandedPaths.add(pk);
+        lastTreeSig='';
+        if(activeTreeJobId&&lastTreeStatusObj)renderTreePanel(activeTreeJobId,lastTreeStatusObj);
+        return;
+      }
+      if(!activeTreeJobId)return;
+      const bc=e.target.closest('[data-cut-city]');
+      if(bc){sendTreePruneCmd(activeTreeJobId,{prune_cities:[bc.dataset.cutCity],action:'prune'});return;}
+      const bs=e.target.closest('[data-cut-station]');
+      if(bs){sendTreePruneCmd(activeTreeJobId,{prune_stations:[bs.dataset.cutStation],action:'prune'});return;}
+      const bp=e.target.closest('[data-cut-path]');
+      if(bp){sendTreePruneCmd(activeTreeJobId,{prune_paths:[JSON.parse(bp.dataset.cutPath)],action:'prune'});}
+    });
+  }
+  if($('s-tree-filter')){
+    $('s-tree-filter').addEventListener('input',()=>{
+      lastTreeSig='';
+      if(activeTreeJobId&&lastTreeStatusObj)renderTreePanel(activeTreeJobId,lastTreeStatusObj);
+    });
+  }
+  if($('s-tree-exp-all')){
+    $('s-tree-exp-all').onclick=()=>{
+      const snap=lastTreeStatusObj&&lastTreeStatusObj.tree_snapshot;
+      if(!snap)return;
+      const paths=[];
+      collectTreeExpandablePaths(snap.nodes||[],paths);
+      paths.forEach(pk=>treeExpandedPaths.add(pk));
+      lastTreeSig='';
+      if(activeTreeJobId&&lastTreeStatusObj)renderTreePanel(activeTreeJobId,lastTreeStatusObj);
+    };
+  }
+  if($('s-tree-col-all')){
+    $('s-tree-col-all').onclick=()=>{
+      treeExpandedPaths.clear();
+      lastTreeSig='';
+      if(activeTreeJobId&&lastTreeStatusObj)renderTreePanel(activeTreeJobId,lastTreeStatusObj);
+    };
+  }
+  if($('s-tree-cut-city')){
+    $('s-tree-cut-city').onclick=()=>{
+      const v=String($('s-tree-manual')?$('s-tree-manual').value:'').trim();
+      if(!v||!activeTreeJobId)return;
+      sendTreePruneCmd(activeTreeJobId,{prune_cities:[v],action:'prune'});
+      $('s-tree-manual').value='';
+    };
+  }
+  if($('s-tree-cut-stn')){
+    $('s-tree-cut-stn').onclick=()=>{
+      const v=String($('s-tree-manual')?$('s-tree-manual').value:'').trim();
+      if(!v||!activeTreeJobId)return;
+      sendTreePruneCmd(activeTreeJobId,{prune_stations:[v],action:'prune'});
+      $('s-tree-manual').value='';
+    };
+  }
+}
+initTreePanelEvents();
+
 async function cancelActiveSearchJob(){
   if(searchPoll){clearInterval(searchPoll);searchPoll=null;}
   if(searchCtrl){try{searchCtrl.abort();}catch(e){}searchCtrl=null;}
@@ -1930,8 +2273,12 @@ async function cancelActiveSearchJob(){
   if(oldId){try{await post(`/api/jobs/${oldId}/cancel`,{});}catch(e){}}
   if(activeRouteJob){const rid=activeRouteJob;activeRouteJob=null;try{await post(`/api/jobs/${rid}/cancel`,{});}catch(e){}}
   setCancelBtn('s-cancel',null);
+  hideTreePanel();
 }
 async function runTransferSearch(body,myGen){
+  hideTreePanel();
+  treeExpandedPaths.clear();
+  lastTreeStatusObj=null;
   const ctrl=searchCtrl=new AbortController();
   let stopped=false;
   setAbortBtn('s-cancel',ctrl,()=>{stopped=true;searchGen++;});
@@ -1944,26 +2291,35 @@ async function runTransferSearch(body,myGen){
   return await new Promise((resolve,reject)=>{
     let done=false;
     const finish=()=>{if(searchPoll){clearInterval(searchPoll);searchPoll=null;}activeSearchJob=null;setCancelBtn('s-cancel',null);};
-    setCancelBtn('s-cancel',start.job_id,()=>{if(done)return;done=true;finish();setProg('s-prog',null);reject(new Error('【换乘搜索】任务已中断'));});
+    setCancelBtn('s-cancel',start.job_id,()=>{if(done)return;done=true;finish();setProg('s-prog',null);hideTreePanel();reject(new Error('【换乘搜索】任务已中断'));});
     const tick=async()=>{
       if(done)return;
       try{
         const j=await api('/api/jobs/'+start.job_id);
         if(done)return;
+        lastTreeStatusObj=j;
+        if(j.status==='running'&&j.tree_snapshot)renderTreePanel(start.job_id,j);
         const subFrac=(j.sub_total>0&&j.done<j.total)?Math.min(0.99,Math.max(0,j.sub_done/j.sub_total)):0;
         const effDone=j.total?Math.min(j.total,j.done+subFrac):0;
         setProg('s-prog',effDone,j.total);
         if(j.status==='running'){
           const pct=j.total?Math.min(j.done<j.total?99:100,Math.round(effDone*100/j.total)):0;
           const subTxt=j.sub_total>0?` [本阶段 ${Math.round(Math.min(1,Math.max(0,j.sub_done/j.sub_total))*100)}%]`:'';
-          msg('s-msg',`【换乘搜索】${j.done}/${j.total} (${pct}%)${subTxt}${etaTxt(j)}${j.current?` — ${j.current}`:''}`);
+          const pauseTag=j.tree_paused?' [已暂停等待分支树剪枝]':'';
+          msg('s-msg',`【换乘搜索】${j.done}/${j.total} (${pct}%)${subTxt}${pauseTag}${etaTxt(j)}${j.current?` — ${j.current}`:''}`);
           return;
         }
         done=true;finish();setProg('s-prog',null);
-        if(j.status==='cancelled'){reject(new Error(`【换乘搜索】任务已中断${actualDurTxt(j.elapsed_sec)}`));return;}
-        if(j.status==='error'){reject(new Error(j.error||'搜索失败'));return;}
+        if(j.status==='cancelled'){hideTreePanel();reject(new Error(`【换乘搜索】任务已中断${actualDurTxt(j.elapsed_sec)}`));return;}
+        if(j.status==='error'){hideTreePanel();reject(new Error(j.error||'搜索失败'));return;}
+        if(j.tree_snapshot){
+          treeBodyCollapsed=true;
+          renderTreePanel(start.job_id,j);
+        }else{
+          hideTreePanel();
+        }
         resolve({result:j.result,elapsed_sec:j.elapsed_sec});
-      }catch(e){if(!done){done=true;finish();setProg('s-prog',null);reject(e);}}
+      }catch(e){if(!done){done=true;finish();setProg('s-prog',null);hideTreePanel();reject(e);}}
     };
     tick();
     searchPoll=setInterval(tick,350);
@@ -1982,7 +2338,7 @@ const FALLBACK_HUBS_TEXT='北京,天津,石家庄,太原,呼和浩特,沈阳,长
 const SEARCH_PREFS_KEY='transferSearch:v2';
 const RULES_VER_KEY='transferRulesVersion:v1';
 const SEARCH_DEFAULTS={
-  sort:'duration',schemeType:'',maxLegs:2,pageSize:50,minWait:30,maxWait:360,
+  sort:'duration',schemeType:'',maxLegs:2,treePruneMode:'off',pageSize:50,minWait:30,maxWait:360,
   transferScope:'all',radiusKm:20,crossTimeMode:'smart',fixedExtra:60,
   transitDiscountOn:true,transitDiscountMin:15,transitProximityM:1500,
   fallbackUngeocoded:false,pruneLevel:'balanced',fk:8,maxh:48,detour:0,dom:false,
@@ -2089,6 +2445,7 @@ function applyPrefsToDOM(){
   if($('s-sort'))$('s-sort').value=searchPrefs.sort||'duration';
   if($('s-type'))$('s-type').value=searchPrefs.schemeType||'';
   if($('s-legs'))$('s-legs').value=String(searchPrefs.maxLegs||2);
+  if($('s-tree-mode'))$('s-tree-mode').value=['off','step','live'].includes(searchPrefs.treePruneMode)?searchPrefs.treePruneMode:'off';
   if($('s-size'))$('s-size').value=String(searchPrefs.pageSize||50);
   if($('s-min'))$('s-min').value=String(searchPrefs.minWait??30);
   if($('s-max'))$('s-max').value=String(searchPrefs.maxWait??360);
@@ -2114,7 +2471,7 @@ function saveSearchPrefs(){
   searchPrefs={
     ...searchPrefs,
     version:2,
-    sort:raw.sort,schemeType:raw.schemeType,maxLegs:raw.maxLegs,pageSize:raw.pageSize,
+    sort:raw.sort,schemeType:raw.schemeType,maxLegs:raw.maxLegs,treePruneMode:raw.treePruneMode,pageSize:raw.pageSize,
     minWait:raw.minWaitRaw??30,maxWait:raw.maxWaitRaw??360,
     transferScope:raw.transferScope,
     radiusKm:raw.radiusRaw??20,
@@ -2151,6 +2508,7 @@ function readRawSearchState(){
     sort:$('s-sort')?$('s-sort').value:'duration',
     schemeType:$('s-type')?$('s-type').value:'',
     maxLegs:+numVal('s-legs',2),
+    treePruneMode:$('s-tree-mode')?$('s-tree-mode').value:'off',
     pageSize:+numVal('s-size',50),
     minWaitRaw:rawNumOrNull('s-min'),
     maxWaitRaw:rawNumOrNull('s-max'),
@@ -2223,6 +2581,9 @@ function deriveSearchConfig(raw){
   const maxhVal=(isCustomPrune&&raw.maxhRaw!=null&&Number.isFinite(raw.maxhRaw))?raw.maxhRaw:48;
   const detourVal=(isCustomPrune&&raw.detourRaw!=null&&Number.isFinite(raw.detourRaw))?raw.detourRaw:0;
 
+  const treeModeActive=!isDirect&&raw.maxLegs>=3;
+  const effTreeMode=treeModeActive&&['step','live'].includes(raw.treePruneMode)?raw.treePruneMode:'off';
+
   const payload={
     from_station:raw.from_station,to_station:raw.to_station,date:raw.date,
     min_wait:minW,max_wait:maxW,
@@ -2249,7 +2610,9 @@ function deriveSearchConfig(raw){
     exclude_stations:isDirect?'':raw.excTst
   };
 
+  // NOTE: tree_prune_mode 仅控制运行期分支树展示与人工干预，不列入 serverFingerprint 以避免跑完后切回默认误报过期
   const serverFingerprint=JSON.stringify(payload);
+  payload.tree_prune_mode=effTreeMode;
   const directBaseFingerprint=JSON.stringify({
     from_station:raw.from_station,from_city_mode:fcm,to_station:raw.to_station,to_city_mode:tcm,
     date:raw.date,allow_prefixes:raw.incPfx,exclude_prefixes:raw.excPfx
@@ -2263,6 +2626,9 @@ function deriveSearchConfig(raw){
     modeSegments.push({text:scopeTxt,drawer:'cross'});
     if(crossActive){
       modeSegments.push({text:isFixed?'固定加时':(transitSubActive?'智能计价+城轨估算':'智能计价(无减时)'),drawer:'cross'});
+    }
+    if(effTreeMode!=='off'){
+      modeSegments.push({text:effTreeMode==='step'?'分支树:逐程暂停':'分支树:实时热砍',action:'focusTreeMode'});
     }
   }
 
@@ -2308,9 +2674,9 @@ function deriveSearchConfig(raw){
 
   return {
     raw,isDirect,effScope,allowCross,sameFlag,crossActive,isFixed,isSmart,transitSubActive,
-    effRad,fallbackAllowed,effFallback,isCustomPrune,
+    effRad,fallbackAllowed,effFallback,isCustomPrune,treeModeActive,effTreeMode,
     visible:{
-      legs:!isDirect,crossDrawerBtn:!isDirect,pruneDrawerBtn:!isDirect,
+      legs:!isDirect,treeMode:treeModeActive,crossDrawerBtn:!isDirect,pruneDrawerBtn:!isDirect,
       crossConfigArea:crossActive,fixedExtra:isFixed,transitToggle:isSmart,transitParams:transitSubActive,
       tstFilters:!isDirect,pruneCustomPanel:isCustomPrune,hubBox:!isDirect&&!!raw.hubOnly
     },
@@ -2391,6 +2757,8 @@ function syncSearchDrawerUI(){
   const v=d.visible;
 
   if($('s-legs-wrap'))$('s-legs-wrap').style.display=v.legs?'':'none';
+  if($('s-tree-mode-wrap'))$('s-tree-mode-wrap').style.display=v.treeMode?'':'none';
+  if($('s-tree-mode'))$('s-tree-mode').disabled=!v.treeMode;
   if($('s-drawer-cross-btn'))$('s-drawer-cross-btn').style.display=v.crossDrawerBtn?'':'none';
   if($('s-drawer-prune-btn'))$('s-drawer-prune-btn').style.display=v.pruneDrawerBtn?'':'none';
   if($('s-tst-filter-wrap'))$('s-tst-filter-wrap').style.display=v.tstFilters?'flex':'none';
@@ -2466,6 +2834,7 @@ function syncSearchDrawerUI(){
       btn.onclick=()=>{
         const tgt=btn.dataset.modeJump;
         if(tgt==='focusType'){$('s-type').focus();return;}
+        if(tgt==='focusTreeMode'){if($('s-tree-mode'))$('s-tree-mode').focus();return;}
         openDrawers.add(tgt);
         syncSearchDrawerUI();
         const dr=$('s-'+tgt+'-drawer');
@@ -2564,6 +2933,7 @@ function pruneBreakdownItems(st,cfg){
   if(st.frontier)items.push(`束宽截断 ${st.frontier}`);
   if(st.total_time)items.push(`总耗时超限 ${st.total_time}`);
   if(st.custom_rule)items.push(`规则过滤 ${st.custom_rule}`);
+  if(st.user_tree)items.push(`分支树人工剪除 ${st.user_tree}`);
   if(st.repeat_train)items.push(`重复车次 ${st.repeat_train}`);
   if(loop)items.push(`折返绕回 ${loop}`);
   return items;
@@ -2646,7 +3016,7 @@ document.querySelectorAll('#s-radius-presets button[data-rad]').forEach(btn=>{
 ['s-min','s-max','s-radius','s-cross','s-transit-disc','s-transit-prox','s-hubs'].forEach(id=>{
   ['input','change'].forEach(ev=>$(id).addEventListener(ev,()=>{saveSearchPrefs();syncSearchDrawerUI();}));
 });
-['s-cross-mode','s-transit-on','s-fallback','s-legs'].forEach(id=>{
+['s-cross-mode','s-transit-on','s-fallback','s-legs','s-tree-mode'].forEach(id=>{
   $(id).addEventListener('change',()=>{saveSearchPrefs();syncSearchDrawerUI();});
 });
 $('s-date').addEventListener('change',updateStaleBanner);

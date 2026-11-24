@@ -234,9 +234,11 @@ def get_conn() -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA cache_size=-131072")  # 128MB 内存页缓存，减少全表扫描换页读盘
+        # 路网与站点主体已常驻 Python 内存，限制 SQLite 单连接页缓存(16MB)并关闭 mmap，
+        # 避免 SQLite 虚拟内存映射与 Python 堆争夺物理 RAM 引发抖动换页。
+        conn.execute("PRAGMA cache_size=-16384")
         try:
-            conn.execute("PRAGMA mmap_size=536870912")  # 512MB 内存映射只读加速
+            conn.execute("PRAGMA mmap_size=0")
         except sqlite3.Error:
             pass
         conn.execute("PRAGMA foreign_keys=ON")
@@ -310,6 +312,8 @@ def init_db():
         tp_cols = {r[1] for r in conn.execute("PRAGMA table_info(transfer_pair_overrides)")}
         if "updated_at" not in tp_cols:
             conn.execute("ALTER TABLE transfer_pair_overrides ADD COLUMN updated_at TEXT DEFAULT ''")
+        # 覆盖索引：让 tickets LEFT JOIN raw_payloads 取 fetched_at 时无需读取 raw_payloads 巨型 payload 叶子页
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rp_id_fetched ON raw_payloads(id, fetched_at)")
     if added:
         _backfill_screen()
     bump_data_version()
@@ -364,29 +368,57 @@ def clear_cache(before_date: str | None = None, include_raw: bool = False) -> di
     return deleted
 
 
+_STATIONS_MEM_LOCK = threading.Lock()
+_STATIONS_MEM: dict | None = None
+
+
+def _get_stations_mem() -> dict:
+    """按 data_version() 缓存全量 stations 行索引，避免每次搜索与自动补全反复读盘。"""
+    global _STATIONS_MEM
+    ver = data_version()
+    with _STATIONS_MEM_LOCK:
+        if _STATIONS_MEM is not None and _STATIONS_MEM["ver"] == ver:
+            return _STATIONS_MEM
+    all_rows = rows("SELECT * FROM stations")
+    by_tc: dict[str, dict] = {}
+    by_name: dict[str, dict] = {}
+    by_city: dict[str, list[dict]] = {}
+    for r in all_rows:
+        tc = (r.get("telecode") or "").upper()
+        nm = r.get("name") or ""
+        ct = r.get("city") or ""
+        if tc and tc not in by_tc:
+            by_tc[tc] = r
+        if nm and nm not in by_name:
+            by_name[nm] = r
+        if ct:
+            by_city.setdefault(ct, []).append(r)
+    snap = {"ver": ver, "all": all_rows, "by_tc": by_tc, "by_name": by_name, "by_city": by_city}
+    with _STATIONS_MEM_LOCK:
+        _STATIONS_MEM = snap
+    return snap
+
+
 def station_lookup() -> dict:
-    return {r["name"]: r["telecode"] for r in rows("SELECT name,telecode FROM stations")}
+    mem = _get_stations_mem()
+    return {r["name"]: r["telecode"] for r in mem["all"]}
 
 
 def resolve_station(q: str) -> dict | None:
     q = (q or "").strip()
     if not q:
         return None
+    mem = _get_stations_mem()
     # 精确电报码、精确站名优先于去“站”后缀匹配，避免同名/近名顺序不确定
-    r = rows(
-        """SELECT * FROM stations WHERE telecode=? OR name=? OR name=?
-           ORDER BY CASE WHEN telecode=? THEN 0 WHEN name=? THEN 1 ELSE 2 END LIMIT 1""",
-        (q.upper(), q, q.removesuffix("站"), q.upper(), q),
-    )
+    r = mem["by_tc"].get(q.upper()) or mem["by_name"].get(q) or mem["by_name"].get(q.removesuffix("站"))
     if r:
-        return r[0]
+        return dict(r)
     m = re.fullmatch(r"(.+?)\s*\(([A-Za-z]{3})\)", q)
     if m:
         tc, nm = m.group(2).upper(), m.group(1).strip()
-        r = rows("SELECT * FROM stations WHERE telecode=? OR name=? ORDER BY CASE WHEN telecode=? THEN 0 ELSE 1 END LIMIT 1",
-                 (tc, nm, tc))
+        r = mem["by_tc"].get(tc) or mem["by_name"].get(nm)
         if r:
-            return r[0]
+            return dict(r)
     return None
 
 
@@ -409,6 +441,24 @@ CITY_PROPER = {
 }
 
 
+def _city_rows_mem(q: str) -> list[dict]:
+    q = (q or "").strip()
+    base = q.removesuffix("市")
+    if not base:
+        return []
+    mem = _get_stations_mem()
+    by_city = mem["by_city"]
+    seen_tc = set()
+    out = []
+    for ck in (q, base, base + "市"):
+        for r in by_city.get(ck, ()):
+            tc = r["telecode"]
+            if tc not in seen_tc:
+                seen_tc.add(tc)
+                out.append(dict(r))
+    return out
+
+
 def city_stations(q: str) -> list[dict]:
     """返回某城市（如“厦门”“南昌”，可带“市”后缀）的城区车站，主站优先。
 
@@ -419,8 +469,7 @@ def city_stations(q: str) -> list[dict]:
     base = q.removesuffix("市")
     if not base:
         return []
-    all_rows = rows("SELECT * FROM stations WHERE city=? OR city=? OR city=?",
-                    (q, base, base + "市"))
+    all_rows = _city_rows_mem(q)
     proper = set(CITY_PROPER.get(base, ()))
     out = [r for r in all_rows
            if r["name"].startswith(base) or r["name"] in proper or r["name"].removesuffix("站") in proper]
@@ -443,8 +492,7 @@ def city_all_stations(q: str) -> list[dict]:
     base = q.removesuffix("市")
     if not base:
         return []
-    all_rows = rows("SELECT * FROM stations WHERE city=? OR city=? OR city=?",
-                    (q, base, base + "市"))
+    all_rows = _city_rows_mem(q)
     exact = resolve_station(q)
     if exact and exact["name"] in (q, base) and all(
         r["telecode"] != exact["telecode"] for r in all_rows
@@ -550,7 +598,7 @@ def resolve_stations(q: str, expand_city: bool = True, city_mode: str | None = N
 
 def station_resolve_error(q: str, city_mode: str | None = None) -> str:
     """生成符合当前 city_mode 语义的车站解析失败提示。"""
-    if not rows("SELECT 1 FROM stations LIMIT 1"):
+    if not _get_stations_mem()["all"]:
         return "站名表为空，请先在「爬取数据」页更新车站站名表"
     q_s = (q or "").strip()
     if not q_s:

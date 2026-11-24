@@ -135,7 +135,27 @@ STATIC = Path(__file__).resolve().parent.parent / "static"
 _jobs_lock = threading.Lock()
 jobs: dict[str, dict] = {}
 _job_cancels: dict[str, threading.Event] = {}
+_job_trees: dict[str, transfer.TreePruneController] = {}
 MAX_JOBS = 100
+# WHY: 仅保留最近 6 次搜索的完整 result（多程方案列表占数十 MB），其余已完成搜索条目保留
+# 元信息以兼容 MAX_JOBS=100 约定，但释放重 result 载荷避免内存只增不减。
+MAX_SEARCH_RESULTS_KEPT = 6
+
+
+def _evict_old_search_results_locked():
+    search_done = [
+        jid for jid, j in jobs.items()
+        if j.get("status") == "done"
+        and isinstance(j.get("result"), dict)
+        and not j["result"].get("evicted")
+        and ("transfers" in j["result"] or "direct" in j["result"])
+    ]
+    if len(search_done) <= MAX_SEARCH_RESULTS_KEPT:
+        return
+    search_done.sort(key=lambda jid: jobs[jid].get("finished_at") or jobs[jid].get("created_at") or 0)
+    for jid in search_done[:len(search_done) - MAX_SEARCH_RESULTS_KEPT]:
+        jobs[jid]["result"] = {"evicted": True}
+        jobs[jid].pop("tree_snapshot", None)
 
 
 def _create_job(initial: dict) -> tuple[str, threading.Event]:
@@ -158,6 +178,7 @@ def _create_job(initial: dict) -> tuple[str, threading.Event]:
             for jid in done_ids[:len(jobs) - MAX_JOBS + 1]:
                 jobs.pop(jid, None)
                 _job_cancels.pop(jid, None)
+                _job_trees.pop(jid, None)
         jobs[job_id] = initial
         _job_cancels[job_id] = ev
     return job_id, ev
@@ -186,6 +207,8 @@ def _job_update(job_id: str, **kwargs):
             j["sub_started_at"] = None
         if j.get("status") in ("done", "cancelled", "error") and not j.get("finished_at"):
             j["finished_at"] = now
+        if j.get("status") == "done" and "result" in kwargs:
+            _evict_old_search_results_locked()
 
 
 def _job_inc(job_id: str, field: str, delta: int = 1):
@@ -555,6 +578,9 @@ def job_status(job_id: str):
         j = jobs[job_id]
         snap = dict(j)
         out = {k: (list(v) if isinstance(v, list) else v) for k, v in j.items() if k not in _JOB_INTERNAL_KEYS}
+        ctrl = _job_trees.get(job_id)
+    if ctrl is not None:
+        out.update(ctrl.get_status())
     end_t = snap.get("finished_at") or now
     created_t = snap.get("created_at") or end_t
     out["elapsed_sec"] = round(max(0.0, end_t - created_t), 1)
@@ -588,6 +614,9 @@ def cancel_job(job_id: str):
         ev = _job_cancels.get(job_id)
         if ev:
             ev.set()
+        ctrl = _job_trees.get(job_id)
+        if ctrl is not None:
+            ctrl.resume_event.set()
         if jobs[job_id].get("status") == "running":
             jobs[job_id]["status"] = "cancelled"
             if not jobs[job_id].get("finished_at"):
@@ -971,7 +1000,8 @@ def _validate_search_params(date: str, max_legs: int, cross_extra: int,
                             transit_discount_on: bool = True,
                             transit_discount_min: int = geo.DEFAULT_TRANSIT_DISCOUNT_MIN,
                             transit_proximity_m: int = geo.DEFAULT_TRANSIT_PROXIMITY_M,
-                            fallback_ungeocoded: bool = False):
+                            fallback_ungeocoded: bool = False,
+                            tree_prune_mode: str = "off"):
     _check_date(date)
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
@@ -987,6 +1017,8 @@ def _validate_search_params(date: str, max_legs: int, cross_extra: int,
         raise HTTPException(400, "transit_proximity_m 必须在 200-5000 米之间")
     if cross_radius_km == 0 and fallback_ungeocoded:
         raise HTTPException(400, "半径 R=0（关闭按距离跨站建边）时不允许开启无坐标同城回退")
+    if (tree_prune_mode or "off").strip().lower() not in ("off", "live", "step"):
+        raise HTTPException(400, "tree_prune_mode 必须为 off / live / step")
     if frontier_k is not None and (frontier_k < 0 or frontier_k > 64):
         raise HTTPException(400, "frontier_k 必须在 0-64 之间（0 表示不限束宽）")
     if prune_level not in ("unbounded", "relaxed", "balanced", "strict", "custom"):
@@ -1089,6 +1121,39 @@ class TransferSearchReq(BaseModel):
     transit_proximity_m: int = geo.DEFAULT_TRANSIT_PROXIMITY_M
     active_group_ids: list[int] | None = None
     fallback_ungeocoded: bool = False
+    tree_prune_mode: str = "off"
+
+
+class TreePruneReq(BaseModel):
+    prune_cities: list[str] = []
+    prune_stations: list[str] = []
+    prune_paths: list[list[str]] = []
+    unprune_cities: list[str] = []
+    unprune_stations: list[str] = []
+    unprune_paths: list[list[str]] = []
+    action: str = "prune"
+
+
+@app.post("/api/jobs/{job_id}/prune_tree")
+def prune_job_tree(job_id: str, body: TreePruneReq):
+    act = (body.action or "prune").strip().lower()
+    if act not in ("prune", "continue", "continue_all", "pause"):
+        raise HTTPException(400, "action 必须为 prune / continue / continue_all / pause")
+    with _jobs_lock:
+        if job_id not in jobs:
+            raise HTTPException(404, "任务不存在")
+        ctrl = _job_trees.get(job_id)
+    if ctrl is None:
+        raise HTTPException(404, "该任务未开启交互式分支树剪枝（或任务已结束）")
+    return ctrl.apply_command(
+        prune_cities=body.prune_cities,
+        prune_stations=body.prune_stations,
+        prune_paths=body.prune_paths,
+        unprune_cities=body.unprune_cities,
+        unprune_stations=body.unprune_stations,
+        unprune_paths=body.unprune_paths,
+        action=act,
+    )
 
 
 def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchReq):
@@ -1097,6 +1162,14 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
 
     def on_sub(s_done: int, s_total: int, cur: str):
         _job_update(job_id, sub_done=s_done, sub_total=s_total, current=cur)
+
+    tree_mode = (body.tree_prune_mode or "off").strip().lower()
+    ctrl = None
+    if tree_mode in ("live", "step") and body.max_legs >= 3:
+        ctrl = transfer.TreePruneController(pause_after_layer=(tree_mode == "step"))
+        with _jobs_lock:
+            if job_id in jobs:
+                _job_trees[job_id] = ctrl
 
     try:
         res = transfer.search(
@@ -1127,16 +1200,25 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
             active_group_ids=body.active_group_ids,
             fallback_ungeocoded=body.fallback_ungeocoded,
             progress_cb=on_prog, cancel_event=ev, sub_cb=on_sub,
+            tree_ctrl=ctrl,
         )
         if ev.is_set():
             _job_update(job_id, status="cancelled")
         else:
-            _job_update(job_id, status="done", phase="done", sub_done=0, sub_total=0, result=res)
+            extra_tree = {}
+            if ctrl is not None:
+                # WHY: 搜索结束前保留最终分支树摘要与快照（tree_paused 置 False），
+                # 便于前端从实时面板平稳过渡到“已完成·人工已剪 N 条”的复盘视图。
+                extra_tree = ctrl.get_status()
+                extra_tree["tree_paused"] = False
+            _job_update(job_id, status="done", phase="done", sub_done=0, sub_total=0, result=res, **extra_tree)
     except transfer.SearchCancelled:
         _job_update(job_id, status="cancelled")
     except Exception as e:
         _job_update(job_id, status="error", error=str(e))
     finally:
+        with _jobs_lock:
+            _job_trees.pop(job_id, None)
         db.close_conn()
 
 
@@ -1154,6 +1236,7 @@ def start_transfers(body: TransferSearchReq):
         transit_discount_min=body.transit_discount_min,
         transit_proximity_m=body.transit_proximity_m,
         fallback_ungeocoded=body.fallback_ungeocoded,
+        tree_prune_mode=body.tree_prune_mode,
     )
     f_mode = body.from_city_mode or body.city_mode
     t_mode = body.to_city_mode or body.city_mode

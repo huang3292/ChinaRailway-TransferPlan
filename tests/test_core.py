@@ -2342,8 +2342,194 @@ class TestSchemeCv2(TempDBTestCase):
             self.assertNotIn(removed, html_text, f"前端残留已移除控件: {removed}")
 
 
+class TestMemoryAndInteractiveTreePrune(TempDBTestCase):
+    def _seed_multi_corridor(self):
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [
+                    ("ORI", "起点站", "qdz", "qdz", "起市"),
+                    ("MA1", "中甲站", "zjz", "zjz", "中甲市"),
+                    ("MA2", "次甲站", "cjz", "cjz", "次甲市"),
+                    ("MB1", "中乙站", "zyz", "zyz", "中乙市"),
+                    ("MB2", "次乙站", "cyz", "cyz", "次乙市"),
+                    ("DST", "终点站", "zdz", "zdz", "终市"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    # 路线 A (更快，经 中甲市 -> 中乙市): G101 -> G102 -> G103
+                    ("TA1", "G101", "2026-11-21", 1, "起点站", "ORI", "----", "08:00"),
+                    ("TA1", "G101", "2026-11-21", 2, "中甲站", "MA1", "09:00", "09:00"),
+                    ("TA2", "G102", "2026-11-21", 1, "中甲站", "MA1", "----", "09:35"),
+                    ("TA2", "G102", "2026-11-21", 2, "中乙站", "MB1", "10:35", "10:35"),
+                    ("TA3", "G103", "2026-11-21", 1, "中乙站", "MB1", "----", "11:10"),
+                    ("TA3", "G103", "2026-11-21", 2, "终点站", "DST", "12:00", "12:00"),
+                    # 路线 B (稍慢，经 次甲市 -> 次乙市): G201 -> G202 -> G203
+                    ("TB1", "G201", "2026-11-21", 1, "起点站", "ORI", "----", "08:10"),
+                    ("TB1", "G201", "2026-11-21", 2, "次甲站", "MA2", "09:20", "09:20"),
+                    ("TB2", "G202", "2026-11-21", 1, "次甲站", "MA2", "----", "10:00"),
+                    ("TB2", "G202", "2026-11-21", 2, "次乙站", "MB2", "11:10", "11:10"),
+                    ("TB3", "G203", "2026-11-21", 1, "次乙站", "MB2", "----", "11:50"),
+                    ("TB3", "G203", "2026-11-21", 2, "终点站", "DST", "13:00", "13:00"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,from_station_no,to_station_no,seat_types,seats,can_web_buy) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                [
+                    ("TD_DIR", "D999", "2026-11-21", "ORI", "DST", "01", "02", "O", '{"ze":"有"}', "Y"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("TD_DIR", "D999", "2026-11-21", 1, "起点站", "ORI", "----", "07:00"),
+                    ("TD_DIR", "D999", "2026-11-21", 2, "终点站", "DST", "11:30", "11:30"),
+                ],
+            )
+
+    def test_stations_memory_cache_and_topk_enrichment(self):
+        self._seed_multi_corridor()
+        # 首次调用预热站点内存缓存
+        res1 = db.resolve_stations("起点站", True, "name")
+        self.assertEqual([r["telecode"] for r in res1], ["ORI"])
+        # 再次解析应 0 次 SQLite 查询
+        with mock.patch.object(db, "rows", wraps=db.rows) as spy:
+            res2 = db.resolve_stations("中甲市", True, "all")
+            self.assertEqual([r["telecode"] for r in res2], ["MA1"])
+            self.assertEqual(spy.call_count, 0)
+
+        # 验证 Top-K 延迟丰富化：limit=2 时直达占 1 席 + 换乘占 1 席，且 transfers_total 仍准确记录 2 条
+        sr_lim = transfer.search("起点站", "终点站", "2026-11-21", min_wait=30, max_wait=120, max_legs=3, limit=2, allow_cross_station=False)
+        self.assertEqual([p["legs"][0]["train"] for p in sr_lim["direct"]], ["D999"])
+        self.assertEqual(len(sr_lim["transfers"]), 1)
+        self.assertEqual(sr_lim["transfers_total"], 2)
+        self.assertEqual([l["train"] for l in sr_lim["transfers"][0]["legs"]], ["G101", "G102", "G103"])
+
+    def test_step_and_live_tree_prune_and_result_eviction(self):
+        import time
+        from app import main as main_mod
+
+        self._seed_multi_corridor()
+        main_mod.jobs.clear()
+        main_mod._job_cancels.clear()
+        main_mod._job_trees.clear()
+
+        # 1) 逐程暂停(step)模式：第1程结束暂停 -> 人工砍掉"中甲市" -> 内存前沿立即减少并唤醒完成
+        req = main_mod.TransferSearchReq(
+            from_station="起点站", to_station="终点站", date="2026-11-21",
+            min_wait=30, max_wait=120, max_legs=3, allow_cross_station=False,
+            tree_prune_mode="step",
+        )
+        start = main_mod.start_transfers(req)
+        jid = start["job_id"]
+        st = None
+        for _ in range(80):
+            st = main_mod.job_status(jid)
+            if st.get("tree_paused"):
+                break
+            time.sleep(0.05)
+        self.assertTrue(st and st.get("tree_paused"), f"未触发逐程暂停: {st}")
+        self.assertEqual(st.get("tree_paused_depth"), 1)
+        snap = st.get("tree_snapshot") or {}
+        top_cities = {n["city"] for n in snap.get("nodes", [])}
+        self.assertIn("中甲市", top_cities)
+        self.assertIn("次甲市", top_cities)
+
+        pr_res = main_mod.prune_job_tree(jid, main_mod.TreePruneReq(prune_cities=["中甲市"], action="prune"))
+        self.assertGreaterEqual(pr_res["dropped_now"], 1)
+        self.assertGreaterEqual(pr_res["tree_pruned_count"], 1)
+        self.assertNotIn("中甲市", {n["city"] for n in pr_res["tree_snapshot"]["nodes"]})
+
+        main_mod.prune_job_tree(jid, main_mod.TreePruneReq(action="continue_all"))
+        for _ in range(80):
+            st = main_mod.job_status(jid)
+            if st["status"] != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(st["status"], "done")
+        self.assertFalse(st.get("tree_paused"))
+        self.assertIsNotNone(st.get("tree_snapshot"))
+        self.assertGreaterEqual(st.get("tree_pruned_count", 0), 1)
+        chains = [tuple(l["train"] for l in p["legs"]) for p in st["result"]["transfers"]]
+        self.assertNotIn(("G101", "G102", "G103"), chains)
+        self.assertIn(("G201", "G202", "G203"), chains)
+        self.assertGreaterEqual(st["result"]["prune_stats"].get("user_tree", 0), 1)
+
+        # 1b) 实时热砍(live)模式：运行中即时快照剔除 + 中途切换 pause -> step 审阅 -> continue_all
+        ctrl_live = transfer.TreePruneController(pause_after_layer=False)
+        snap_mock = {
+            "depth": 1, "max_legs": 3, "phase": "running", "total_states": 2, "more_top": 0,
+            "nodes": [
+                {"kind": "city", "label": "中甲市", "city": "中甲市", "path": ["中甲市"], "count": 1, "min_elapsed_min": 60, "samples": ["G101"], "children": []},
+                {"kind": "city", "label": "次甲市", "city": "次甲市", "path": ["次甲市"], "count": 1, "min_elapsed_min": 80, "samples": ["G201"], "children": []},
+            ],
+        }
+        with ctrl_live.lock:
+            ctrl_live.snapshot = snap_mock
+        live_pr = ctrl_live.apply_command(prune_cities=["中甲市"], action="prune")
+        self.assertFalse(live_pr["tree_paused"])
+        self.assertEqual([n["city"] for n in live_pr["tree_snapshot"]["nodes"]], ["次甲市"])
+        self.assertEqual(live_pr["tree_snapshot"]["total_states"], 1)
+        sw = ctrl_live.apply_command(action="pause")
+        self.assertTrue(sw["tree_pause_after_layer"])
+        sw2 = ctrl_live.apply_command(action="continue_all")
+        self.assertFalse(sw2["tree_pause_after_layer"])
+        req_live = main_mod.TransferSearchReq(
+            from_station="起点站", to_station="终点站", date="2026-11-21",
+            min_wait=30, max_wait=120, max_legs=3, allow_cross_station=False,
+            tree_prune_mode="live",
+        )
+        jid_live = main_mod.start_transfers(req_live)["job_id"]
+        st_live = None
+        for _ in range(80):
+            st_live = main_mod.job_status(jid_live)
+            if st_live["status"] != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(st_live["status"], "done")
+        self.assertFalse(st_live.get("tree_paused"))
+        self.assertIsNotNone(st_live.get("tree_snapshot"))
+
+        # 2) 暂停状态下 cancel_job 能立即唤醒并取消
+        start_c = main_mod.start_transfers(req)
+        jid_c = start_c["job_id"]
+        for _ in range(80):
+            if main_mod.job_status(jid_c).get("tree_paused"):
+                break
+            time.sleep(0.05)
+        main_mod.cancel_job(jid_c)
+        for _ in range(40):
+            if main_mod.job_status(jid_c)["status"] == "cancelled":
+                break
+            time.sleep(0.05)
+        self.assertEqual(main_mod.job_status(jid_c)["status"], "cancelled")
+
+        # 3) 搜索结果超 MAX_SEARCH_RESULTS_KEPT 时淘汰旧 result 与旧 tree_snapshot，保留任务元数据与 MAX_JOBS 上限
+        created_jids = []
+        for idx in range(main_mod.MAX_SEARCH_RESULTS_KEPT + 3):
+            j_ev, _ = main_mod._create_job({"status": "running", "phase": "search", "done": 0, "total": 1, "result": {}})
+            main_mod._job_update(j_ev, status="done", result={"direct": [], "transfers": [{"idx": idx}]}, tree_snapshot={"depth": 1, "nodes": []})
+            created_jids.append(j_ev)
+        with main_mod._jobs_lock:
+            self.assertTrue(main_mod.jobs[created_jids[0]]["result"].get("evicted"))
+            self.assertNotIn("tree_snapshot", main_mod.jobs[created_jids[0]])
+            self.assertIn("tree_snapshot", main_mod.jobs[created_jids[-1]])
+            self.assertEqual(main_mod.jobs[created_jids[-1]]["result"]["transfers"], [{"idx": main_mod.MAX_SEARCH_RESULTS_KEPT + 2}])
+
+        # 4) 前端分支树面板控件校验
+        html_text = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        for marker in (
+            'id="s-tree-mode"', 'id="s-tree-panel"', 'prune_tree', 'renderTreePanel',
+            'initTreePanelEvents', 'id="s-tree-exp-all"', 'id="s-tree-col-all"', 'toggle-body',
+        ):
+            self.assertIn(marker, html_text, f"缺失分支树 UI 标记: {marker}")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
