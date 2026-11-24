@@ -1415,6 +1415,9 @@ function priceDrawerHtml(l,opts={}){
   if(l.ticket_updated){
     stBadges.push(`<span class="kflag upd">余票更新 ${esc(l.ticket_updated)}</span>`);
   }
+  if(l.ticket_live){
+    stBadges.push(`<span class="kflag upd" title="国铁已改普速车次头，本行按车次数字匹配到实时车次">实时车次 ${esc(l.ticket_live)}</span>`);
+  }
   if(l.can_web_buy==='N'){
     stBadges.push(`<span class="kflag gone">当前不可网上购票</span>`);
   }
@@ -3458,6 +3461,7 @@ function applyTickets(result){
         delete l.ticket_error;
       }
       if(r.prices){l.prices=r.prices;l.price_date=r.price_date;l.price_stale=!!r.price_stale;}
+      if(r.live_train)l.ticket_live=r.live_train;
       if(r.error&&!r.seats)l.ticket_error=r.error;
     }
     if(p.legs.length&&p.legs.every(l=>!!l.seats)){

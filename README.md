@@ -493,8 +493,12 @@ python3 crawl_geo_coords.py --audit-only        # 仅离线运行多维质检与
    `_leg_ident` 去重，生成 `key = "train_no|from|to|date"`（与前端 `legKey()` 完全一致）。
 2. 对每个唯一 OD+日期：**日期 >= 今天**才实时 `crawl_tickets`（过去日期只用缓存）。
 3. 从入库 tickets 取余票；station_no 优先用 tickets 的 `from/to_station_no`，缺失用 `sno` 回填。
+   匹配先用 `train_no` 精确；miss 时按「车次数字部分 + 同区间 + 同日期」兜底（`find_tk`）。
+   WHY：2026-11-25 乘车日起国铁把普速车次头改为 V 等（K1068→V1068），`train_no` 同步变，
+   旧头方案查不到实时余票；数字部分改头中不变，同数字多行按"最后爬取为准"取 id 最大行。
+   兜底命中且车次名不同时会输出 `live_train`（票价/`crawl_price` 也改用实时 `train_no` 对齐）。
 4. 票价：已有缓存跳过，否则 `crawl_price`（同样仅未来日期）。
-5. 输出 `result[key] = {seats, can_web_buy, prices:[{seat,price}]}`；无余票或失败则 `error`。
+5. 输出 `result[key] = {seats, can_web_buy, prices:[{seat,price}], live_train?}`；无余票或失败则 `error`。
 
 > 前端 `autoQuery()` 取**当前页**（`sortPlans(filterPlans(...)).slice((page-1)*size, page*size).filter(!departed)`）的行程段，POST 后轮询，`applyTickets()` 按 key 回填。切换排序/筛选/翻页会 `refreshAutoQuery()` 防抖 900ms 重查。
 
@@ -612,6 +616,7 @@ python3 crawl_geo_coords.py --audit-only        # 仅离线运行多维质检与
 | 票价估算费率/速度 | `fare.py`（`RATES`/`SPEED`/`load_calibration`） |
 | 城市展开/别名/五档选站（含③城市+字样、④芯片多选、实时预览） | `db.py`（`city_stations`、`city_all_stations`、`CITY_PROPER`、`resolve_stations(city_mode)`）；`main.py`（`/api/stations/resolve`、`only_cities`、`from_city_mode`/`to_city_mode`）；前端 `index.html`（`initSidePicker`、`odState`、`schedulePreview`） |
 | 担当车型徽标（复兴号/智能动车/车底） | `parsers.parse_station_screen`（train_style/jiaolu_train_style）→ `transfer._style_map`/`_enrich` → 前端 `styleBadges()` |
+| 普速车次改头（2026-11-25 乘车日起 K/T/Z→V 等，`train_no` 同步变） | `main._train_digits`/`find_tk`：实时匹配 miss 时按数字段+同区间+同日期兜底，多行取最后爬取；输出 `live_train`，前端席别面板「实时车次」徽标；`crawl_price`/票价回查按实时 `train_no` 对齐 |
 | 常驻路网/日期缓存、候选筛选 | `transfer.py`（`_build_graph_cache`/`_get_graph_cache`/`_get_date_cache`、`screen_key_to_tn`/`tt_key_to_tn`）、`db.py`（`data_version`/`bump_data_version`） |
 | SQLite 读盘性能（页缓存/mmap/同步级别） | `db.py` 连接初始化处的 `PRAGMA` |
 | 排序"实际价优先"口径 | 前端 `priceKey`；后端 `transfer.rank` |
