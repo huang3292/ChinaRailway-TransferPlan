@@ -380,6 +380,24 @@ button.drawer-btn .cnt{display:inline-block;background:var(--blue);color:#fff;bo
 .tree-cut.sec:hover{background:#fef2f2;color:#b91c1c;border-color:#fecaca}
 .tree-children{padding-left:20px;border-left:1px solid #e2e8f0;margin-left:9px}
 .tree-more{padding:4px 6px;font-size:11px;color:var(--muted)}
+.tree-kind.prov{background:#eef5ff;color:var(--blue-dark);border:1px solid #bfdbfe;border-radius:3px;padding:0 5px;font-weight:600}
+.tree-prov-bar{padding:7px 14px;background:#f8fafc;border-bottom:1px solid var(--border-light);display:none;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px}
+.tree-prov-bar.show{display:flex}
+.tree-prov-pill{display:inline-flex;align-items:center;gap:5px;background:#fff;border:1px solid #cbd5e1;border-radius:4px;padding:2px 7px;font-size:11px;color:#334155}
+.tree-prov-pill b{color:#0f172a}
+.tree-prov-pill button{border:none;background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:3px;padding:0 5px;font-size:11px;cursor:pointer;line-height:1.4}
+.tree-prov-pill button:hover{background:#fee2e2}
+.prov-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.prov-corridor-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px 10px;background:#eef5ff;border:1px solid #bfdbfe;border-radius:4px;margin-bottom:9px;font-size:12px}
+.prov-region-bar{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-bottom:8px}
+.prov-reg-btn,.prov-chip{background:#fff;color:#334155;border:1px solid #cbd5e1;border-radius:4px;padding:3px 9px;font-size:12px;cursor:pointer;line-height:1.35;white-space:nowrap}
+.prov-reg-btn:hover,.prov-chip:hover{border-color:#93c5fd;background:#f0f7ff;color:var(--blue-dark)}
+.prov-reg-btn.on,.prov-chip.on{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}
+.prov-reg-btn.part{background:#dbeafe;border-color:#60a5fa;color:#1e40af;font-weight:600}
+.prov-grid{display:flex;flex-direction:column;gap:5px;padding:8px 10px;background:#fff;border:1px solid var(--border-light);border-radius:4px}
+.prov-reg-row{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap}
+.prov-reg-lbl{flex:0 0 52px;font-size:11px;font-weight:600;color:var(--muted);padding-top:4px}
+.prov-chips{flex:1;display:flex;flex-wrap:wrap;gap:5px}
 
 @media(max-width:768px){
   header{padding:6px 12px;height:auto;flex-wrap:wrap;gap:6px 10px}
@@ -511,6 +529,7 @@ button.drawer-btn .cnt{display:inline-block;background:var(--blue);color:#fff;bo
         <button type="button" class="drawer-btn" id="s-drawer-cross-btn" data-drawer="cross">换乘与异站设置 <span class="cnt" id="s-cnt-cross" style="display:none"></span> ▾</button>
         <button type="button" class="drawer-btn" id="s-drawer-filter-btn" data-drawer="filter">车次与时段筛选 <span class="cnt" id="s-cnt-filter" style="display:none"></span> ▾</button>
         <button type="button" class="drawer-btn" id="s-drawer-prune-btn" data-drawer="prune">剪枝参数 <span class="cnt" id="s-cnt-prune" style="display:none"></span> ▾</button>
+        <button type="button" class="drawer-btn" id="s-drawer-prov-btn" data-drawer="prov">省份路线过滤 <span class="cnt" id="s-cnt-prov" style="display:none"></span> ▾</button>
       </div>
       <div class="summary-right">
         <div class="mode-readout" id="s-mode-readout"></div>
@@ -650,6 +669,45 @@ button.drawer-btn .cnt{display:inline-block;background:var(--blue);color:#fff;bo
       <div class="hint" style="margin-top:8px">重复车次、折返已乘车站、同城空转、绕回已离城市等防死循环规则在底层强制执行；当必经/排除/车型约束生效时，后端自动关闭束宽与支配剪枝（非自定义模式）。修改搜前条件后点击「重新查询」生效，不影响当前查看中的结果对照。</div>
     </div>
 
+    <!-- 抽屉 4：省份路线过滤与走廊推荐（默认折叠，搜前只过滤中间换乘站） -->
+    <div class="search-drawer" id="s-prov-drawer" style="display:none">
+      <div class="search-drawer-hd">
+        <b>省份路线过滤（搜前阶段直接拦截不合理中转省，出发/到达地与直达车次不受影响）</b>
+        <span class="hint" style="margin:0">零坐标离线映射全国 34 省与 340+ 城市；与束宽/支配剪枝正交，不触发自动放宽</span>
+      </div>
+      <div class="prov-toolbar">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="font-size:12px;color:var(--muted);font-weight:500">过滤模式：</span>
+          <div class="seg-tri" id="s-prov-mode-seg" role="group" aria-label="省份过滤模式">
+            <button type="button" data-prov-mode="off" class="active">不限省份</button>
+            <button type="button" data-prov-mode="allow">仅限经过省份（白名单）</button>
+            <button type="button" data-prov-mode="exclude">屏蔽选中省份（黑名单）</button>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <button type="button" class="mini" id="s-prov-inv-btn">反选全部省份</button>
+          <button type="button" class="mini" id="s-prov-clr-btn">清空勾选</button>
+        </div>
+      </div>
+      <div class="prov-corridor-bar">
+        <span style="font-weight:600;color:var(--blue-dark)">OD 沿途走廊推荐：</span>
+        <select id="s-prov-widen" style="width:auto;padding:3px 7px;font-size:12px">
+          <option value="tight">紧致直线走廊</option>
+          <option value="standard" selected>标准走廊（推荐）</option>
+          <option value="wide">宽松多绕走廊</option>
+        </select>
+        <button type="button" class="mini" id="s-prov-rec-btn">按起终点推荐沿途省份（填入白名单）</button>
+        <button type="button" class="mini" id="s-prov-rec-exc-btn">屏蔽走廊外其余全部省份（黑名单）</button>
+        <span id="s-prov-rec-msg" class="hint" style="margin:0;color:#1e40af"></span>
+      </div>
+      <div class="prov-region-bar" id="s-prov-regions"></div>
+      <div class="prov-grid" id="s-prov-grid"></div>
+      <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <label class="chk-inline" title="仅对既无内置城市映射也无可用经纬度的极少数不知名小站生效；默认放行以免误杀"><input type="checkbox" id="s-prov-block-unknown"> 未知归属小站也按规则拦截（严格模式）</label>
+        <span id="s-prov-sel-info" class="hint" style="margin:0">当前未勾选省份</span>
+      </div>
+    </div>
+
     <div id="s-stale-banner" class="stale-bar">
       <span id="s-stale-txt">搜索条件或异站规则已变更，当前结果基于上次查询</span>
       <button type="button" class="mini orange" id="s-recompute-btn">按新条件重新查询</button>
@@ -665,23 +723,29 @@ button.drawer-btn .cnt{display:inline-block;background:var(--blue);color:#fff;bo
       <div class="tree-hd-left">
         <b>交互分支树</b>
         <span id="s-tree-status" class="tree-status running">运行中</span>
+        <div class="seg-tri" id="s-tree-view-seg" role="group" aria-label="分支树视图">
+          <button type="button" data-tree-view="by_province" class="active">按省分层(省→市→站)</button>
+          <button type="button" data-tree-view="by_city">按城市(市→站+省栏)</button>
+        </div>
         <span id="s-tree-meta" class="num" style="color:var(--muted);font-size:12px"></span>
       </div>
       <div class="tree-actions" id="s-tree-actions"></div>
     </div>
     <div class="tree-filter-bar" id="s-tree-filter-bar">
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-        <input id="s-tree-filter" placeholder="过滤展示城市/站点/车次…">
+        <input id="s-tree-filter" placeholder="过滤展示省/城市/站点/车次…">
         <button type="button" class="mini" id="s-tree-exp-all">全部展开</button>
         <button type="button" class="mini" id="s-tree-col-all">全部收起</button>
-        <span class="hint" style="margin:0">仅展示按耗时排序的头部中转分支；未出现在下方也可直接输入手动剪除</span>
+        <span class="hint" style="margin:0">按省展示全量活跃省份；未出现在下方也可直接输入手动剪除</span>
       </div>
       <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap" id="s-tree-manual-wrap">
-        <input id="s-tree-manual" placeholder="输入城市或站名…" style="width:140px;min-width:120px">
+        <input id="s-tree-manual" placeholder="输入省/城市或站名…" style="width:140px;min-width:120px">
+        <button type="button" class="mini" id="s-tree-cut-prov">屏蔽省</button>
         <button type="button" class="mini" id="s-tree-cut-city">全局剪城市</button>
         <button type="button" class="mini" id="s-tree-cut-stn">剪站点</button>
       </div>
     </div>
+    <div id="s-tree-prov-bar" class="tree-prov-bar"></div>
     <div id="s-tree-rules" class="tree-rules-bar"></div>
     <div id="s-tree-body" class="tree-body"></div>
   </div>
@@ -1994,6 +2058,7 @@ let lastTreeSig='';
 let activeTreeJobId=null;
 let lastTreeStatusObj=null;
 let treeBodyCollapsed=false;
+let treeViewMode='by_province';
 
 function hideTreePanel(){
   const p=$('s-tree-panel');
@@ -2025,6 +2090,12 @@ async function sendTreePruneCmd(jobId,cmd){
   }
 }
 
+function activeTreeRootNodes(snap){
+  if(!snap)return [];
+  if(treeViewMode==='by_province'&&Array.isArray(snap.provinces)&&snap.provinces.length)return snap.provinces;
+  return snap.nodes||[];
+}
+
 function collectTreeExpandablePaths(nodes,out){
   (nodes||[]).forEach(n=>{
     const children=n.children||[];
@@ -2037,7 +2108,7 @@ function collectTreeExpandablePaths(nodes,out){
 
 function treeNodeMatchesFilter(node,q){
   if(!q)return true;
-  const hay=[node.label,node.city,node.station_key,...(node.samples||[]),...(node.path||[])].join(' ').toLowerCase();
+  const hay=[node.label,node.province,node.city,node.station_key,...(node.samples||[]),...(node.path||[])].filter(Boolean).join(' ').toLowerCase();
   if(hay.includes(q))return true;
   return (node.children||[]).some(ch=>treeNodeMatchesFilter(ch,q));
 }
@@ -2055,7 +2126,10 @@ function renderTreeNodeHtml(node,q,isDone){
   let opsHtml='';
   if(!isDone){
     const pathJson=esc(JSON.stringify(node.path||[]));
-    if(node.kind==='station'){
+    if(node.kind==='province'){
+      const pName=node.province||node.label;
+      opsHtml=`<button type="button" class="tree-cut" data-cut-province="${esc(pName)}">全局屏蔽 ${esc(pName)}</button>`;
+    }else if(node.kind==='station'){
       opsHtml=`<button type="button" class="tree-cut" data-cut-station="${esc(node.station_key||node.label)}">剪此站</button>`
         +`<button type="button" class="tree-cut sec" data-cut-path="${pathJson}">仅砍此分枝</button>`;
     }else{
@@ -2063,6 +2137,11 @@ function renderTreeNodeHtml(node,q,isDone){
         +`<button type="button" class="tree-cut sec" data-cut-city="${esc(node.city||node.label)}">全局屏蔽 ${esc(node.city||node.label)}</button>`;
     }
   }
+  const kindHtml=node.kind==='province'
+    ?'<span class="tree-kind prov">省份</span>'
+    :(node.kind==='station'
+      ?'<span class="tree-kind">车站</span>'
+      :`<span class="tree-kind">城市${node.province&&treeViewMode==='by_city'?'·'+esc(node.province):''}</span>`);
   const chHtml=isExp
     ?(`<div class="tree-children">${children.map(ch=>renderTreeNodeHtml(ch,q,isDone)).join('')}${node.more_children>0?`<div class="tree-more">… 还有 ${node.more_children} 个下级分支（可用上方过滤或手动输入剪除）</div>`:''}</div>`)
     :'';
@@ -2071,7 +2150,7 @@ function renderTreeNodeHtml(node,q,isDone){
     +`<div class="tree-row-main">`
     +`<button type="button" class="tree-tog${hasCh?'':' leaf'}" data-tog-path="${esc(pathKey)}">${isExp?'▾':'▸'}</button>`
     +`<span class="tree-label">${esc(node.label)}</span>`
-    +`<span class="tree-kind">${node.kind==='station'?'车站':'城市'}</span>`
+    +kindHtml
     +`<span class="tree-meta">${esc(metaParts.join(' · '))}</span>`
     +`</div>`
     +(opsHtml?`<div class="tree-row-ops">${opsHtml}</div>`:'')
@@ -2092,15 +2171,19 @@ function renderTreePanel(jobId,j){
 
   const isDone=j.status!=='running';
   const q=String($('s-tree-filter')?$('s-tree-filter').value:'').trim().toLowerCase();
-  const topDigest=(snap.nodes||[]).map(n=>`${n.label}:${n.count}:${(n.children||[]).length}`).join('|');
+  const roots=activeTreeRootNodes(snap);
+  const topDigest=roots.map(n=>`${n.label}:${n.count}:${(n.children||[]).length}`).join('|');
+  const provDigest=(snap.province_summary||[]).map(x=>`${x.province}:${x.count}`).join('|');
   const sig=JSON.stringify([
     j.status,!!j.tree_paused,j.tree_paused_depth||0,!!j.tree_pause_after_layer,
     j.tree_pruned_count||0,j.tree_pruned_rules||null,
-    snap.depth,snap.phase,snap.total_states,topDigest,q,[...treeExpandedPaths].join(','),treeBodyCollapsed
+    snap.depth,snap.phase,snap.total_states,treeViewMode,topDigest,provDigest,q,[...treeExpandedPaths].join(','),treeBodyCollapsed
   ]);
   // WHY: live 模式 350ms 轮询且采样未更新时跳过 DOM 重建，既避免页面抖动，也配合事件委托确保点击不因重绘丢失。
   if(sig===lastTreeSig)return;
   lastTreeSig=sig;
+
+  document.querySelectorAll('#s-tree-view-seg button[data-tree-view]').forEach(b=>b.classList.toggle('active',b.dataset.treeView===treeViewMode));
 
   const stEl=$('s-tree-status');
   if(stEl){
@@ -2136,9 +2219,23 @@ function renderTreePanel(jobId,j){
   if(fBar)fBar.style.display=(isDone&&treeBodyCollapsed)?'none':'flex';
   if(mWrap)mWrap.style.display=isDone?'none':'flex';
 
+  const provBar=$('s-tree-prov-bar');
+  const pSum=snap.province_summary||[];
+  if(provBar){
+    if(!(isDone&&treeBodyCollapsed)&&pSum.length){
+      provBar.classList.add('show');
+      provBar.innerHTML='<span style="color:var(--muted);font-weight:600">当前活跃省份：</span>'
+        +pSum.map(ps=>`<span class="tree-prov-pill"><b>${esc(ps.province)}</b> <span>${ps.count}分支</span>${ps.min_elapsed_min!=null?`<span>最快${fmtMin(ps.min_elapsed_min)}</span>`:''}${isDone?'':`<button type="button" data-cut-province="${esc(ps.province)}" title="全局屏蔽 ${esc(ps.province)}">屏蔽</button>`}</span>`).join('');
+    }else{
+      provBar.classList.remove('show');
+      provBar.innerHTML='';
+    }
+  }
+
   const rulesBar=$('s-tree-rules');
-  const rules=j.tree_pruned_rules||{cities:[],stations:[],paths:[]};
+  const rules=j.tree_pruned_rules||{provinces:[],cities:[],stations:[],paths:[]};
   const rTags=[];
+  (rules.provinces||[]).forEach(pr=>rTags.push(`<span class="tree-rule-tag">屏蔽省: ${esc(pr)}${isDone?'':`<button type="button" data-unprune-prov="${esc(pr)}" title="恢复">×</button>`}</span>`));
   (rules.cities||[]).forEach(c=>rTags.push(`<span class="tree-rule-tag">屏蔽城市: ${esc(c)}${isDone?'':`<button type="button" data-unprune-city="${esc(c)}" title="恢复">×</button>`}</span>`));
   (rules.stations||[]).forEach(s=>rTags.push(`<span class="tree-rule-tag">屏蔽站: ${esc(s)}${isDone?'':`<button type="button" data-unprune-stn="${esc(s)}" title="恢复">×</button>`}</span>`));
   (rules.paths||[]).forEach(pt=>rTags.push(`<span class="tree-rule-tag">砍分支: ${esc(pt.join(' → '))}${isDone?'':`<button type="button" data-unprune-path="${esc(JSON.stringify(pt))}" title="恢复">×</button>`}</span>`));
@@ -2159,8 +2256,9 @@ function renderTreePanel(jobId,j){
     }else{
       bodyEl.style.display='block';
       const prevScroll=bodyEl.scrollTop;
-      const html=(snap.nodes||[]).map(n=>renderTreeNodeHtml(n,q,isDone)).join('')
-        +(snap.more_top>0?`<div class="tree-more">… 顶层还折叠了 ${snap.more_top} 个耗时更长城市（可用上方过滤或手动剪除）</div>`:'');
+      const moreCount=treeViewMode==='by_province'?0:(snap.more_top||0);
+      const html=roots.map(n=>renderTreeNodeHtml(n,q,isDone)).join('')
+        +(moreCount>0?`<div class="tree-more">… 顶层还折叠了 ${moreCount} 个耗时更长城市（可切换「按省分层」查看全量省，或用上方过滤/手动剪除）</div>`:'');
       bodyEl.innerHTML=html||'<div class="hint" style="margin:6px 0">当前无匹配树节点（或已被全部剪除）</div>';
       bodyEl.scrollTop=prevScroll;
     }
@@ -2168,6 +2266,29 @@ function renderTreePanel(jobId,j){
 }
 
 function initTreePanelEvents(){
+  const viewSeg=$('s-tree-view-seg');
+  if(viewSeg&&!viewSeg.dataset.bound){
+    viewSeg.dataset.bound='1';
+    viewSeg.addEventListener('click',e=>{
+      const b=e.target.closest('button[data-tree-view]');
+      if(!b)return;
+      const next=b.dataset.treeView==='by_city'?'by_city':'by_province';
+      if(next===treeViewMode)return;
+      treeViewMode=next;
+      saveSearchPrefs();
+      lastTreeSig='';
+      if(activeTreeJobId&&lastTreeStatusObj)renderTreePanel(activeTreeJobId,lastTreeStatusObj);
+    });
+  }
+  const provBar=$('s-tree-prov-bar');
+  if(provBar&&!provBar.dataset.bound){
+    provBar.dataset.bound='1';
+    provBar.addEventListener('click',e=>{
+      if(!activeTreeJobId)return;
+      const bp=e.target.closest('[data-cut-province]');
+      if(bp){sendTreePruneCmd(activeTreeJobId,{prune_provinces:[bp.dataset.cutProvince],action:'prune'});}
+    });
+  }
   const actEl=$('s-tree-actions');
   if(actEl&&!actEl.dataset.bound){
     actEl.dataset.bound='1';
@@ -2192,6 +2313,8 @@ function initTreePanelEvents(){
     rulesBar.dataset.bound='1';
     rulesBar.addEventListener('click',e=>{
       if(!activeTreeJobId)return;
+      const bpr=e.target.closest('[data-unprune-prov]');
+      if(bpr){sendTreePruneCmd(activeTreeJobId,{unprune_provinces:[bpr.dataset.unpruneProv],action:'prune'});return;}
       const bc=e.target.closest('[data-unprune-city]');
       if(bc){sendTreePruneCmd(activeTreeJobId,{unprune_cities:[bc.dataset.unpruneCity],action:'prune'});return;}
       const bs=e.target.closest('[data-unprune-stn]');
@@ -2214,6 +2337,8 @@ function initTreePanelEvents(){
         return;
       }
       if(!activeTreeJobId)return;
+      const bpr=e.target.closest('[data-cut-province]');
+      if(bpr){sendTreePruneCmd(activeTreeJobId,{prune_provinces:[bpr.dataset.cutProvince],action:'prune'});return;}
       const bc=e.target.closest('[data-cut-city]');
       if(bc){sendTreePruneCmd(activeTreeJobId,{prune_cities:[bc.dataset.cutCity],action:'prune'});return;}
       const bs=e.target.closest('[data-cut-station]');
@@ -2233,7 +2358,7 @@ function initTreePanelEvents(){
       const snap=lastTreeStatusObj&&lastTreeStatusObj.tree_snapshot;
       if(!snap)return;
       const paths=[];
-      collectTreeExpandablePaths(snap.nodes||[],paths);
+      collectTreeExpandablePaths(activeTreeRootNodes(snap),paths);
       paths.forEach(pk=>treeExpandedPaths.add(pk));
       lastTreeSig='';
       if(activeTreeJobId&&lastTreeStatusObj)renderTreePanel(activeTreeJobId,lastTreeStatusObj);
@@ -2244,6 +2369,14 @@ function initTreePanelEvents(){
       treeExpandedPaths.clear();
       lastTreeSig='';
       if(activeTreeJobId&&lastTreeStatusObj)renderTreePanel(activeTreeJobId,lastTreeStatusObj);
+    };
+  }
+  if($('s-tree-cut-prov')){
+    $('s-tree-cut-prov').onclick=()=>{
+      const v=String($('s-tree-manual')?$('s-tree-manual').value:'').trim();
+      if(!v||!activeTreeJobId)return;
+      sendTreePruneCmd(activeTreeJobId,{prune_provinces:[v],action:'prune'});
+      $('s-tree-manual').value='';
     };
   }
   if($('s-tree-cut-city')){
@@ -2337,15 +2470,27 @@ const PRUNE_LEVEL_SHORT={unbounded:'无限制',relaxed:'高度宽松',balanced:'
 const FALLBACK_HUBS_TEXT='北京,天津,石家庄,太原,呼和浩特,沈阳,长春,哈尔滨,上海,南京,杭州,合肥,福州,南昌,济南,郑州,武汉,长沙,广州,南宁,海口,重庆,成都,贵阳,昆明,拉萨,西安,兰州,西宁,银川,乌鲁木齐,徐州,商丘,阜阳,蚌埠,鹰潭,株洲,衡阳,怀化,襄阳,深圳,厦门,青岛,大连,宁波,温州,苏州,无锡,桂林,柳州,洛阳,宝鸡,宜昌,三明北';
 const SEARCH_PREFS_KEY='transferSearch:v2';
 const RULES_VER_KEY='transferRulesVersion:v1';
+const PROVINCE_REGIONS=[
+  ['华东',['上海','江苏','浙江','安徽','福建','江西','山东']],
+  ['华南',['广东','广西','海南']],
+  ['华中',['河南','湖北','湖南']],
+  ['华北',['北京','天津','河北','山西','内蒙古']],
+  ['东北',['辽宁','吉林','黑龙江']],
+  ['西南',['重庆','四川','贵州','云南','西藏']],
+  ['西北',['陕西','甘肃','青海','宁夏','新疆']],
+  ['港澳台',['香港','澳门','台湾']],
+];
+const ALL_PROVINCES=PROVINCE_REGIONS.flatMap(r=>r[1]);
 const SEARCH_DEFAULTS={
-  sort:'duration',schemeType:'',maxLegs:2,treePruneMode:'off',pageSize:50,minWait:30,maxWait:360,
+  sort:'duration',schemeType:'',maxLegs:2,treePruneMode:'off',treeViewMode:'by_province',pageSize:50,minWait:30,maxWait:360,
   transferScope:'all',radiusKm:20,crossTimeMode:'smart',fixedExtra:60,
   transitDiscountOn:true,transitDiscountMin:15,transitProximityM:1500,
   fallbackUngeocoded:false,pruneLevel:'balanced',fk:8,maxh:48,detour:0,dom:false,
-  hubOnly:false,hubStations:'',migratedFixedNotice:false
+  hubOnly:false,hubStations:'',provinceMode:'off',selectedProvinces:[],provWiden:'standard',blockUnknownProv:false,migratedFixedNotice:false
 };
 
 let transferScope='all',hideFallbackPlans=false,hideSuspectPlans=false,groupsLoaded=false,cachedGroups=[];
+let provinceMode='off',selectedProvinces=[];
 let searchPrefs={...SEARCH_DEFAULTS};
 let localFilterDiffNote='',lastSearchDelta=null;
 let openDrawers=new Set();
@@ -2446,6 +2591,7 @@ function applyPrefsToDOM(){
   if($('s-type'))$('s-type').value=searchPrefs.schemeType||'';
   if($('s-legs'))$('s-legs').value=String(searchPrefs.maxLegs||2);
   if($('s-tree-mode'))$('s-tree-mode').value=['off','step','live'].includes(searchPrefs.treePruneMode)?searchPrefs.treePruneMode:'off';
+  treeViewMode=searchPrefs.treeViewMode==='by_city'?'by_city':'by_province';
   if($('s-size'))$('s-size').value=String(searchPrefs.pageSize||50);
   if($('s-min'))$('s-min').value=String(searchPrefs.minWait??30);
   if($('s-max'))$('s-max').value=String(searchPrefs.maxWait??360);
@@ -2464,6 +2610,10 @@ function applyPrefsToDOM(){
   if($('s-dom'))$('s-dom').checked=!!searchPrefs.dom;
   if($('s-hub-only'))$('s-hub-only').checked=!!searchPrefs.hubOnly;
   if($('s-hubs'))$('s-hubs').value=searchPrefs.hubStations||'';
+  provinceMode=['off','allow','exclude'].includes(searchPrefs.provinceMode)?searchPrefs.provinceMode:'off';
+  selectedProvinces=Array.isArray(searchPrefs.selectedProvinces)?searchPrefs.selectedProvinces.filter(p=>ALL_PROVINCES.includes(p)):[];
+  if($('s-prov-widen'))$('s-prov-widen').value=['tight','standard','wide'].includes(searchPrefs.provWiden)?searchPrefs.provWiden:'standard';
+  if($('s-prov-block-unknown'))$('s-prov-block-unknown').checked=!!searchPrefs.blockUnknownProv;
   if($('s-migrated-notice'))$('s-migrated-notice').classList.toggle('show',!!searchPrefs.migratedFixedNotice);
 }
 function saveSearchPrefs(){
@@ -2471,7 +2621,7 @@ function saveSearchPrefs(){
   searchPrefs={
     ...searchPrefs,
     version:2,
-    sort:raw.sort,schemeType:raw.schemeType,maxLegs:raw.maxLegs,treePruneMode:raw.treePruneMode,pageSize:raw.pageSize,
+    sort:raw.sort,schemeType:raw.schemeType,maxLegs:raw.maxLegs,treePruneMode:raw.treePruneMode,treeViewMode:treeViewMode,pageSize:raw.pageSize,
     minWait:raw.minWaitRaw??30,maxWait:raw.maxWaitRaw??360,
     transferScope:raw.transferScope,
     radiusKm:raw.radiusRaw??20,
@@ -2483,7 +2633,9 @@ function saveSearchPrefs(){
     fallbackUngeocoded:raw.fallbackUngeocoded,
     pruneLevel:raw.pruneLevel,
     fk:raw.fkRaw??8,maxh:raw.maxhRaw??48,detour:raw.detourRaw??0,dom:raw.dom,
-    hubOnly:raw.hubOnly,hubStations:raw.hubStations
+    hubOnly:raw.hubOnly,hubStations:raw.hubStations,
+    provinceMode:raw.provinceMode,selectedProvinces:[...raw.selectedProvinces],
+    provWiden:raw.provWiden,blockUnknownProv:raw.blockUnknownProv
   };
   try{localStorage.setItem(SEARCH_PREFS_KEY,JSON.stringify(searchPrefs));}catch(_e){}
 }
@@ -2528,6 +2680,10 @@ function readRawSearchState(){
     dom:$('s-dom')?$('s-dom').checked:false,
     hubOnly:$('s-hub-only')?$('s-hub-only').checked:false,
     hubStations:$('s-hubs')?$('s-hubs').value.trim():'',
+    provinceMode:provinceMode,
+    selectedProvinces:[...selectedProvinces],
+    provWiden:$('s-prov-widen')?$('s-prov-widen').value:'standard',
+    blockUnknownProv:$('s-prov-block-unknown')?$('s-prov-block-unknown').checked:false,
     incPfx:$('s-inc-pfx')?$('s-inc-pfx').value.trim():'',
     excPfx:$('s-exc-pfx')?$('s-exc-pfx').value.trim():'',
     incTst:$('s-inc-tst')?$('s-inc-tst').value.trim():'',
@@ -2558,6 +2714,8 @@ function deriveSearchConfig(raw){
   const fallbackAllowed=crossActive&&Number.isFinite(effRad)&&effRad>0;
   const effFallback=fallbackAllowed&&!!raw.fallbackUngeocoded;
   const isCustomPrune=!isDirect&&raw.pruneLevel==='custom';
+  const effProvMode=(!isDirect&&['allow','exclude'].includes(raw.provinceMode))?raw.provinceMode:'off';
+  const effProvList=(effProvMode==='off')?'':(raw.selectedProvinces||[]).join(',');
 
   const validationFields=['from','to','date'];
   if(!isDirect){
@@ -2568,6 +2726,7 @@ function deriveSearchConfig(raw){
       else if(transitSubActive)validationFields.push('transit_discount_min','transit_proximity_m');
     }
     if(isCustomPrune)validationFields.push('frontier_k','max_total_hours','detour_ratio');
+    if(effProvMode==='allow')validationFields.push('prov_allow');
   }
 
   const fcm=raw.from_city_mode,tcm=raw.to_city_mode;
@@ -2603,6 +2762,10 @@ function deriveSearchConfig(raw){
     allow_cross_station:allowCross,
     hub_only:!isDirect&&!!raw.hubOnly,
     hub_stations:(!isDirect&&raw.hubOnly)?raw.hubStations:'',
+    province_mode:effProvMode,
+    allow_provinces:effProvMode==='allow'?effProvList:'',
+    exclude_provinces:effProvMode==='exclude'?effProvList:'',
+    block_unknown_prov:(effProvMode!=='off'&&!!raw.blockUnknownProv),
     allow_prefixes:raw.incPfx,
     exclude_prefixes:raw.excPfx,
     include_stations:isDirect?'':raw.incTst,
@@ -2627,13 +2790,18 @@ function deriveSearchConfig(raw){
     if(crossActive){
       modeSegments.push({text:isFixed?'固定加时':(transitSubActive?'智能计价+城轨估算':'智能计价(无减时)'),drawer:'cross'});
     }
+    if(effProvMode==='allow'){
+      modeSegments.push({text:`仅限${(raw.selectedProvinces||[]).length}省`,drawer:'prov'});
+    }else if(effProvMode==='exclude'){
+      modeSegments.push({text:`屏蔽${(raw.selectedProvinces||[]).length}省`,drawer:'prov'});
+    }
     if(effTreeMode!=='off'){
       modeSegments.push({text:effTreeMode==='step'?'分支树:逐程暂停':'分支树:实时热砍',action:'focusTreeMode'});
     }
   }
 
   const chips=[];
-  let crossBadge=0,filterBadge=0,pruneBadge=0;
+  let crossBadge=0,filterBadge=0,pruneBadge=0,provBadge=0;
   if(!isDirect){
     if(minW!==30){chips.push({key:'minWait',label:`最短等 ${minW}m`,kind:'server'});crossBadge++;}
     if(maxW!==360){chips.push({key:'maxWait',label:`最长等 ${maxW}m`,kind:'server'});crossBadge++;}
@@ -2658,6 +2826,13 @@ function deriveSearchConfig(raw){
         }
       }
     }
+    if(effProvMode!=='off'){
+      const pList=raw.selectedProvinces||[];
+      const preview=pList.length<=3?pList.join(','):(pList.slice(0,3).join(',')+`等${pList.length}省`);
+      const prefix=effProvMode==='allow'?'仅限省':'屏蔽省';
+      chips.push({key:'provinces',label:`${prefix}:${preview||'未选'}`,kind:'server'});
+      provBadge++;
+    }
     if(raw.incTst){chips.push({key:'incTst',label:`必经:${raw.incTst}${raw.incMode==='and'?'(AND)':''}`,kind:'server'});filterBadge++;}
     if(raw.excTst){chips.push({key:'excTst',label:`排除站:${raw.excTst}`,kind:'server'});filterBadge++;}
     if(raw.hubOnly){chips.push({key:'hubOnly',label:'仅经枢纽',kind:'server'});pruneBadge++;}
@@ -2674,9 +2849,9 @@ function deriveSearchConfig(raw){
 
   return {
     raw,isDirect,effScope,allowCross,sameFlag,crossActive,isFixed,isSmart,transitSubActive,
-    effRad,fallbackAllowed,effFallback,isCustomPrune,treeModeActive,effTreeMode,
+    effRad,fallbackAllowed,effFallback,isCustomPrune,treeModeActive,effTreeMode,effProvMode,
     visible:{
-      legs:!isDirect,treeMode:treeModeActive,crossDrawerBtn:!isDirect,pruneDrawerBtn:!isDirect,
+      legs:!isDirect,treeMode:treeModeActive,crossDrawerBtn:!isDirect,pruneDrawerBtn:!isDirect,provDrawerBtn:!isDirect,
       crossConfigArea:crossActive,fixedExtra:isFixed,transitToggle:isSmart,transitParams:transitSubActive,
       tstFilters:!isDirect,pruneCustomPanel:isCustomPrune,hubBox:!isDirect&&!!raw.hubOnly
     },
@@ -2687,7 +2862,7 @@ function deriveSearchConfig(raw){
       filter:raw.filter,seat:raw.seat,dep1:raw.dep1,dep2:raw.dep2,arr1:raw.arr1,arr2:raw.arr2,
       hideFallback:isDirect?false:!!raw.hideFallback,hideSuspect:isDirect?false:!!raw.hideSuspect
     },
-    modeSegments,chips,badges:{cross:crossBadge,filter:filterBadge,prune:pruneBadge}
+    modeSegments,chips,badges:{cross:crossBadge,filter:filterBadge,prune:pruneBadge,prov:provBadge}
   };
 }
 
@@ -2696,6 +2871,7 @@ function validateSearchConfig(d){
   if(f.has('from')&&!String(r.from_station||'').trim())return '请填写出发地';
   if(f.has('to')&&!String(r.to_station||'').trim())return '请填写到达地';
   if(f.has('date')&&!/^\d{4}-\d{2}-\d{2}$/.test(String(r.date||'')))return '请选择有效的出发日期';
+  if(f.has('prov_allow')&&(!r.selectedProvinces||!r.selectedProvinces.length))return '省份白名单模式下请至少选择 1 个允许经过的省份（或点击走廊推荐）';
   if(f.has('min_wait')){
     const mw=r.minWaitRaw,xw=r.maxWaitRaw;
     if(mw===null||!Number.isFinite(mw)||mw<0||mw>1440)return '最短换乘时间须在 0–1440 分钟之间';
@@ -2761,13 +2937,14 @@ function syncSearchDrawerUI(){
   if($('s-tree-mode'))$('s-tree-mode').disabled=!v.treeMode;
   if($('s-drawer-cross-btn'))$('s-drawer-cross-btn').style.display=v.crossDrawerBtn?'':'none';
   if($('s-drawer-prune-btn'))$('s-drawer-prune-btn').style.display=v.pruneDrawerBtn?'':'none';
+  if($('s-drawer-prov-btn'))$('s-drawer-prov-btn').style.display=v.provDrawerBtn?'':'none';
   if($('s-tst-filter-wrap'))$('s-tst-filter-wrap').style.display=v.tstFilters?'flex':'none';
 
   // 隐藏无用抽屉时仅隐藏可见性（不清空 rawState 正交偏好，派生层已冻结不入参）
   if(d.isDirect){
-    openDrawers.delete('cross');openDrawers.delete('prune');
+    openDrawers.delete('cross');openDrawers.delete('prune');openDrawers.delete('prov');
   }
-  ['cross','filter','prune'].forEach(k=>{
+  ['cross','filter','prune','prov'].forEach(k=>{
     const dr=$('s-'+k+'-drawer'),btn=$('s-drawer-'+k+'-btn'),cnt=$('s-cnt-'+k);
     const isOpen=openDrawers.has(k)&&(k==='filter'||!d.isDirect);
     if(dr)dr.style.display=isOpen?'block':'none';
@@ -2775,6 +2952,7 @@ function syncSearchDrawerUI(){
     const n=d.badges[k]||0;
     if(cnt){cnt.textContent=String(n);cnt.style.display=n>0?'inline-block':'none';}
   });
+  renderProvDrawerState();
 
   // 三态按钮与移动端入口文案同步（移动端仅显示模式，不混入半径数值）
   document.querySelectorAll('#s-scope-seg button[data-scope]').forEach(b=>b.classList.toggle('active',b.dataset.scope===d.raw.transferScope));
@@ -2872,6 +3050,7 @@ function removeParamChip(key){
   else if(key==='incTst'){$('s-inc-tst').value='';$('s-inc-mode').value='or';label='必经换乘站';}
   else if(key==='excTst'){$('s-exc-tst').value='';label='排除换乘站';}
   else if(key==='hubOnly'){$('s-hub-only').checked=false;label='仅经枢纽';}
+  else if(key==='provinces'){provinceMode='off';label='省份路线过滤';}
   else if(key==='prune'){
     $('s-prune').value='balanced';
     const pr=PRUNE_PRESETS.balanced;
@@ -2927,6 +3106,7 @@ function pruneBreakdownItems(st,cfg){
   if(!st)return [];
   const loop=(st.loopback||0)+(st.city_loop||0)+(st.passed_dest||0);
   const items=[];
+  if(st.province_filter)items.push(`省份过滤 ${st.province_filter}`);
   if(st.hub_filter)items.push(`非枢纽剪除 ${st.hub_filter}`);
   if(st.detour)items.push(`绕行截断 ${st.detour}`);
   if(st.dominated)items.push(`劣势支配 ${st.dominated}`);
@@ -2944,8 +3124,121 @@ function formatPruneStats(st,cfg){
   return items.length?` · 树枝剪枝${limitTxt}：${items.join(' / ')}`:(limitTxt?` · 树枝剪枝${limitTxt}`:'');
 }
 
+function buildProvDrawerDOM(){
+  const regBar=$('s-prov-regions'),grid=$('s-prov-grid');
+  if(regBar&&!regBar.dataset.built){
+    regBar.dataset.built='1';
+    regBar.innerHTML='<span style="font-size:12px;color:var(--muted);font-weight:500">大区快捷：</span>'
+      +PROVINCE_REGIONS.map(([r])=>`<button type="button" class="prov-reg-btn" data-prov-reg="${esc(r)}">${esc(r)}</button>`).join('');
+  }
+  if(grid&&!grid.dataset.built){
+    grid.dataset.built='1';
+    grid.innerHTML=PROVINCE_REGIONS.map(([r,ps])=>`<div class="prov-reg-row"><span class="prov-reg-lbl">${esc(r)}</span><div class="prov-chips">${ps.map(p=>`<button type="button" class="prov-chip" data-prov="${esc(p)}">${esc(p)}</button>`).join('')}</div></div>`).join('');
+  }
+}
+function renderProvDrawerState(){
+  buildProvDrawerDOM();
+  const selSet=new Set(selectedProvinces);
+  document.querySelectorAll('#s-prov-mode-seg button[data-prov-mode]').forEach(b=>b.classList.toggle('active',b.dataset.provMode===provinceMode));
+  document.querySelectorAll('#s-prov-grid button[data-prov]').forEach(b=>b.classList.toggle('on',selSet.has(b.dataset.prov)));
+  document.querySelectorAll('#s-prov-regions button[data-prov-reg]').forEach(b=>{
+    const reg=PROVINCE_REGIONS.find(x=>x[0]===b.dataset.provReg);
+    const ps=reg?reg[1]:[];
+    const hit=ps.filter(p=>selSet.has(p)).length;
+    b.classList.toggle('on',ps.length>0&&hit===ps.length);
+    b.classList.toggle('part',hit>0&&hit<ps.length);
+  });
+  const info=$('s-prov-sel-info');
+  if(info){
+    const mTxt=provinceMode==='allow'?'白名单（仅限经过）':(provinceMode==='exclude'?'黑名单（屏蔽选中）':'未启用过滤');
+    info.textContent=`模式：${mTxt} · 已勾选 ${selectedProvinces.length}/${ALL_PROVINCES.length} 省`;
+  }
+}
+async function applyCorridorRecommend(targetMode){
+  const fq=getSideQuery('from'),tq=getSideQuery('to');
+  const fcm=getSideMode('from'),tcm=getSideMode('to');
+  const widen=$('s-prov-widen')?$('s-prov-widen').value:'standard';
+  const msgEl=$('s-prov-rec-msg');
+  if(!fq||!tq){if(msgEl)msgEl.textContent='请先填写出发地与到达地';return;}
+  if(msgEl)msgEl.textContent='计算沿途省份中…';
+  try{
+    const url=`/api/provinces/recommend?from_station=${encodeURIComponent(fq)}&to_station=${encodeURIComponent(tq)}&from_city_mode=${encodeURIComponent(fcm)}&to_city_mode=${encodeURIComponent(tcm)}&widen=${encodeURIComponent(widen)}`;
+    const res=await api(url);
+    const cor=res.provinces||[];
+    if(targetMode==='exclude'){
+      const corSet=new Set(cor);
+      selectedProvinces=ALL_PROVINCES.filter(p=>!corSet.has(p));
+      provinceMode='exclude';
+      if(msgEl)msgEl.textContent=cor.length?`走廊 ${cor.join('→')}，已自动勾选走廊外 ${selectedProvinces.length} 省为黑名单`:'未匹配到起终点走廊';
+    }else{
+      selectedProvinces=cor.filter(p=>ALL_PROVINCES.includes(p));
+      if(selectedProvinces.length)provinceMode='allow';
+      if(msgEl)msgEl.textContent=cor.length?`已推荐沿途 ${cor.length} 省：${cor.join('、')}`:'未识别起终点省份（可手动勾选）';
+    }
+    saveSearchPrefs();syncSearchDrawerUI();
+  }catch(e){
+    if(msgEl)msgEl.textContent='推荐失败：'+(e.message||e);
+  }
+}
+function initProvDrawerEvents(){
+  buildProvDrawerDOM();
+  const modeSeg=$('s-prov-mode-seg');
+  if(modeSeg){
+    modeSeg.addEventListener('click',e=>{
+      const b=e.target.closest('button[data-prov-mode]');
+      if(!b)return;
+      provinceMode=['off','allow','exclude'].includes(b.dataset.provMode)?b.dataset.provMode:'off';
+      saveSearchPrefs();syncSearchDrawerUI();
+    });
+  }
+  const grid=$('s-prov-grid');
+  if(grid){
+    grid.addEventListener('click',e=>{
+      const b=e.target.closest('button[data-prov]');
+      if(!b)return;
+      const p=b.dataset.prov;
+      const s=new Set(selectedProvinces);
+      if(s.has(p))s.delete(p);else s.add(p);
+      selectedProvinces=ALL_PROVINCES.filter(x=>s.has(x));
+      if(provinceMode==='off'&&selectedProvinces.length)provinceMode='allow';
+      saveSearchPrefs();syncSearchDrawerUI();
+    });
+  }
+  const regBar=$('s-prov-regions');
+  if(regBar){
+    regBar.addEventListener('click',e=>{
+      const b=e.target.closest('button[data-prov-reg]');
+      if(!b)return;
+      const reg=PROVINCE_REGIONS.find(x=>x[0]===b.dataset.provReg);
+      if(!reg)return;
+      const ps=reg[1];
+      const s=new Set(selectedProvinces);
+      const allIn=ps.every(p=>s.has(p));
+      ps.forEach(p=>{if(allIn)s.delete(p);else s.add(p);});
+      selectedProvinces=ALL_PROVINCES.filter(x=>s.has(x));
+      if(provinceMode==='off'&&selectedProvinces.length)provinceMode='allow';
+      saveSearchPrefs();syncSearchDrawerUI();
+    });
+  }
+  if($('s-prov-inv-btn'))$('s-prov-inv-btn').onclick=()=>{
+    const s=new Set(selectedProvinces);
+    selectedProvinces=ALL_PROVINCES.filter(p=>!s.has(p));
+    saveSearchPrefs();syncSearchDrawerUI();
+  };
+  if($('s-prov-clr-btn'))$('s-prov-clr-btn').onclick=()=>{
+    selectedProvinces=[];
+    if($('s-prov-rec-msg'))$('s-prov-rec-msg').textContent='';
+    saveSearchPrefs();syncSearchDrawerUI();
+  };
+  if($('s-prov-widen'))$('s-prov-widen').onchange=()=>{saveSearchPrefs();};
+  if($('s-prov-block-unknown'))$('s-prov-block-unknown').onchange=()=>{saveSearchPrefs();syncSearchDrawerUI();};
+  if($('s-prov-rec-btn'))$('s-prov-rec-btn').onclick=()=>applyCorridorRecommend('allow');
+  if($('s-prov-rec-exc-btn'))$('s-prov-rec-exc-btn').onclick=()=>applyCorridorRecommend('exclude');
+}
+initProvDrawerEvents();
+
 // 抽屉按钮与移动端三态弹层接线
-['cross','filter','prune'].forEach(k=>{
+['cross','filter','prune','prov'].forEach(k=>{
   const btn=$('s-drawer-'+k+'-btn');
   if(!btn)return;
   btn.onclick=()=>{

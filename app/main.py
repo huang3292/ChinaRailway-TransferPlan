@@ -126,7 +126,7 @@ except ImportError:
             self.mounts.append((path.rstrip("/"), app_obj))
 
 
-from . import db, geo, importer, transfer
+from . import china_geo, db, geo, importer, transfer
 from .crawler import CrawlCancelled, CrawlError, crawler, station_timetable_context
 
 app = FastAPI(title="12306 智能中转")
@@ -300,9 +300,9 @@ def _station_or_400(q: str) -> dict:
     return s
 
 
-def _run(fn, *args):
+def _run(fn, *args, **kwargs):
     try:
-        return fn(*args)
+        return fn(*args, **kwargs)
     except (CrawlError, ValueError) as e:
         raise HTTPException(400, str(e))
 
@@ -415,6 +415,35 @@ def resolve_stations_preview(q: str = "", city_mode: str = "name", expand_city: 
 @app.get("/api/hubs")
 def hubs():
     return {"hubs": list(transfer.MAJOR_HUBS), "text": ",".join(transfer.MAJOR_HUBS)}
+
+
+@app.get("/api/provinces/meta")
+def provinces_meta():
+    return china_geo.list_province_metadata()
+
+
+@app.get("/api/provinces/recommend")
+def recommend_provinces(
+    from_station: str = "",
+    to_station: str = "",
+    city_mode: str | None = None,
+    from_city_mode: str | None = None,
+    to_city_mode: str | None = None,
+    expand_city: bool = True,
+    widen: str = "standard",
+):
+    fq = (from_station or "").strip()
+    tq = (to_station or "").strip()
+    if not fq or not tq:
+        raise HTTPException(400, "请先填写出发地与到达地再推荐沿途省份")
+    w = (widen or "standard").strip().lower()
+    if w not in ("tight", "standard", "wide"):
+        raise HTTPException(400, "widen 必须为 tight / standard / wide")
+    f_mode = from_city_mode or city_mode
+    t_mode = to_city_mode or city_mode
+    fst = db.resolve_stations(fq, expand_city, f_mode)
+    tst = db.resolve_stations(tq, expand_city, t_mode)
+    return china_geo.recommend_corridor_provinces(fq, tq, from_stations=fst, to_stations=tst, widen=w)
 
 
 # ---------- 请求速率 ----------
@@ -1001,7 +1030,8 @@ def _validate_search_params(date: str, max_legs: int, cross_extra: int,
                             transit_discount_min: int = geo.DEFAULT_TRANSIT_DISCOUNT_MIN,
                             transit_proximity_m: int = geo.DEFAULT_TRANSIT_PROXIMITY_M,
                             fallback_ungeocoded: bool = False,
-                            tree_prune_mode: str = "off"):
+                            tree_prune_mode: str = "off",
+                            province_mode: str = "off"):
     _check_date(date)
     if max_legs < 1 or max_legs > 6:
         raise HTTPException(400, "max_legs 必须在 1-6 之间")
@@ -1019,6 +1049,8 @@ def _validate_search_params(date: str, max_legs: int, cross_extra: int,
         raise HTTPException(400, "半径 R=0（关闭按距离跨站建边）时不允许开启无坐标同城回退")
     if (tree_prune_mode or "off").strip().lower() not in ("off", "live", "step"):
         raise HTTPException(400, "tree_prune_mode 必须为 off / live / step")
+    if (province_mode or "off").strip().lower() not in ("off", "allow", "exclude"):
+        raise HTTPException(400, "province_mode 必须为 off / allow / exclude")
     if frontier_k is not None and (frontier_k < 0 or frontier_k > 64):
         raise HTTPException(400, "frontier_k 必须在 0-64 之间（0 表示不限束宽）")
     if prune_level not in ("unbounded", "relaxed", "balanced", "strict", "custom"):
@@ -1062,7 +1094,11 @@ def transfers(from_station: str, to_station: str, date: str,
               transit_discount_min: int = geo.DEFAULT_TRANSIT_DISCOUNT_MIN,
               transit_proximity_m: int = geo.DEFAULT_TRANSIT_PROXIMITY_M,
               active_group_ids: str | None = None,
-              fallback_ungeocoded: bool = False):
+              fallback_ungeocoded: bool = False,
+              province_mode: str = "off",
+              allow_provinces: str = "",
+              exclude_provinces: str = "",
+              block_unknown_prov: bool = False):
     _validate_search_params(
         date, max_legs, cross_extra, frontier_k, prune_level,
         max_total_min, detour_ratio, include_stations_mode,
@@ -1073,6 +1109,7 @@ def transfers(from_station: str, to_station: str, date: str,
         transit_discount_min=transit_discount_min,
         transit_proximity_m=transit_proximity_m,
         fallback_ungeocoded=fallback_ungeocoded,
+        province_mode=province_mode,
     )
     gids = _parse_group_ids(active_group_ids)
     return _run(
@@ -1085,6 +1122,10 @@ def transfers(from_station: str, to_station: str, date: str,
         city_mode, from_city_mode, to_city_mode,
         cross_radius_km, cross_time_mode, transit_discount_on,
         transit_discount_min, transit_proximity_m, gids, fallback_ungeocoded,
+        province_mode=province_mode,
+        allow_provinces=allow_provinces,
+        exclude_provinces=exclude_provinces,
+        block_unknown_prov=block_unknown_prov,
     )
 
 
@@ -1122,12 +1163,18 @@ class TransferSearchReq(BaseModel):
     active_group_ids: list[int] | None = None
     fallback_ungeocoded: bool = False
     tree_prune_mode: str = "off"
+    province_mode: str = "off"
+    allow_provinces: list[str] = []
+    exclude_provinces: list[str] = []
+    block_unknown_prov: bool = False
 
 
 class TreePruneReq(BaseModel):
+    prune_provinces: list[str] = []
     prune_cities: list[str] = []
     prune_stations: list[str] = []
     prune_paths: list[list[str]] = []
+    unprune_provinces: list[str] = []
     unprune_cities: list[str] = []
     unprune_stations: list[str] = []
     unprune_paths: list[list[str]] = []
@@ -1146,9 +1193,11 @@ def prune_job_tree(job_id: str, body: TreePruneReq):
     if ctrl is None:
         raise HTTPException(404, "该任务未开启交互式分支树剪枝（或任务已结束）")
     return ctrl.apply_command(
+        prune_provinces=body.prune_provinces,
         prune_cities=body.prune_cities,
         prune_stations=body.prune_stations,
         prune_paths=body.prune_paths,
+        unprune_provinces=body.unprune_provinces,
         unprune_cities=body.unprune_cities,
         unprune_stations=body.unprune_stations,
         unprune_paths=body.unprune_paths,
@@ -1201,6 +1250,10 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
             fallback_ungeocoded=body.fallback_ungeocoded,
             progress_cb=on_prog, cancel_event=ev, sub_cb=on_sub,
             tree_ctrl=ctrl,
+            province_mode=body.province_mode,
+            allow_provinces=body.allow_provinces,
+            exclude_provinces=body.exclude_provinces,
+            block_unknown_prov=body.block_unknown_prov,
         )
         if ev.is_set():
             _job_update(job_id, status="cancelled")
@@ -1237,6 +1290,7 @@ def start_transfers(body: TransferSearchReq):
         transit_proximity_m=body.transit_proximity_m,
         fallback_ungeocoded=body.fallback_ungeocoded,
         tree_prune_mode=body.tree_prune_mode,
+        province_mode=body.province_mode,
     )
     f_mode = body.from_city_mode or body.city_mode
     t_mode = body.to_city_mode or body.city_mode

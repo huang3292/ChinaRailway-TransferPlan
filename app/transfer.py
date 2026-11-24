@@ -23,7 +23,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta
 
-from . import db, fare, geo, parsers
+from . import china_geo, db, fare, geo, parsers
 
 _CACHE_LOCK = threading.Lock()
 _BUILD_LOCK = threading.Lock()
@@ -653,6 +653,64 @@ def _resolve_hub_tokens(hub_only: bool, hub_stations: str | list[str] | None) ->
     return toks if toks else list(MAJOR_HUB_TOKENS)
 
 
+def _parse_province_tokens(val) -> set[str]:
+    if not val:
+        return set()
+    items = val if isinstance(val, (list, tuple, set)) else _parse_tokens(str(val))
+    out = set()
+    for it in items:
+        p = china_geo.normalize_province(str(it))
+        if p:
+            out.add(p)
+    return out
+
+
+def _build_prov_map(cities: tuple, geo_index=None) -> dict[str, str]:
+    city_of, _, tele_of = cities
+    lat_of = getattr(geo_index, "lat_of", {}) if geo_index is not None else {}
+    lon_of = getattr(geo_index, "lon_of", {}) if geo_index is not None else {}
+    out: dict[str, str] = {}
+    for nm, tc in tele_of.items():
+        ct = city_of.get(tc) or city_of.get(nm) or ""
+        p = china_geo.infer_station_province(nm, ct, lat_of.get(tc), lon_of.get(tc))
+        if p:
+            out[tc] = p
+            out[nm] = p
+    for key, ct in city_of.items():
+        if key not in out and ct:
+            p = china_geo.infer_station_province(key, ct, lat_of.get(key), lon_of.get(key))
+            if p:
+                out[key] = p
+    return out
+
+
+def _station_province(key: str | None, name: str | None, city_of: dict, prov_of: dict | None = None) -> str:
+    if prov_of:
+        p = (key and prov_of.get(key)) or (name and prov_of.get(name))
+        if p:
+            return p
+    ct = (key and city_of.get(key)) or (name and city_of.get(name)) or ""
+    p = china_geo.infer_station_province(name or key, ct)
+    if prov_of is not None and p:
+        if key:
+            prov_of[key] = p
+        if name:
+            prov_of[name] = p
+    return p
+
+
+def _prov_allowed(prov: str, allow_provs: set[str], exc_provs: set[str], block_unknown: bool = False) -> bool:
+    if not allow_provs and not exc_provs:
+        return True
+    if not prov:
+        return not block_unknown
+    if exc_provs and prov in exc_provs:
+        return False
+    if allow_provs and prov not in allow_provs:
+        return False
+    return True
+
+
 def filter_plans(
     plans: list[dict],
     allow_prefixes: str | list[str] = "",
@@ -663,14 +721,20 @@ def filter_plans(
     allow_cross_station: bool = True,
     cities: tuple | None = None,
     stats: dict | None = None,
+    allow_provinces: str | list[str] | set[str] = "",
+    exclude_provinces: str | list[str] | set[str] = "",
+    prov_of: dict | None = None,
+    block_unknown_prov: bool = False,
 ) -> list[dict]:
-    """独立后置过滤器：按车型头、必经/排除换乘站（精确站名/城市+OR/AND）、同异站过滤已生成的方案。"""
+    """独立后置过滤器：按车型头、必经/排除换乘站（精确站名/城市+OR/AND）、同异站及中转省份过滤已生成的方案。"""
     inc_pfx = _parse_tokens(allow_prefixes) if not isinstance(allow_prefixes, (list, tuple)) else [str(x).strip().upper() for x in allow_prefixes if str(x).strip()]
     exc_pfx = _parse_tokens(exclude_prefixes) if not isinstance(exclude_prefixes, (list, tuple)) else [str(x).strip().upper() for x in exclude_prefixes if str(x).strip()]
     inc_st = _parse_tokens(include_stations) if not isinstance(include_stations, (list, tuple)) else [str(x).strip().upper() for x in include_stations if str(x).strip()]
     exc_st = _parse_tokens(exclude_stations) if not isinstance(exclude_stations, (list, tuple)) else [str(x).strip().upper() for x in exclude_stations if str(x).strip()]
+    allow_provs = _parse_province_tokens(allow_provinces)
+    exc_provs = _parse_province_tokens(exclude_provinces)
     inc_mode = "and" if str(include_stations_mode or "or").strip().lower() == "and" else "or"
-    if not inc_pfx and not exc_pfx and not inc_st and not exc_st and allow_cross_station:
+    if not inc_pfx and not exc_pfx and not inc_st and not exc_st and allow_cross_station and not allow_provs and not exc_provs:
         return list(plans)
 
     if cities is None:
@@ -709,6 +773,13 @@ def filter_plans(
                 else:
                     dk_name, dk_key = sk_name, sk_key
                 pairs.append((sk_key, sk_name, dk_key, dk_name))
+            if (allow_provs or exc_provs) and any(
+                not _prov_allowed(_station_province(sk, sk_n, city_of, prov_of), allow_provs, exc_provs, block_unknown=block_unknown_prov)
+                or (dk != sk and not _prov_allowed(_station_province(dk, dk_n, city_of, prov_of), allow_provs, exc_provs, block_unknown=block_unknown_prov))
+                for sk, sk_n, dk, dk_n in pairs
+            ):
+                _add_prune(stats, "province_filter")
+                continue
             if exc_st and any(
                 _match_station_tokens(sk, sk_n, city_of, tele_of, exc_st)
                 or (dk != sk and _match_station_tokens(dk, dk_n, city_of, tele_of, exc_st))
@@ -1510,26 +1581,39 @@ def _norm_tree_tok(s: str | None) -> str:
 
 
 class TreePruneController:
-    """多程 BFS 分支树实时监控与人工剪枝控制器（支持 step 逐程暂停与 live 实时热砍无缝切换）。"""
+    """多程 BFS 分支树实时监控与人工剪枝控制器（支持按省/城市/站/路径热砍与 step/live 无缝切换）。"""
 
-    def __init__(self, pause_after_layer: bool = False, on_state_change=None):
+    def __init__(self, pause_after_layer: bool = False, on_state_change=None, prov_lookup: dict | None = None):
         self.lock = threading.Lock()
         self.pause_after_layer = bool(pause_after_layer)
         self.paused = False
         self.paused_depth = 0
         self.resume_event = threading.Event()
+        self.pruned_provinces: set[str] = set()
         self.pruned_cities: set[str] = set()
         self.pruned_stations: set[str] = set()
         self.pruned_paths: set[tuple[str, ...]] = set()
         self.snapshot: dict | None = None
         self.user_pruned_count = 0
         self.on_state_change = on_state_change
+        self.prov_lookup: dict[str, str] = dict(prov_lookup) if prov_lookup else {}
         self._last_snap_ts = 0.0
         self._paused_frontier: list | None = None
         self._paused_max_legs = 3
         self._paused_chain_fn = None
         self._paused_build_fn = None
         self._paused_prune_stats = None
+
+    def _get_prov_locked(self, city: str | None, key: str | None, name: str | None) -> str:
+        p = (key and self.prov_lookup.get(key)) or (name and self.prov_lookup.get(name)) or ""
+        if not p:
+            p = china_geo.infer_station_province(name, city)
+            if p:
+                if key:
+                    self.prov_lookup[key] = p
+                if name:
+                    self.prov_lookup[name] = p
+        return p
 
     def _hop_tokens(self, city: str | None, key: str | None, name: str | None) -> set[str]:
         toks = set()
@@ -1549,10 +1633,14 @@ class TreePruneController:
         return toks
 
     def _is_chain_pruned_locked(self, chain: list[tuple[str, str, str]]) -> bool:
-        if not self.pruned_cities and not self.pruned_stations and not self.pruned_paths:
+        if not self.pruned_provinces and not self.pruned_cities and not self.pruned_stations and not self.pruned_paths:
             return False
         hop_sets = []
         for city, key, name in chain:
+            if self.pruned_provinces:
+                p = self._get_prov_locked(city, key, name)
+                if p and p in self.pruned_provinces:
+                    return True
             c = _norm_tree_tok(city)
             c_bare = c[:-1] if c.endswith("市") and len(c) > 1 else c
             if c and (c in self.pruned_cities or c_bare in self.pruned_cities):
@@ -1573,7 +1661,7 @@ class TreePruneController:
 
     def is_expansion_pruned(self, prev_chain: list[tuple[str, str, str]], city: str, key: str, name: str, count_prune: bool = False) -> bool:
         with self.lock:
-            if not self.pruned_cities and not self.pruned_stations and not self.pruned_paths:
+            if not self.pruned_provinces and not self.pruned_cities and not self.pruned_stations and not self.pruned_paths:
                 return False
             hit = self._is_chain_pruned_locked(prev_chain + [(city, key, name)])
             if hit and count_prune:
@@ -1588,7 +1676,24 @@ class TreePruneController:
     def _prune_snapshot_nodes_locked(self, nodes: list[dict]) -> list[dict]:
         kept = []
         for nd in nodes:
-            if nd.get("kind") == "station":
+            kind = nd.get("kind")
+            if kind == "province":
+                pv = china_geo.normalize_province(nd.get("province") or nd.get("label"))
+                if pv and pv in self.pruned_provinces:
+                    continue
+                new_nd = dict(nd)
+                if nd.get("children"):
+                    pruned_ch = self._prune_snapshot_nodes_locked(nd["children"])
+                    if not pruned_ch:
+                        continue
+                    new_nd["children"] = pruned_ch
+                    new_nd["count"] = sum(int(c.get("count") or 0) for c in pruned_ch) if not nd.get("more_children") else nd["count"]
+                kept.append(new_nd)
+                continue
+            pv_nd = china_geo.normalize_province(nd.get("province"))
+            if pv_nd and pv_nd in self.pruned_provinces:
+                continue
+            if kind == "station":
                 c = _norm_tree_tok(nd.get("city"))
                 c_bare = c[:-1] if c.endswith("市") and len(c) > 1 else c
                 k = _norm_tree_tok(nd.get("station_key"))
@@ -1616,7 +1721,7 @@ class TreePruneController:
 
     def filter_states(self, states: list, chain_fn, prune_stats: dict | None = None) -> list:
         with self.lock:
-            if not self.pruned_cities and not self.pruned_stations and not self.pruned_paths:
+            if not self.pruned_provinces and not self.pruned_cities and not self.pruned_stations and not self.pruned_paths:
                 return states
             kept = []
             dropped = 0
@@ -1642,9 +1747,18 @@ class TreePruneController:
         unprune_paths=None,
         action: str = "prune",
         chain_fn=None,
+        prune_provinces=None,
+        unprune_provinces=None,
     ) -> dict:
         dropped_now = 0
         with self.lock:
+            for x in (prune_provinces or ()):
+                p = china_geo.normalize_province(x)
+                if p:
+                    self.pruned_provinces.add(p)
+            for x in (unprune_provinces or ()):
+                p = china_geo.normalize_province(x)
+                self.pruned_provinces.discard(p)
             for x in (prune_cities or ()):
                 t = _norm_tree_tok(x)
                 if t:
@@ -1672,7 +1786,7 @@ class TreePruneController:
 
             eff_chain_fn = chain_fn or self._paused_chain_fn
             if self.paused and self._paused_frontier is not None and eff_chain_fn is not None:
-                if self.pruned_cities or self.pruned_stations or self.pruned_paths:
+                if self.pruned_provinces or self.pruned_cities or self.pruned_stations or self.pruned_paths:
                     kept = []
                     for st in self._paused_frontier:
                         if self._is_chain_pruned_locked(eff_chain_fn(st)):
@@ -1688,13 +1802,23 @@ class TreePruneController:
                             self.snapshot = self._paused_build_fn(
                                 self._paused_frontier, self.paused_depth, self._paused_max_legs, "paused"
                             )
-            elif self.snapshot is not None and (self.pruned_cities or self.pruned_stations or self.pruned_paths):
-                # 实时(live)模式下一旦收到人工剪除指令，立即在当前快照树上同步剔除对应节点，UI 零延迟反馈
+            elif self.snapshot is not None and (self.pruned_provinces or self.pruned_cities or self.pruned_stations or self.pruned_paths):
+                # 实时(live)模式下一旦收到人工剪除指令，立即在当前快照树上同步剔除对应省/市/站/路径节点，UI 零延迟反馈
                 new_nodes = self._prune_snapshot_nodes_locked(self.snapshot.get("nodes") or [])
+                new_provs = self._prune_snapshot_nodes_locked(self.snapshot.get("provinces") or [])
+                new_psummary = [
+                    ps for ps in (self.snapshot.get("province_summary") or [])
+                    if ps.get("province") not in self.pruned_provinces
+                ]
+                new_tot = sum(int(ps.get("count") or 0) for ps in new_psummary) if new_psummary else (
+                    sum(int(n.get("count") or 0) for n in new_nodes) if not self.snapshot.get("more_top") else self.snapshot.get("total_states", 0)
+                )
                 self.snapshot = {
                     **self.snapshot,
                     "nodes": new_nodes,
-                    "total_states": sum(int(n.get("count") or 0) for n in new_nodes) if not self.snapshot.get("more_top") else self.snapshot.get("total_states", 0),
+                    "provinces": new_provs,
+                    "province_summary": new_psummary,
+                    "total_states": new_tot,
                 }
 
             act = (action or "prune").strip().lower()
@@ -1720,6 +1844,7 @@ class TreePruneController:
             "tree_pause_after_layer": self.pause_after_layer,
             "tree_pruned_count": self.user_pruned_count,
             "tree_pruned_rules": {
+                "provinces": sorted(self.pruned_provinces),
                 "cities": sorted(self.pruned_cities),
                 "stations": sorted(self.pruned_stations),
                 "paths": [list(p) for p in sorted(self.pruned_paths)],
@@ -1829,6 +1954,26 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
     city_of, _, tele_of = cities
     name_of = {tc: nm for nm, tc in tele_of.items()}
     seats_keys = set(seats)
+
+    allow_provs = set(prune_cfg.get("allow_provs") or ())
+    exc_provs = set(prune_cfg.get("exc_provs") or ())
+    block_unknown_prov = bool(prune_cfg.get("block_unknown_prov", False))
+    has_prov_filter = bool(allow_provs or exc_provs)
+    prov_of = dict(prune_cfg.get("prov_of") or ())
+    if not prov_of and (has_prov_filter or tree_ctrl is not None):
+        prov_of = _build_prov_map(cities, geo_index=geo_index)
+
+    def _prov_key(k: str, nm: str) -> str:
+        return _station_province(k, nm, city_of, prov_of)
+
+    def _prov_ok(k: str, nm: str) -> bool:
+        if not has_prov_filter:
+            return True
+        return _prov_allowed(_prov_key(k, nm), allow_provs, exc_provs, block_unknown=block_unknown_prov)
+
+    if tree_ctrl is not None and prov_of:
+        with tree_ctrl.lock:
+            tree_ctrl.prov_lookup.update(prov_of)
 
     # 1) 过滤有效车次（含车型前缀预筛选）并预计算停站元数据与按发车时刻排序的站车倒排索引
     allowed_sv = []
@@ -2062,72 +2207,113 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
         return ch
 
     def build_tree_snapshot(states: list, depth_cur: int, m_legs: int, phase_tag: str) -> dict:
-        # 按城市→路径聚合当前前沿状态，控制节点上限以确保浏览器轮询轻量
+        # 同时生成两套互补视图：
+        # 1) provinces: 按「首程/当前落地省 -> 城市 -> 站」分层，顶层<=34省永不折叠百城，一眼看清方向并按省秒砍；
+        # 2) nodes: 按「城市路径 -> 站」平铺视图 + province_summary 全省汇总条，兼顾原城市习惯。
         def _new_node():
-            return {"count": 0, "min_elapsed": _INF, "min_cost": None, "samples": [], "children": {}}
+            return {"count": 0, "min_elapsed": _INF, "min_cost": None, "samples": [], "children": {}, "province": ""}
 
         root = _new_node()
+        prov_agg: dict[str, dict] = {}
+        prov_root: dict[str, dict] = {}
         for st in states:
             ch = state_hub_chain(st)
             el = max(0, st["arr"] - st["start"])
             scost = st["cost"] if st["cost_known"] else None
             first_sv_code = allowed_sv[st["leg_refs"][-1][0]].get("code") or ""
-            cur = root
-            cur["count"] += 1
-            if el < cur["min_elapsed"]:
-                cur["min_elapsed"] = el
-            path_acc = []
-            n_ch = len(ch)
-            for idx_h, (ct, key, nm) in enumerate(ch):
-                c_label = ct or nm or key
-                path_acc.append(c_label)
-                c_key = ("city", c_label)
-                c_node = cur["children"].get(c_key)
-                if c_node is None:
-                    c_node = {
-                        **_new_node(),
-                        "kind": "city", "city": c_label, "station_key": "", "label": c_label,
-                        "path": list(path_acc),
-                    }
-                    cur["children"][c_key] = c_node
-                c_node["count"] += 1
-                if el < c_node["min_elapsed"]:
-                    c_node["min_elapsed"] = el
-                if scost is not None and (c_node["min_cost"] is None or scost < c_node["min_cost"]):
-                    c_node["min_cost"] = round(scost, 1)
-                if first_sv_code and len(c_node["samples"]) < 3 and first_sv_code not in c_node["samples"]:
-                    c_node["samples"].append(first_sv_code)
-                if idx_h == n_ch - 1:
-                    s_key = ("station", key)
-                    s_node = c_node["children"].get(s_key)
-                    if s_node is None:
-                        s_node = {
-                            **_new_node(),
-                            "kind": "station", "city": c_label, "station_key": key,
-                            "label": nm or key, "path": path_acc[:-1] + [key],
-                        }
-                        c_node["children"][s_key] = s_node
-                    s_node["count"] += 1
-                    if el < s_node["min_elapsed"]:
-                        s_node["min_elapsed"] = el
-                    if scost is not None and (s_node["min_cost"] is None or scost < s_node["min_cost"]):
-                        s_node["min_cost"] = round(scost, 1)
-                    if first_sv_code and len(s_node["samples"]) < 3 and first_sv_code not in s_node["samples"]:
-                        s_node["samples"].append(first_sv_code)
-                else:
-                    cur = c_node
 
-        def _serialize(node: dict, level: int) -> tuple[list[dict], int]:
+            # 1) 省份汇总与「按当前落脚省 -> 城市路径 -> 车站」分层树
+            last_ct, last_key, last_nm = ch[-1]
+            cur_prov = _prov_key(last_key, last_nm) or "未识别省份"
+            pa = prov_agg.get(cur_prov)
+            if pa is None:
+                pa = prov_agg[cur_prov] = {"province": cur_prov, "count": 0, "min_elapsed": _INF, "min_cost": None, "samples": []}
+            pa["count"] += 1
+            if el < pa["min_elapsed"]:
+                pa["min_elapsed"] = el
+            if scost is not None and (pa["min_cost"] is None or scost < pa["min_cost"]):
+                pa["min_cost"] = round(scost, 1)
+            if first_sv_code and len(pa["samples"]) < 3 and first_sv_code not in pa["samples"]:
+                pa["samples"].append(first_sv_code)
+
+            p_top = prov_root.get(cur_prov)
+            if p_top is None:
+                p_top = prov_root[cur_prov] = {
+                    **_new_node(),
+                    "kind": "province", "province": cur_prov, "city": "", "station_key": "",
+                    "label": cur_prov, "path": [],
+                }
+            p_top["count"] += 1
+            if el < p_top["min_elapsed"]:
+                p_top["min_elapsed"] = el
+            if scost is not None and (p_top["min_cost"] is None or scost < p_top["min_cost"]):
+                p_top["min_cost"] = round(scost, 1)
+            if first_sv_code and len(p_top["samples"]) < 3 and first_sv_code not in p_top["samples"]:
+                p_top["samples"].append(first_sv_code)
+
+            # 将状态插入两棵树（城市平铺树 & 当前省份子树）
+            for tree_top in (root, p_top):
+                cur = tree_top
+                if tree_top is root:
+                    cur["count"] += 1
+                    if el < cur["min_elapsed"]:
+                        cur["min_elapsed"] = el
+                path_acc = []
+                n_ch = len(ch)
+                for idx_h, (ct, key, nm) in enumerate(ch):
+                    c_label = ct or nm or key
+                    hop_prov = _prov_key(key, nm)
+                    path_acc.append(c_label)
+                    c_key = ("city", c_label)
+                    c_node = cur["children"].get(c_key)
+                    if c_node is None:
+                        c_node = {
+                            **_new_node(),
+                            "kind": "city", "city": c_label, "station_key": "", "label": c_label,
+                            "path": list(path_acc), "province": hop_prov,
+                        }
+                        cur["children"][c_key] = c_node
+                    elif not c_node["province"] and hop_prov:
+                        c_node["province"] = hop_prov
+                    c_node["count"] += 1
+                    if el < c_node["min_elapsed"]:
+                        c_node["min_elapsed"] = el
+                    if scost is not None and (c_node["min_cost"] is None or scost < c_node["min_cost"]):
+                        c_node["min_cost"] = round(scost, 1)
+                    if first_sv_code and len(c_node["samples"]) < 3 and first_sv_code not in c_node["samples"]:
+                        c_node["samples"].append(first_sv_code)
+                    if idx_h == n_ch - 1:
+                        s_key = ("station", key)
+                        s_node = c_node["children"].get(s_key)
+                        if s_node is None:
+                            s_node = {
+                                **_new_node(),
+                                "kind": "station", "city": c_label, "station_key": key,
+                                "label": nm or key, "path": path_acc[:-1] + [key], "province": hop_prov,
+                            }
+                            c_node["children"][s_key] = s_node
+                        s_node["count"] += 1
+                        if el < s_node["min_elapsed"]:
+                            s_node["min_elapsed"] = el
+                        if scost is not None and (s_node["min_cost"] is None or scost < s_node["min_cost"]):
+                            s_node["min_cost"] = round(scost, 1)
+                        if first_sv_code and len(s_node["samples"]) < 3 and first_sv_code not in s_node["samples"]:
+                            s_node["samples"].append(first_sv_code)
+                    else:
+                        cur = c_node
+
+        def _serialize(node: dict, level: int, cap0: int = 45, cap_sub: int = 18) -> tuple[list[dict], int]:
             items = list(node["children"].values())
             items.sort(key=lambda x: (x["min_elapsed"], -x["count"], x["label"]))
-            cap = 45 if level == 0 else 18
+            cap = cap0 if level == 0 else cap_sub
             shown = items[:cap]
             hidden = max(0, len(items) - cap)
             out_nodes = []
             for it in shown:
-                ch_list, ch_more = _serialize(it, level + 1) if it["children"] else ([], 0)
+                ch_list, ch_more = _serialize(it, level + 1, cap0=cap0, cap_sub=cap_sub) if it["children"] else ([], 0)
                 out_nodes.append({
                     "kind": it["kind"],
+                    "province": it.get("province") or "",
                     "city": it["city"],
                     "station_key": it["station_key"],
                     "label": it["label"],
@@ -2141,7 +2327,37 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                 })
             return out_nodes, hidden
 
-        nodes, more_top = _serialize(root, 0)
+        nodes, more_top = _serialize(root, 0, cap0=45, cap_sub=18)
+
+        prov_nodes = []
+        for p_item in sorted(prov_root.values(), key=lambda x: (x["min_elapsed"], -x["count"], x["province"])):
+            p_ch, p_more = _serialize(p_item, 0, cap0=22, cap_sub=12)
+            prov_nodes.append({
+                "kind": "province",
+                "province": p_item["province"],
+                "city": "",
+                "station_key": "",
+                "label": p_item["province"],
+                "path": [],
+                "count": p_item["count"],
+                "min_elapsed_min": p_item["min_elapsed"] if p_item["min_elapsed"] < _INF else None,
+                "min_cost": p_item["min_cost"],
+                "samples": p_item["samples"],
+                "children": p_ch,
+                "more_children": p_more,
+            })
+
+        prov_summary = [
+            {
+                "province": pa["province"],
+                "count": pa["count"],
+                "min_elapsed_min": pa["min_elapsed"] if pa["min_elapsed"] < _INF else None,
+                "min_cost": pa["min_cost"],
+                "samples": pa["samples"],
+            }
+            for pa in sorted(prov_agg.values(), key=lambda x: (x["min_elapsed"], -x["count"], x["province"]))
+        ]
+
         return {
             "depth": depth_cur,
             "max_legs": m_legs,
@@ -2149,6 +2365,8 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
             "total_states": len(states),
             "nodes": nodes,
             "more_top": more_top,
+            "provinces": prov_nodes,
+            "province_summary": prov_summary,
         }
 
     # 内存优化：未开启支配剪枝时“入桶即截断”——每站只维护 fast/cheap 两维
@@ -2197,6 +2415,9 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                     _add_prune(prune_stats, "detour")
                 continue
             b_city = s_cities[j]
+            if has_prov_filter and not _prov_ok(bk, b["name"]):
+                _add_prune(prune_stats, "province_filter")
+                continue
             if exc_st and _match_station_tokens(bk, b["name"], city_of, tele_of, exc_st):
                 _add_prune(prune_stats, "custom_rule")
                 continue
@@ -2397,6 +2618,9 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                 same = em["same"]
                 pair_extra = em["extra_min"]
                 dk_name = state["name"] if same else name_of.get(dk, dk)
+                if has_prov_filter and not same and not _prov_ok(dk, dk_name):
+                    _add_prune(prune_stats, "province_filter")
+                    continue
                 if exc_st and not same and _match_station_tokens(dk, dk_name, city_of, tele_of, exc_st):
                     _add_prune(prune_stats, "custom_rule")
                     continue
@@ -2566,6 +2790,9 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                                     _add_prune(prune_stats, "total_time")
                                 else:
                                     _add_prune(prune_stats, "detour")
+                                continue
+                            if has_prov_filter and not _prov_ok(bk, b["name"]):
+                                _add_prune(prune_stats, "province_filter")
                                 continue
                             if exc_st and _match_station_tokens(bk, b["name"], city_of, tele_of, exc_st):
                                 _add_prune(prune_stats, "custom_rule")
@@ -2966,12 +3193,14 @@ def _build_graph_cache(ver: tuple, cancel_event=None, sub_cb=None) -> dict:
             if nm:
                 tt_key_to_tn.setdefault(nm, set()).add(tn)
 
+    prov_of = _build_prov_map(cities, geo_index=geo_index)
     services_all = _load_services(screen_all, tt_all, cancel_event=cancel_event)
     return {
         "version": ver,
         "n2c": n2c,
         "cities": cities,
         "geo_index": geo_index,
+        "prov_of": prov_of,
         "cal": cal,
         "sno_base": sno_base,
         "screen_all": screen_all,
@@ -3066,7 +3295,11 @@ def search(from_q: str, to_q: str, date: str,
            active_group_ids: list[int] | None = None,
            fallback_ungeocoded: bool = False,
            progress_cb=None, cancel_event=None, sub_cb=None,
-           tree_ctrl: TreePruneController | None = None) -> dict:
+           tree_ctrl: TreePruneController | None = None,
+           province_mode: str = "off",
+           allow_provinces: str | list[str] = "",
+           exclude_provinces: str | list[str] = "",
+           block_unknown_prov: bool = False) -> dict:
     preset = PRUNE_PRESETS.get(prune_level, PRUNE_PRESETS["balanced"])
     eff_fk = frontier_k if frontier_k is not None else preset["frontier_k"]
     eff_max_total = max_total_min if max_total_min is not None else preset["max_total_min"]
@@ -3079,8 +3312,23 @@ def search(from_q: str, to_q: str, date: str,
     inc_st_mode = "and" if str(include_stations_mode or "or").strip().lower() == "and" else "or"
     exc_st = _parse_tokens(exclude_stations)
 
+    p_mode = str(province_mode or "off").strip().lower()
+    raw_allow_p = _parse_province_tokens(allow_provinces)
+    raw_exc_p = _parse_province_tokens(exclude_provinces)
+    if p_mode == "allow":
+        allow_provs, exc_provs = raw_allow_p, raw_exc_p
+    elif p_mode == "exclude":
+        allow_provs, exc_provs = set(), raw_exc_p
+    elif raw_allow_p or raw_exc_p:
+        allow_provs, exc_provs = raw_allow_p, raw_exc_p
+        p_mode = "allow" if raw_allow_p else "exclude"
+    else:
+        allow_provs, exc_provs = set(), set()
+        p_mode = "off"
+
     # WHY: 束宽(frontier_k)与支配剪枝在过滤之前按"局部最优"扔分支，会把"尚未经过必经站"的合法分支误剪；
     # 车型头(inc_pfx/exc_pfx)与排除站(exc_st)已下沉到 _search_multi 搜前筛选，同时把自动放宽束宽控制在安全上限(32–64)而非清零无限制，避免 3+ 程爆内存。
+    # NOTE: 中转省份过滤属于主动收缩搜索空间，不触发 auto_relaxed，保留 frontier_k 加速收敛。
     auto_relaxed = False
     if (inc_pfx or exc_pfx or inc_st or exc_st) and frontier_k is None and prune_dominated is None:
         if eff_fk or eff_dom:
@@ -3102,7 +3350,7 @@ def search(from_q: str, to_q: str, date: str,
     prune_stats = {
         "repeat_train": 0, "loopback": 0, "city_loop": 0, "passed_dest": 0,
         "total_time": 0, "detour": 0, "dominated": 0, "frontier": 0,
-        "hub_filter": 0, "custom_rule": 0, "user_tree": 0,
+        "hub_filter": 0, "province_filter": 0, "custom_rule": 0, "user_tree": 0,
     }
     prune_cfg = {
         "prune_level": prune_level,
@@ -3121,6 +3369,10 @@ def search(from_q: str, to_q: str, date: str,
         "inc_st": inc_st,
         "inc_st_mode": inc_st_mode,
         "exc_st": exc_st,
+        "province_mode": p_mode,
+        "allow_provs": sorted(allow_provs),
+        "exc_provs": sorted(exc_provs),
+        "block_unknown_prov": bool(block_unknown_prov),
     }
 
     total_steps = 6 if max_legs < 3 else 5 + (max_legs - 1)
@@ -3167,6 +3419,8 @@ def search(from_q: str, to_q: str, date: str,
     cal = g["cal"]
     cities = g["cities"]
     geo_index = g.get("geo_index")
+    prov_of = g.get("prov_of") or _build_prov_map(cities, geo_index=geo_index)
+    prune_cfg["prov_of"] = prov_of
     cross_cfg = geo.resolve_cross_cfg(
         cross_extra=cross_extra,
         cross_radius_km=cross_radius_km,
@@ -3398,8 +3652,8 @@ def search(from_q: str, to_q: str, date: str,
             kept_t.extend(x["plan"] for x in accepted)
         transfers = kept_t
 
-    # 车次头与换乘站过滤已从图搜索剥离为统一后置过滤（API/测试调用传入时仍自动在末尾生效）
-    if inc_pfx or exc_pfx or inc_st or exc_st:
+    # 车次头、换乘站与中转省份统一后置校验（2程方案在此同步按中转省份剪枝，3+程在 _search_multi 已前置拦截）
+    if inc_pfx or exc_pfx or inc_st or exc_st or allow_provs or exc_provs:
         direct = filter_plans(
             direct,
             allow_prefixes=inc_pfx, exclude_prefixes=exc_pfx,
@@ -3413,7 +3667,10 @@ def search(from_q: str, to_q: str, date: str,
             include_stations=inc_st, exclude_stations=exc_st,
             include_stations_mode=inc_st_mode, allow_cross_station=allow_cross_station,
             cities=cities, stats=prune_stats,
+            allow_provinces=allow_provs, exclude_provinces=exc_provs,
+            prov_of=prov_of, block_unknown_prov=bool(block_unknown_prov),
         )
+    prune_cfg.pop("prov_of", None)
 
     direct.sort(key=lambda x: x["total_min"])
     transfers.sort(key=lambda x: x["total_min"])

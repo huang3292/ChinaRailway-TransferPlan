@@ -2527,6 +2527,193 @@ class TestMemoryAndInteractiveTreePrune(TempDBTestCase):
             self.assertIn(marker, html_text, f"缺失分支树 UI 标记: {marker}")
 
 
+class TestProvinceFilterAndTreeGrouping(TempDBTestCase):
+    def _seed_corridor_provinces(self):
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,pinyin,short,city) VALUES(?,?,?,?,?)",
+                [
+                    ("XMN", "厦门", "xm", "xm", "厦门"),
+                    ("JYB", "建阳", "jy", "jy", "南平"),
+                    ("GZS", "中山", "zs", "zs", "中山"),
+                    ("HZC", "杭州东", "hzd", "hzd", "杭州"),
+                    ("JND", "济南西", "jnx", "jnx", "济南"),
+                    ("WHI", "威海", "wh", "wh", "威海"),
+                    ("UNK", "神秘小站", "smxz", "smxz", "神秘城"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    # 2程绕广东方案: 厦门 -> 中山(广东) -> 威海(山东)
+                    ("P2_GD1", "G8001", "2026-11-25", 1, "厦门", "XMN", "----", "07:00"),
+                    ("P2_GD1", "G8001", "2026-11-25", 2, "中山", "GZS", "09:00", "09:00"),
+                    ("P2_GD2", "G8002", "2026-11-25", 1, "中山", "GZS", "----", "09:40"),
+                    ("P2_GD2", "G8002", "2026-11-25", 2, "威海", "WHI", "15:00", "15:00"),
+                    # 2程走廊内方案: 厦门 -> 杭州东(浙江) -> 威海(山东)
+                    ("P2_ZJ1", "G8003", "2026-11-25", 1, "厦门", "XMN", "----", "07:10"),
+                    ("P2_ZJ1", "G8003", "2026-11-25", 2, "杭州东", "HZC", "10:10", "10:10"),
+                    ("P2_ZJ2", "G8004", "2026-11-25", 1, "杭州东", "HZC", "----", "10:50"),
+                    ("P2_ZJ2", "G8004", "2026-11-25", 2, "威海", "WHI", "16:00", "16:00"),
+                    # 2程未知省小站方案: 厦门 -> 神秘小站(未知) -> 威海(山东)
+                    ("P2_UK1", "G8005", "2026-11-25", 1, "厦门", "XMN", "----", "07:20"),
+                    ("P2_UK1", "G8005", "2026-11-25", 2, "神秘小站", "UNK", "09:20", "09:20"),
+                    ("P2_UK2", "G8006", "2026-11-25", 1, "神秘小站", "UNK", "----", "10:00"),
+                    ("P2_UK2", "G8006", "2026-11-25", 2, "威海", "WHI", "16:20", "16:20"),
+                    # 3程绕广东方案: 厦门 -> 中山(广东) -> 济南西(山东) -> 威海(山东)
+                    ("P3_GD2", "G8012", "2026-11-25", 1, "中山", "GZS", "----", "09:45"),
+                    ("P3_GD2", "G8012", "2026-11-25", 2, "济南西", "JND", "13:00", "13:00"),
+                    # 3程走廊内方案: 厦门 -> 杭州东(浙江) -> 济南西(山东) -> 威海(山东)
+                    ("P3_ZJ2", "G8013", "2026-11-25", 1, "杭州东", "HZC", "----", "10:55"),
+                    ("P3_ZJ2", "G8013", "2026-11-25", 2, "济南西", "JND", "13:30", "13:30"),
+                    ("P3_SD3", "G8014", "2026-11-25", 1, "济南西", "JND", "----", "14:10"),
+                    ("P3_SD3", "G8014", "2026-11-25", 2, "威海", "WHI", "16:40", "16:40"),
+                    # 直达车次必须免疫任何省份黑/白名单过滤（即使白名单不含起点福建或终点山东）
+                    ("P1_DIR", "G9000", "2026-11-25", 1, "厦门", "XMN", "----", "06:30"),
+                    ("P1_DIR", "G9000", "2026-11-25", 2, "威海", "WHI", "17:00", "17:00"),
+                ],
+            )
+
+    def test_china_geo_mapping_and_corridor_recommend(self):
+        from app import china_geo
+
+        self.assertEqual(len(china_geo.ALL_PROVINCES), 34)
+        self.assertEqual(china_geo.infer_station_province("厦门北", "厦门"), "福建")
+        self.assertEqual(china_geo.infer_station_province("建阳", "南平"), "福建")
+        self.assertEqual(china_geo.infer_station_province("武夷山北", ""), "福建")
+        self.assertEqual(china_geo.infer_station_province("威海北", "威海"), "山东")
+        self.assertEqual(china_geo.infer_station_province("荣成", ""), "山东")
+        self.assertEqual(china_geo.infer_station_province("青海海南", "海南州"), "青海")
+        self.assertEqual(china_geo.infer_station_province("神秘小站", "神秘城"), "")
+        # 无城市名时利用经纬度兜底识别（济南坐标 -> 山东）
+        self.assertEqual(china_geo.infer_station_province("不知名郊县站", "", lat=36.65, lon=117.0), "山东")
+
+        # 厦门 -> 威海 走廊不得包含广东、台湾、辽宁
+        rec_std = china_geo.recommend_corridor_provinces("厦门", "威海", widen="standard")
+        self.assertIn("福建", rec_std["provinces"])
+        self.assertIn("浙江", rec_std["provinces"])
+        self.assertIn("山东", rec_std["provinces"])
+        self.assertNotIn("广东", rec_std["provinces"])
+        self.assertNotIn("台湾", rec_std["provinces"])
+        self.assertNotIn("辽宁", rec_std["provinces"])
+
+        rec_wide = china_geo.recommend_corridor_provinces("建阳", "威海", widen="wide")
+        self.assertTrue(len(rec_wide["provinces"]) >= len(rec_std["provinces"]))
+        self.assertIn("福建", rec_wide["provinces"])
+        self.assertIn("山东", rec_wide["provinces"])
+
+    def test_province_filter_2leg_and_3leg_and_endpoints(self):
+        from app import main as main_mod
+
+        self._seed_corridor_provinces()
+
+        # 1) 黑名单屏蔽广东：2程 G8001/G8002 与 3程 G8001/G8012/G8014 被彻底屏蔽，直达 G9000 与浙江/未知中转放行
+        r_exc = transfer.search(
+            "厦门", "威海", "2026-11-25",
+            min_wait=30, max_wait=120, max_legs=3, expand_city=False, allow_cross_station=False,
+            province_mode="exclude", exclude_provinces="广东",
+        )
+        self.assertFalse(r_exc["prune_config"]["auto_relaxed"])
+        self.assertEqual(len(r_exc["direct"]), 1)
+        chains_exc = {tuple(l["train"] for l in p["legs"]) for p in r_exc["transfers"]}
+        self.assertNotIn(("G8001", "G8002"), chains_exc)
+        self.assertNotIn(("G8001", "G8012", "G8014"), chains_exc)
+        self.assertIn(("G8003", "G8004"), chains_exc)
+        self.assertIn(("G8003", "G8013", "G8014"), chains_exc)
+        self.assertIn(("G8005", "G8006"), chains_exc)
+        self.assertGreaterEqual(r_exc["prune_stats"].get("province_filter", 0), 1)
+
+        # 2) 白名单仅限 浙江,山东：未知小站默认放行(block_unknown_prov=False)，开启 block_unknown_prov=True 后被拦截
+        r_allow_open = transfer.search(
+            "厦门", "威海", "2026-11-25",
+            min_wait=30, max_wait=120, max_legs=3, expand_city=False, allow_cross_station=False,
+            province_mode="allow", allow_provinces="浙江,山东", block_unknown_prov=False,
+        )
+        chains_open = {tuple(l["train"] for l in p["legs"]) for p in r_allow_open["transfers"]}
+        self.assertIn(("G8003", "G8004"), chains_open)
+        self.assertIn(("G8005", "G8006"), chains_open)
+        self.assertNotIn(("G8001", "G8002"), chains_open)
+        self.assertEqual(len(r_allow_open["direct"]), 1)
+
+        r_allow_strict = transfer.search(
+            "厦门", "威海", "2026-11-25",
+            min_wait=30, max_wait=120, max_legs=3, expand_city=False, allow_cross_station=False,
+            province_mode="allow", allow_provinces="浙江,山东", block_unknown_prov=True,
+        )
+        chains_strict = {tuple(l["train"] for l in p["legs"]) for p in r_allow_strict["transfers"]}
+        self.assertIn(("G8003", "G8004"), chains_strict)
+        self.assertNotIn(("G8005", "G8006"), chains_strict)
+
+        # 3) API 端点 /api/provinces/meta 与 /api/provinces/recommend 验证 + 400 校验
+        meta = main_mod.provinces_meta()
+        self.assertEqual(len(meta["provinces"]), 34)
+        self.assertEqual(len(meta["regions"]), 8)
+        rec_api = main_mod.recommend_provinces(from_station="厦门", to_station="威海", widen="standard")
+        self.assertIn("浙江", rec_api["provinces"])
+        self.assertNotIn("广东", rec_api["provinces"])
+
+        with self.assertRaises(main_mod.HTTPException) as ctx_bad_pm:
+            main_mod.transfers("厦门", "威海", "2026-11-25", province_mode="invalid")
+        self.assertEqual(ctx_bad_pm.exception.status_code, 400)
+
+    def test_tree_province_grouping_and_live_province_prune(self):
+        import time
+        from app import main as main_mod
+
+        self._seed_corridor_provinces()
+        main_mod.jobs.clear()
+        main_mod._job_cancels.clear()
+        main_mod._job_trees.clear()
+
+        req = main_mod.TransferSearchReq(
+            from_station="厦门", to_station="威海", date="2026-11-25",
+            min_wait=30, max_wait=120, max_legs=3, expand_city=False, allow_cross_station=False,
+            tree_prune_mode="step",
+        )
+        jid = main_mod.start_transfers(req)["job_id"]
+        st = None
+        for _ in range(80):
+            st = main_mod.job_status(jid)
+            if st.get("tree_paused"):
+                break
+            time.sleep(0.05)
+        self.assertTrue(st and st.get("tree_paused"))
+        snap = st["tree_snapshot"]
+        # 按省分层树应包含 广东 -> 中山 -> 中山，浙江 -> 杭州 -> 杭州东，以及活跃省份汇总栏
+        prov_labels = [n["label"] for n in snap.get("provinces", [])]
+        self.assertIn("广东", prov_labels)
+        self.assertIn("浙江", prov_labels)
+        sum_provs = [x["province"] for x in snap.get("province_summary", [])]
+        self.assertIn("广东", sum_provs)
+
+        # 一键整省屏蔽 广东 并继续完成
+        pr = main_mod.prune_job_tree(jid, main_mod.TreePruneReq(prune_provinces=["广东"], action="prune"))
+        self.assertIn("广东", pr["tree_pruned_rules"]["provinces"])
+        self.assertNotIn("广东", [n["label"] for n in pr["tree_snapshot"].get("provinces", [])])
+        self.assertNotIn("中山", [n["city"] for n in pr["tree_snapshot"].get("nodes", [])])
+
+        main_mod.prune_job_tree(jid, main_mod.TreePruneReq(action="continue_all"))
+        for _ in range(80):
+            st = main_mod.job_status(jid)
+            if st["status"] != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(st["status"], "done")
+        chains = {tuple(l["train"] for l in p["legs"]) for p in st["result"]["transfers"]}
+        self.assertNotIn(("G8001", "G8012", "G8014"), chains)
+        self.assertIn(("G8003", "G8013", "G8014"), chains)
+
+        # 前端省份抽屉与双视图分支树控件检查
+        html_text = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        for marker in (
+            'id="s-drawer-prov-btn"', 'id="s-prov-drawer"', 'id="s-prov-mode-seg"',
+            'id="s-prov-rec-btn"', 'id="s-prov-rec-exc-btn"', 'id="s-prov-widen"',
+            'id="s-prov-block-unknown"', 'id="s-tree-view-seg"', 'id="s-tree-prov-bar"',
+            'id="s-tree-cut-prov"', 'data-cut-province=', '/api/provinces/recommend',
+        ):
+            self.assertIn(marker, html_text, f"缺失省份过滤 UI 标记: {marker}")
+
+
 if __name__ == "__main__":
     unittest.main()
 
