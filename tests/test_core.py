@@ -2328,8 +2328,18 @@ class TestSchemeCv2(TempDBTestCase):
             'id="s-hide-suspect"', 'id="geo-card"', 'id="groups-card"',
             'id="pairs-card"', 'id="transit-card"', 'transferLedgerHtml',
             'id="s-cross-preview"',
+            'id="tab-geo"', 'data-tab="geo"', 'id="s-summary-bar"',
+            'id="s-mode-readout"', 'id="s-param-chips"', 'id="s-stale-banner"',
+            'id="s-scope-seg"', 'id="scope-sheet"', 'id="pr-pv-radius"',
+            'id="grp-member-add"', 'deriveSearchConfig', 'validateSearchConfig',
+            'transferSearch:v2', 'transferRulesVersion:v1',
         ):
             self.assertIn(marker, html_text, f"前端缺失控件: {marker}")
+        for removed in (
+            'id="s-allow-cross"', 'id="s-same"', 'id="s-prune-toggle"',
+            'scheduleCondResearch',
+        ):
+            self.assertNotIn(removed, html_text, f"前端残留已移除控件: {removed}")
 
 
 if __name__ == "__main__":

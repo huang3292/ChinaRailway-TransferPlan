@@ -566,25 +566,36 @@ python3 crawl_geo_coords.py --audit-only        # 仅离线运行多维质检与
 
 ## 11. 前端逻辑（`static/index.html`）[概念]
 
-五个页签：换乘搜索 / 爬取数据 / 导入数据 / 数据浏览 / 显示设置。核心 JS：
+六个页签：换乘搜索 / 异站与地理 / 爬取数据 / 导入数据 / 数据浏览 / 显示设置。核心 JS：
 
-- 搜索：`#s-go` → （在线模式先 `runRouteImport`）→ `POST /api/transfers/start` + 轮询 `/api/jobs/{id}` → 给方案打 `_k/_type` → `render()`；任务运行中实时展示 `已用` 与阶段 `预计剩余`（`sub_eta_sec`/`eta_sec`），结束后固定展示 `实际用时`（同时写入搜索结果顶栏）。
+- 搜索：`#s-go` → `deriveSearchConfig(raw)` + `validateSearchConfig(derived)` 校验活跃可见字段 → （在线模式先 `runRouteImport`）→ `POST /api/transfers/start` + 轮询 `/api/jobs/{id}` → 记录 `_serverFingerprint`/`_directBaseFingerprint`/`_rulesVersion` → 给方案打 `_k/_type` → `render()`；任务运行中实时展示 `已用` 与阶段 `预计剩余`（`sub_eta_sec`/`eta_sec`），结束后固定展示 `实际用时`（同时写入搜索结果顶栏）。
+- **单一真源配置与条件门控（`deriveSearchConfig` + `transferSearch:v2`）**：
+  - 换乘方式采用三态互斥选择器 `#s-scope-seg`（桌面端分段 / `<=768px` 移动端 `#s-scope-mobile-btn` 仅展示模式文案并唤起底栏弹层 `#scope-sheet`）：**同站+异站** / **仅限同站** / **仅异站（当前页）**。
+  - 首屏仅保留 OD/日期/搜索主按钮与 `排序 / 方案类型 / 最大段数 / 每页 / 在线 / 自动查票` 常用控制行，高级参数收进 3 个默认折叠的细线抽屉（`#s-cross-drawer` 异站、 `#s-filter-drawer` 筛选、 `#s-prune-drawer` 剪枝）。
+  - `#s-summary-bar` 将**只读模式指示（`#s-mode-readout`，点击跳转定位）**与**可移除参数/过滤 chip（`#s-param-chips` 含 `×`）**分离。
+  - **动态隐藏语义区分**：互斥替代项（如固定加时 vs 智能+城轨减时、非 `custom` 剪枝覆盖）隐藏时同步禁用并排除出请求 `payload` 与 `validationFields`；正交项（如 `仅直达` 下冻结 `transferScope`/异站/剪枝配置）仅冻结不入参而不覆盖用户原偏好。
+  - 偏好持久化至 `localStorage('transferSearch:v2')`，首次访问且无 v2 键时自动从旧键幂等迁移（`migratedFixedNotice` 一次提示自定义固定加时已保留）。
+- **统一“待重算”状态机（无静默自动重搜）**：
+  - 后端/图搜索条件变更或通过 `localStorage('transferRulesVersion:v1')`（`storage` 事件 + `visibilitychange`）跨标签页/页签检测到地理/换乘组/站对/重轨规则更新时，统一显示 `#s-stale-banner` 提示并保留当前对照方案，由用户点击「立即重算」或 `#s-go` 触发；
+  - 纯本地筛选（`#s-filter`/`#s-seat`/`#s-dep1..2`/`#s-arr1..2`/`#s-hide-fallback`/`#s-hide-suspect`/三态 `仅异站`）0ms 即时重排并提示过滤前后条数变化（当 `only_cross` 命中服务端截断翻页时诚实提示仅作用于已加载结果）。
 - `legKey(l)`：`train_no|from_telecode|to_telecode|depart[:10]`，与后端 `_leg_ident` 对齐。
 - `priceKey(p)`：返回 `[miss?1:0, est?1:0, sum, waitlist?1:0, allSoldOut?1:0]`——**实际价优先**（有真实价排前，按实际价升序；同价位优先有票而非候补），其次有估价。`sortPlans` 价格模式据此排序。
-- `filterPlans`：统一后置本地过滤（即时生效、不重跑图搜索）——只含/排除车型头（`#s-inc-pfx`/`#s-exc-pfx`）、车次包含（`#s-filter`）、必经/排除换乘站（`#s-inc-tst` + `#s-inc-mode` OR/AND、`#s-exc-tst`，利用响应附带的 `station_cities` 与 `city_suffix_stations` 复现精确站名/城市匹配）、换乘类型（`#s-same`）、席位（`#s-seat`）、出发到达时间等。
+- `filterPlans`：统一后置本地过滤（即时生效、不重跑图搜索）——只含/排除车型头（`#s-inc-pfx`/`#s-exc-pfx`）、车次包含（`#s-filter`）、必经/排除换乘站（`#s-inc-tst` + `#s-inc-mode` OR/AND、`#s-exc-tst`，利用响应附带的 `station_cities` 与 `city_suffix_stations` 复现精确站名/城市匹配）、三态异站过滤（`only_cross` 时 `same='0'`）、席位（`#s-seat`）、出发到达时间、`#s-hide-fallback`/`#s-hide-suspect` 等。
   （"直达 0"通常是开了"仅换乘"、"同/异站换乘"或"必经换乘站"筛选所致，非 bug。）
 - 剪枝与指定枢纽收窄（搜前）：`#s-prune` 提供均衡 / 严格 / 高度宽松 / 无限制（仅防死循环） / 自定义五种策略，`#s-hub-only` 与 `#s-hubs`（可点「填入省会+大枢纽预设」自由增删）控制搜前仅经指定枢纽换乘；`#s-prune-panel` 仅保留纯数值/图参数（束宽 0=不限、总历时 0=不限、绕行倍率、异站分支、支配剪枝），不再混入后置过滤框。`pruneDiagHtml` 按需提供扩展 3 程、放宽至高度宽松/无限制、关闭仅枢纽重搜，以及一键 `清除后置筛选`（0ms 本地生效）。
-- **方案 C 异站配置条（`#s-cross-strip`）与透明账本**：搜索主面板集成物理搜寻半径预设（0 / 10 / 20 / 35 / 50 / 100 km）、计价模式（智能连续+重轨减时 / 固定 `+Xm`）、3 档重轨估算减时开关与邻近阈值（默认 1500m）、无坐标回退复选框（**默认关闭**；当 `R=0` 时联动禁用，开启时触发琥珀色低置信提示；当 `ok>=98%` 时展示劝关提醒）与已启用换乘组多选标签。结果列表新增 `#s-hide-fallback` / `#s-hide-suspect` 本地筛选，顶栏按需告警 `radius_truncated`（单站超 25 个邻近截断）与 `zero_override_active`（0m 强控规则放宽了 BFS 下界）；桌面端与手机端方案卡片统一渲染 `transferLedgerHtml`，就地展开 `基础 Xm + 枢纽 Ym - 重轨估算 Zm = 有效 Wm` 与规则来源徽标（规则/换乘组/半径+距离/低置信回退）。
-- **日期、双端视图与动态席位设置（`#tab-display`）**：所有查询/爬取日期输入项默认取北京时间**明天（+1 天）**（缓存清理基线维持今天避免误清）。结果区支持**国铁 12306 网页多列席别表格**与**铁路 12306 手机紧凑卡片**切换/自适应（`viewMode`）；第 5 页签「显示设置」支持配置：
+- **方案 C 异站透明账本与告警**：`#s-cross-drawer` 内集成物理搜寻半径预设（0 / 10 / 20 / 35 / 50 / 100 km）、计价模式（智能连续+重轨减时 / 固定 `+Xm`）、3 档重轨估算减时开关与邻近阈值（默认 1500m）、无坐标回退复选框（**默认关闭**；当 `R=0` 时联动禁用，开启时触发琥珀色低置信提示；当 `ok>=98%` 时展示劝关提醒）与已启用换乘组多选标签。结果顶栏按需告警 `radius_truncated`（单站超 25 个邻近截断）与 `zero_override_active`（0m 强控规则放宽了 BFS 下界）；桌面端与手机端方案卡片统一渲染 `transferLedgerHtml`，就地展开 `基础 Xm + 枢纽 Ym - 重轨估算 Zm = 有效 Wm` 与规则来源徽标（规则/换乘组/半径+距离/低置信回退）。
+- **日期、双端视图与动态席位设置（`#tab-display`）**：所有查询/爬取日期输入项默认取北京时间**明天（+1 天）**（缓存清理基线维持今天避免误清）。结果区支持**国铁 12306 网页多列席别表格**与**铁路 12306 手机紧凑卡片**切换/自适应（`viewMode`）；第 6 页签「显示设置」支持配置：
   - **整页无数据冷门席位自动折叠**（`foldEmpty`）及手动单席位隐藏（支持在结果栏一键临时展开全部列）；
   - **互斥席位合并**（预设 `硬座-二等座`、`软座-一等座`、`动卧-二等卧(硬卧)`、`高级软卧-商务座` 及自定义合并），其中 **`商务座` 与 `特等座` 强制拆分为独立席位**；`KNOWN_COEXIST_PAIRS` 与 `computeEffectiveColumns()` 双重防线会在配置与渲染阶段拦截或自动拆分任何同车并存的席位组合。
 - `autoQuery()`：`sortPlans(filterPlans(...)).slice((page-1)*size, page*size).filter(!departed)` → flatMap 腿 →
   `POST /api/plan_tickets` → `pollPlanJob` → `applyTickets` 按 key 回填真实价/余票。
 - `refreshAutoQuery()`：排序/筛选/翻页变化后防抖 900ms 重查（仅勾选"自动查询票价/余票"时）。
 - 时刻表与票价展开：`toggleTT`/`renderTT`/`ttTable`（升级为纵向圆点时间线 `●──○──●`，自动淡化上/下车之外经停站）与 `togglePriceRow`/`priceDrawerHtml`（见 §9）。
-- 爬取页（`#tab-crawl`）：除大屏/时刻表/余票抓取外，集成 4 个方案 C 管理面板——`#geo-card`（覆盖率统计、Overpass/Wikidata 抓包与试跑、`suspect/missing` 人工维护 + Nominatim 单站校准）、`#groups-card`（自定义换乘组）、`#pairs-card`（站对允许/禁止与实时公式预览）、`#transit-card`（~43 城重轨名单维护）及 `crawlTT`/`showTimetable`（模态框）、`renderTickets`/`drawTicketsTable`（复用动态席位折叠与合并规则）。
+- **异站与地理独立工作台（`#tab-geo`）与爬取页（`#tab-crawl`）**：
+  - `#tab-geo` 集中承载 4 个规则与地理管理卡片——`#geo-card`（覆盖率统计、Overpass/Wikidata 抓包与试跑、`suspect/missing` 人工维护 + Nominatim 单站校准）、`#groups-card`（自定义换乘组，成员支持站名自动补全 `#grp-member-add`）、`#pairs-card`（站对允许/禁止及独立草稿态预览 `#pr-pv-radius`/`#pr-pv-mode` + 一键同步回搜索条件 `#pr-pv-sync`）、`#transit-card`（~43 城重轨名单维护）；每次变更规则自动递增 `transferRulesVersion:v1` 并联动搜索页待重算提示。
+  - `#tab-crawl` 聚焦大屏/时刻表/余票爬取任务调度与进度监控，以及 `crawlTT`/`showTimetable`、`renderTickets`/`drawTicketsTable`。
 
-> 改前端排序/筛选/自动查询逻辑都在 `index.html` 的 `priceKey/sortPlans/filterPlans/autoQuery` 几处；异站规则条与账本渲染在 `syncCrossStripUI/renderGroupPills/transferLedgerHtml`。
+> 改前端排序/筛选/配置派生逻辑都在 `index.html` 的 `deriveSearchConfig/validateSearchConfig/priceKey/sortPlans/filterPlans/autoQuery` 几处；摘要条、待重算提示与账本渲染在 `syncSearchDrawerUI/updateStaleBanner/transferLedgerHtml`。
 
 ---
 
