@@ -1797,14 +1797,18 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
             fam = parsers.train_class_family(plan_code, is_emu=is_emu)
             dep_hm, arr_hm = _leg_times(l)
 
-            dig = parsers.train_digits(plan_code)
-            if dig:
+            digs = []
+            for src in (plan_code, parsers.train_no_root_code(l["train_no"])):
+                d_val = parsers.train_digits(src)
+                if d_val and d_val not in digs:
+                    digs.append(d_val)
+            for dig in digs:
                 cands = by_code.get((dig, l["from"], l["to"], l["date"]))
                 if cands:
                     matched = [
                         x for x in cands
                         if (not fam or parsers.train_class_family(
-                            x["station_train_code"],
+                            x["station_train_code"] or parsers.train_no_root_code(x["train_no"]),
                             is_emu=parsers.is_emu_style(style_map.get(x["train_no"])),
                         ) == fam)
                     ]
@@ -1908,8 +1912,11 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
                     tk_map[(r["train_no"], f, t, d)] = r
                     if r["station_train_code"]:
                         train_codes.setdefault(r["train_no"], r["station_train_code"])
-                        dig = parsers.train_digits(r["station_train_code"])
-                        if dig:
+                    seen_digs = set()
+                    for c_src in (r["station_train_code"], parsers.train_no_root_code(r["train_no"])):
+                        dig = parsers.train_digits(c_src)
+                        if dig and dig not in seen_digs:
+                            seen_digs.add(dig)
                             by_code.setdefault((dig, f, t, d), []).append(r)
                     if r.get("start_time") and r.get("arrive_time"):
                         by_sched.setdefault((f, t, d, r["start_time"], r["arrive_time"]), []).append(r)

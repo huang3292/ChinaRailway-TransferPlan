@@ -2826,6 +2826,11 @@ class TestZnvZtkCompat(TempDBTestCase):
         self.assertEqual(parsers.train_class_family("T10", is_emu=True), "T")
         self.assertEqual(parsers.train_class_family("N10"), "TN")
 
+        # 12 位 train_no 提取主车次（折角车 K884/V881 同根）
+        self.assertEqual(parsers.train_no_root_code("270000V88400"), "V884")
+        self.assertEqual(parsers.train_no_root_code("47000K827850"), "K8278")
+        self.assertEqual(parsers.train_no_root_code("2400000D170O"), "D17")
+
     def test_fare_estimate_and_calibration_across_nv_and_emu(self):
         with db.tx() as conn:
             conn.executemany(
@@ -2875,10 +2880,12 @@ class TestZnvZtkCompat(TempDBTestCase):
                     ("XKS", "厦门北", "厦门", "xiamenbei", "xmb"),
                     ("UCK", "聊城", "聊城", "liaocheng", "lc"),
                     ("JAK", "大明湖", "济南", "daminghu", "dmh"),
+                    ("WFK", "潍坊", "潍坊", "weifang", "wf"),
+                    ("QHK", "青岛北", "青岛", "qingdaobei", "qdb"),
                     ("WKK", "威海", "威海", "weihai", "wh"),
                 ],
             )
-            # 改号前本地图谱时刻表：Z104 -> K8278(47000K827850) -> K411(240000K41102)
+            # 改号前本地图谱时刻表：Z104 -> K8278(47000K827850) -> K411(240000K41102) 及 K884(270000K8842F)
             conn.executemany(
                 "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
                 [
@@ -2888,9 +2895,11 @@ class TestZnvZtkCompat(TempDBTestCase):
                     ("47000K827850", "K8278", "2026-11-24", 3, "大明湖", "JAK", "01:53", "02:01"),
                     ("240000K41102", "K411", "2026-11-24", 5, "大明湖", "JAK", "06:06", "06:14"),
                     ("240000K41102", "K411", "2026-11-24", 11, "威海", "WKK", "14:25", "----"),
+                    ("270000K8842F", "K884", "2026-11-24", 7, "潍坊", "WFK", "06:10", "06:16"),
+                    ("270000K8842F", "K884", "2026-11-24", 8, "青岛北", "QHK", "07:41", "07:50"),
                 ],
             )
-            # 改号后 12306 实时余票（V4278 train_no=47000V427810，数字 8278->4278；V411 train_no=240000V41100，站序 04->10）
+            # 改号后 12306 实时余票（V4278 47000V427810; V411 240000V41100; 折角车 V881 270000V88400 即使微调 1 分钟也同根命中）
             conn.executemany(
                 """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
                                        from_station_no,to_station_no,start_time,arrive_time,duration,can_web_buy,seats,seat_types)
@@ -2902,6 +2911,8 @@ class TestZnvZtkCompat(TempDBTestCase):
                      json.dumps({"yz": "有", "yw": "有", "rw": "5", "wz": "有"}), "134"),
                     ("240000V41100", "V411", "2026-11-27", "JAK", "WKK", "04", "10", "06:14", "14:25", "08:11", "Y",
                      json.dumps({"yz": "有", "rw": "6", "yw": "有", "wz": "候补"}), "134"),
+                    ("270000V88400", "V881", "2026-11-27", "WFK", "QHK", "07", "08", "06:16", "07:42", "01:26", "Y",
+                     json.dumps({"yz": "有", "rw": "15", "yw": "有", "wz": "有"}), "134"),
                     # 同区间干扰动车 G4278（同数字不同大类）不应被 K8278 匹配
                     ("24000G427800", "G4278", "2026-11-27", "UCK", "JAK", "02", "03", "00:06", "01:53", "01:47", "Y",
                      json.dumps({"ze": "有"}), "OM"),
@@ -2913,6 +2924,7 @@ class TestZnvZtkCompat(TempDBTestCase):
                     ("5n0000Z1040F", "2026-11-26", "01", "08", "yz", "硬座", 206.0),
                     ("47000V427810", "2026-11-27", "02", "03", "yz", "硬座", 19.5),
                     ("240000V41100", "2026-11-27", "04", "10", "yz", "硬座", 81.0),
+                    ("270000V88400", "2026-11-27", "07", "08", "yz", "硬座", 24.5),
                 ],
             )
 
@@ -2948,7 +2960,7 @@ class TestZnvZtkCompat(TempDBTestCase):
         self.assertEqual(len(transfer.filter_plans([emu_plan], exclude_prefixes="N")), 1)
         self.assertEqual(len(transfer.filter_plans([emu_plan], allow_prefixes="N")), 0)
 
-        # _plan_tickets_job: 即便外围传入 K8278 (47000K827850) + K411 (240000K41102)，也能实时命中 V4278 / V411 与不同站序的新票价
+        # _plan_tickets_job: K8278->V4278, K411->V411, 以及折角车 K884(270000K8842F)->V881(270000V88400) 均能命中实时余票与新票价
         main_mod.jobs.clear()
         main_mod._job_cancels.clear()
         req = main_mod.PlanTicketsReq(legs=[
@@ -2960,6 +2972,10 @@ class TestZnvZtkCompat(TempDBTestCase):
                              from_telecode="JAK", to_telecode="WKK", from_name="大明湖", to_name="威海",
                              depart="2026-11-27 06:14", arrive="2026-11-27 14:25",
                              from_station_no="05", to_station_no="11"),
+            main_mod.PlanLeg(train_no="270000K8842F", train="K884", date="2026-11-27",
+                             from_telecode="WFK", to_telecode="QHK", from_name="潍坊", to_name="青岛北",
+                             depart="2026-11-27 06:16", arrive="2026-11-27 07:41",
+                             from_station_no="07", to_station_no="08"),
         ])
         with mock.patch("app.main.crawler.crawl_tickets") as m_ct, mock.patch("app.main.crawler.crawl_price") as m_cp:
             jid = main_mod.plan_tickets(req)["job_id"]
@@ -2974,13 +2990,18 @@ class TestZnvZtkCompat(TempDBTestCase):
         r_map = st["result"]
         k2 = "47000K827850|UCK|JAK|2026-11-27"
         k3 = "240000K41102|JAK|WKK|2026-11-27"
+        k4 = "270000K8842F|WFK|QHK|2026-11-27"
         self.assertEqual(r_map[k2]["live_train"], "V4278")
         self.assertEqual(r_map[k2]["live_train_no"], "47000V427810")
         self.assertEqual(r_map[k2]["seats"]["yz"], "有")
         self.assertEqual(r_map[k2]["prices"][0]["price"], 19.5)
         self.assertEqual(r_map[k3]["live_train"], "V411")
         self.assertEqual(r_map[k3]["prices"][0]["price"], 81.0)
-        self.assertEqual(m_ct.call_count, 2)
+        self.assertEqual(r_map[k4]["live_train"], "V881")
+        self.assertEqual(r_map[k4]["live_train_no"], "270000V88400")
+        self.assertEqual(r_map[k4]["seats"]["rw"], "15")
+        self.assertEqual(r_map[k4]["prices"][0]["price"], 24.5)
+        self.assertEqual(m_ct.call_count, 3)
         m_cp.assert_not_called()
 
     def test_trains_search_timetable_compat_and_ui_mode_markers(self):

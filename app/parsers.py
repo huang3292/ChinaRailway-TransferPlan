@@ -61,6 +61,21 @@ def train_digits(code: str | None) -> str:
     return m.group(0) if m else ""
 
 
+_TRAIN_NO_12_RE = re.compile(r"^[0-9A-Za-z]{2}0*([A-Z]?\d{1,5})[0-9A-Za-z]{2}$")
+
+
+def train_no_root_code(train_no: str | None) -> str:
+    """从 12 位 12306 train_no 中提取主车次码（如 270000V88400 → V884），用于折角车前后段同根匹配。"""
+    s = (train_no or "").strip().upper()
+    if len(s) != 12:
+        return ""
+    body = s[2:10].lstrip("0")
+    if re.fullmatch(r"[A-Z]?\d{1,5}", body):
+        return body
+    m = _TRAIN_NO_12_RE.fullmatch(s)
+    return m.group(1) if m else ""
+
+
 def train_class_family(code: str | None, is_emu: bool = False) -> str:
     """车次大类分组：同组内允许按数字做新旧车次兼容匹配，不同大类互不串车。
 

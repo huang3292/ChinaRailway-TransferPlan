@@ -173,10 +173,13 @@ def _seat_map(target_date: str | None = None) -> tuple[dict, dict, dict, dict]:
         tk_aux["by_exact"][(tn, ftc, ttc, td)] = rec
         if ftc and ttc:
             real_tk.setdefault((ftc, ttc, td), set()).add(tn)
-            if st_code:
-                dig = parsers.train_digits(st_code)
-                if dig:
-                    tk_aux["by_digits"].setdefault((dig, ftc, ttc, td), []).append(rec)
+            if st_code or tn:
+                seen_digs = set()
+                for c_src in (st_code, parsers.train_no_root_code(tn)):
+                    dig = parsers.train_digits(c_src)
+                    if dig and dig not in seen_digs:
+                        seen_digs.add(dig)
+                        tk_aux["by_digits"].setdefault((dig, ftc, ttc, td), []).append(rec)
             if st_time and arr_time:
                 tk_aux["by_sched"].setdefault((ftc, ttc, td, st_time, arr_time), []).append(rec)
             if target_date and td == target_date:
@@ -236,13 +239,20 @@ def _resolve_live_ticket(
         style_map = _style_map()
     is_emu = parsers.is_emu_style(style_map.get(train_no))
     fam = parsers.train_class_family(code, is_emu=is_emu)
-    dig = parsers.train_digits(code)
-    if dig:
+    digs = []
+    for src in (code, parsers.train_no_root_code(train_no)):
+        d_val = parsers.train_digits(src)
+        if d_val and d_val not in digs:
+            digs.append(d_val)
+    for dig in digs:
         cands = tk_aux["by_digits"].get((dig, ftc, ttc, dep_date))
         if cands:
             matched = [
                 c for c in cands
-                if (not fam or parsers.train_class_family(c[1], is_emu=parsers.is_emu_style(style_map.get(c[0]))) == fam)
+                if (not fam or parsers.train_class_family(
+                    c[1] or parsers.train_no_root_code(c[0]),
+                    is_emu=parsers.is_emu_style(style_map.get(c[0])),
+                ) == fam)
             ]
             if matched:
                 if dep_hm and arr_hm:
