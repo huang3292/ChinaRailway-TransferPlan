@@ -140,11 +140,19 @@ def _price_map(target_date: str | None = None) -> dict:
     return out
 
 
-def _seat_map(target_date: str | None = None) -> tuple[dict, dict, dict]:
-    """一次查询同时构建余票明细映射、(from,to,date)->train_no 冲突校验集与当日直达余票索引。"""
+def _hm_of(m: int | None) -> str:
+    if m is None:
+        return ""
+    mm = m % 1440
+    return f"{mm // 60:02d}:{mm % 60:02d}"
+
+
+def _seat_map(target_date: str | None = None) -> tuple[dict, dict, dict, dict]:
+    """一次查询同时构建余票明细映射、(from,to,date)->train_no 冲突校验集、当日直达与改号桥接索引。"""
     out = {}
     real_tk = {}
     direct_tickets: dict[tuple[str, str], list[tuple]] = {}
+    tk_aux = {"by_exact": {}, "by_digits": {}, "by_sched": {}}
     sql = (
         "SELECT t.train_no,t.station_train_code,t.from_telecode,t.to_telecode,t.train_date,"
         "t.from_station_no,t.to_station_no,t.start_time,t.arrive_time,t.duration,"
@@ -161,13 +169,21 @@ def _seat_map(target_date: str | None = None) -> tuple[dict, dict, dict]:
         seats_js, cwb, fetched_at,
     ) in db.get_conn().execute(sql, params):
         out[(tn, ftc, ttc, td)] = (seats_js, cwb, fetched_at)
+        rec = (tn, st_code, fno, tno, st_time, arr_time, seats_js, cwb, fetched_at)
+        tk_aux["by_exact"][(tn, ftc, ttc, td)] = rec
         if ftc and ttc:
             real_tk.setdefault((ftc, ttc, td), set()).add(tn)
+            if st_code:
+                dig = parsers.train_digits(st_code)
+                if dig:
+                    tk_aux["by_digits"].setdefault((dig, ftc, ttc, td), []).append(rec)
+            if st_time and arr_time:
+                tk_aux["by_sched"].setdefault((ftc, ttc, td, st_time, arr_time), []).append(rec)
             if target_date and td == target_date:
                 direct_tickets.setdefault((ftc, ttc), []).append(
                     (tn, st_code, fno, tno, st_time, arr_time, dur)
                 )
-    return out, real_tk, direct_tickets
+    return out, real_tk, direct_tickets, tk_aux
 
 
 _style_cache = {"ver": None, "map": {}}
@@ -194,11 +210,72 @@ def _style_map() -> dict:
     return _style_cache["map"]
 
 
+def _resolve_live_ticket(
+    train_no: str,
+    code: str | None,
+    ftc: str | None,
+    ttc: str | None,
+    dep_date: str | None,
+    dep_hm: str,
+    arr_hm: str,
+    tk_aux: dict | None,
+    style_map: dict | None = None,
+):
+    """三层兼容解析实时余票记录（应对 2026-11-25 普速改字母+重编号导致的 train_no 变更）。
+
+    1) 精确 (train_no, from, to, date)
+    2) 同大类数字段 (T↔N, K/纯数字↔V, Z↔Z 等) — 严禁与动车组串车
+    3) 普速物理发到时刻 (from, to, date, dep_hm, arr_hm) — 兜底如 K8278→V4278 的数字改号
+    """
+    if not tk_aux or not ftc or not ttc or not dep_date:
+        return None
+    rec = tk_aux["by_exact"].get((train_no, ftc, ttc, dep_date))
+    if rec:
+        return rec
+    if style_map is None:
+        style_map = _style_map()
+    is_emu = parsers.is_emu_style(style_map.get(train_no))
+    fam = parsers.train_class_family(code, is_emu=is_emu)
+    dig = parsers.train_digits(code)
+    if dig:
+        cands = tk_aux["by_digits"].get((dig, ftc, ttc, dep_date))
+        if cands:
+            matched = [
+                c for c in cands
+                if (not fam or parsers.train_class_family(c[1], is_emu=parsers.is_emu_style(style_map.get(c[0]))) == fam)
+            ]
+            if matched:
+                if dep_hm and arr_hm:
+                    exact_tm = [c for c in matched if c[4] == dep_hm and c[5] == arr_hm]
+                    if exact_tm:
+                        return exact_tm[-1]
+                return matched[-1]
+    if (not code or parsers.is_conv_code(code, is_emu=is_emu)) and dep_hm and arr_hm:
+        cands = tk_aux["by_sched"].get((ftc, ttc, dep_date, dep_hm, arr_hm))
+        if cands:
+            conv = [
+                c for c in cands
+                if parsers.is_conv_code(c[1], is_emu=parsers.is_emu_style(style_map.get(c[0])))
+            ]
+            if conv:
+                if fam:
+                    same_fam = [
+                        c for c in conv
+                        if parsers.train_class_family(c[1], is_emu=parsers.is_emu_style(style_map.get(c[0]))) == fam
+                    ]
+                    if same_fam:
+                        return same_fam[-1]
+                return conv[-1]
+    return None
+
+
 def _enrich(leg: dict, train_no: str, fno, tno, ftc, ttc, dep_date: str,
             prices: dict, seats: dict, code: str = "", km=None,
             duration_min: int | None = None, cal: dict | None = None,
-            sno: dict | None = None) -> dict:
-    st = _style_map().get(train_no)
+            sno: dict | None = None, dep_hm: str = "", arr_hm: str = "",
+            tk_aux: dict | None = None) -> dict:
+    style_map = _style_map()
+    st = style_map.get(train_no)
     if st:
         leg["train_style"] = st
     if sno:
@@ -217,17 +294,49 @@ def _enrich(leg: dict, train_no: str, fno, tno, ftc, ttc, dep_date: str,
                 leg["price_date"] = p["date"]
             if p["stale"]:
                 leg["price_stale"] = True
-    if "prices" not in leg and code:
-        est = fare.estimate(code, km=km, duration_min=duration_min, cal=cal)
-        if est:
-            leg["price_est"] = est
-    tk = seats.get((train_no, ftc, ttc, dep_date))
-    if tk:
-        seats_js, cwb, fetched_at = tk
+
+    live_rec = _resolve_live_ticket(
+        train_no, code, ftc, ttc, dep_date, dep_hm, arr_hm, tk_aux, style_map=style_map
+    ) if tk_aux else None
+    if live_rec:
+        live_tn, live_code, live_fno, live_tno, _st_tm, _ar_tm, seats_js, cwb, fetched_at = live_rec
         leg["seats"] = json.loads(seats_js or "{}")
         leg["can_web_buy"] = cwb
         if fetched_at:
             leg["ticket_updated"] = fetched_at.replace("T", " ")[:16]
+        if live_code and code and live_code != code:
+            leg["live_train"] = live_code
+        if live_tn and live_tn != train_no:
+            leg["live_train_no"] = live_tn
+            if not st:
+                st2 = style_map.get(live_tn)
+                if st2:
+                    st = st2
+                    leg["train_style"] = st2
+            if "prices" not in leg:
+                lf = live_fno if live_fno is not None else fno
+                lt = live_tno if live_tno is not None else tno
+                if lf is not None and lt is not None:
+                    p2 = prices.get((live_tn, str(lf).zfill(2), str(lt).zfill(2)))
+                    if p2:
+                        leg["prices"] = p2["items"]
+                        if p2["date"]:
+                            leg["price_date"] = p2["date"]
+                        if p2["stale"]:
+                            leg["price_stale"] = True
+    else:
+        tk = seats.get((train_no, ftc, ttc, dep_date))
+        if tk:
+            seats_js, cwb, fetched_at = tk
+            leg["seats"] = json.loads(seats_js or "{}")
+            leg["can_web_buy"] = cwb
+            if fetched_at:
+                leg["ticket_updated"] = fetched_at.replace("T", " ")[:16]
+
+    if "prices" not in leg and code:
+        est = fare.estimate(code, km=km, duration_min=duration_min, cal=cal, style=st)
+        if est:
+            leg["price_est"] = est
     return leg
 
 
@@ -486,7 +595,7 @@ def _train_tier(legs: list[dict]) -> int:
         codes = _train_codes(leg.get("train"))
         if not codes:
             continue
-        tier = 2 if any(c[0] in ("G", "C") for c in codes) else (1 if any(c[0] == "D" for c in codes) else 0)
+        tier = 2 if any(c[0] in ("G", "C", "X") for c in codes) else (1 if any(c[0] == "D" for c in codes) else 0)
         best = max(best, tier)
     return best
 
@@ -558,10 +667,11 @@ def _raw_leg_cost(train_no: str, code: str | None, fno, tno, ftc, ttc, dur_min: 
             if vals:
                 return min(vals)
     if code and dur_min and dur_min > 0:
-        ckey = (code, dur_min)
+        st = _style_map().get(train_no)
+        ckey = (code, dur_min, st or "")
         if cache is not None and ckey in cache:
             return cache[ckey]
-        est = fare.estimate(code, duration_min=dur_min, cal=cal)
+        est = fare.estimate(code, duration_min=dur_min, cal=cal, style=st)
         res = None
         if est and isinstance(est.get("seats"), dict):
             vals = [float(x["min"]) for x in est["seats"].values() if x.get("min") is not None]
@@ -573,11 +683,9 @@ def _raw_leg_cost(train_no: str, code: str | None, fno, tno, ftc, ttc, dur_min: 
     return None
 
 
-def _train_codes(code: str | None) -> frozenset[str]:
-    """拆分合并车次号（如 G123/G126 -> {'G123', 'G126'}），用于严格判重。"""
-    if not code:
-        return frozenset()
-    return frozenset(p.strip().upper() for p in str(code).split("/") if p.strip())
+def _train_codes(code: str | None, is_emu: bool = False) -> frozenset[str]:
+    """拆分合并车次号并扩展 ZNV↔ZTK 等价口径（如 K411 -> {'K411', 'V411'}），用于判重与过滤。"""
+    return parsers.train_code_variants(code, is_emu=is_emu)
 
 
 def _parse_tokens(s: str | None) -> list[str]:
@@ -586,10 +694,10 @@ def _parse_tokens(s: str | None) -> list[str]:
     return [x.strip().upper() for x in re.split(r"[,，\s]+", str(s)) if x.strip()]
 
 
-def _match_prefix(code: str | None, prefixes: list[str]) -> bool:
+def _match_prefix(code: str | None, prefixes: list[str], is_emu: bool = False) -> bool:
     if not prefixes:
         return True
-    parts = _train_codes(code)
+    parts = _train_codes(code, is_emu=is_emu)
     return any(part.startswith(px) for part in parts for px in prefixes)
 
 
@@ -638,10 +746,10 @@ def _city_of_key(key, name: str | None, city_of: dict, tele_of: dict) -> str:
     return city_of.get(key) or (city_of.get(name) if name else None) or tele_of.get(key, key)
 
 
-def _code_allowed(code: str | None, inc_pfx: list[str], exc_pfx: list[str]) -> bool:
-    if inc_pfx and not _match_prefix(code, inc_pfx):
+def _code_allowed(code: str | None, inc_pfx: list[str], exc_pfx: list[str], is_emu: bool = False) -> bool:
+    if inc_pfx and not _match_prefix(code, inc_pfx, is_emu=is_emu):
         return False
-    if exc_pfx and _match_prefix(code, exc_pfx):
+    if exc_pfx and _match_prefix(code, exc_pfx, is_emu=is_emu):
         return False
     return True
 
@@ -684,12 +792,18 @@ def _build_prov_map(cities: tuple, geo_index=None) -> dict[str, str]:
     return out
 
 
-def _station_province(key: str | None, name: str | None, city_of: dict, prov_of: dict | None = None) -> str:
+def _station_province(
+    key: str | None,
+    name: str | None,
+    city_of: dict,
+    prov_of: dict | None = None,
+    city_hint: str | None = None,
+) -> str:
     if prov_of:
         p = (key and prov_of.get(key)) or (name and prov_of.get(name))
         if p:
             return p
-    ct = (key and city_of.get(key)) or (name and city_of.get(name)) or ""
+    ct = (key and city_of.get(key)) or (name and city_of.get(name)) or city_hint or ""
     p = china_geo.infer_station_province(name or key, ct)
     if prov_of is not None and p:
         if key:
@@ -747,10 +861,20 @@ def filter_plans(
     else:
         city_of, _, tele_of = cities
 
+    def _leg_pfx_ok(l: dict) -> bool:
+        emu = parsers.is_emu_style(l.get("train_style"))
+        c_raw = l.get("train")
+        c_live = l.get("live_train") or l.get("ticket_live")
+        if inc_pfx and not (_match_prefix(c_raw, inc_pfx, is_emu=emu) or (c_live and _match_prefix(c_live, inc_pfx, is_emu=emu))):
+            return False
+        if exc_pfx and (_match_prefix(c_raw, exc_pfx, is_emu=emu) or (c_live and _match_prefix(c_live, exc_pfx, is_emu=emu))):
+            return False
+        return True
+
     out = []
     for p in plans:
         legs = p.get("legs") or []
-        if (inc_pfx or exc_pfx) and not all(_code_allowed(l.get("train"), inc_pfx, exc_pfx) for l in legs):
+        if (inc_pfx or exc_pfx) and not all(_leg_pfx_ok(l) for l in legs):
             _add_prune(stats, "custom_rule")
             continue
         trs = p.get("transfers") or []
@@ -829,7 +953,7 @@ def _fig_valid(t: dict, query_date: str) -> bool:
 def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait,
                    prices, seats, cal, sno, cities, cross_extra=60, cancel_event=None,
                    prune_cfg=None, prune_stats=None, sub_cb=None, need_transfers=True,
-                   geo_index=None, cross_cfg=None, truncation_out=None):
+                   geo_index=None, cross_cfg=None, truncation_out=None, tk_aux=None):
     prune_cfg = prune_cfg or {}
     hub_tokens = prune_cfg.get("hub_tokens") or []
     allow_cross = prune_cfg.get("allow_cross_station", True)
@@ -871,7 +995,8 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
             "depart": _fmt_epoch(a["dep"] + shift), "arrive": _fmt_epoch(b["arr"] + shift),
             "duration_min": b["arr"] - a["dep"],
         }, tn[0], a.get("no"), b.get("no"), a.get("telecode"), b.get("telecode"), dep_date, prices, seats,
-            code=a.get("code") or t["code"], km=km, duration_min=b["arr"] - a["dep"], cal=cal, sno=sno)
+            code=a.get("code") or t["code"], km=km, duration_min=b["arr"] - a["dep"], cal=cal, sno=sno,
+            dep_hm=_hm_of(a["dep"]), arr_hm=_hm_of(b["arr"]), tk_aux=tk_aux)
 
     direct, transfers = [], []
     sorted_fkeys = sorted(fkeys)
@@ -1165,7 +1290,8 @@ def _complete_screen_from_tt(screen: dict, tt: list) -> None:
 def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, seats, cal, sno, cities,
                       cross_extra=60, cancel_event=None, prune_cfg=None, prune_stats=None,
                       sub_cb=None, sub_cap: int = 100, real_tk=None, n2c=None, init_best_min=None,
-                      need_transfers=True, geo_index=None, cross_cfg=None, truncation_out=None):
+                      need_transfers=True, geo_index=None, cross_cfg=None, truncation_out=None,
+                      tk_aux=None):
     prune_cfg = prune_cfg or {}
     hub_tokens = prune_cfg.get("hub_tokens") or []
     allow_cross = prune_cfg.get("allow_cross_station", True)
@@ -1176,10 +1302,11 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
         cross_cfg = geo.resolve_cross_cfg(cross_extra=cross_extra, geo_index=geo_index)
     real_tk = real_tk or {}
     n2c = n2c or {}
+    style_map = _style_map()
     city_of, _, tele_of = cities
     name_of = {tc: nm for nm, tc in tele_of.items()}
 
-    def _leg_conflict_raw(train_no, a, b, dep_date_str):
+    def _leg_conflict_raw(train_no, a, b, dep_date_str, code: str = ""):
         if not real_tk:
             return False
         ftc = a["telecode"] or n2c.get(a["station_name"])
@@ -1187,7 +1314,13 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
         if not ftc or not ttc:
             return False
         key = (ftc, ttc, dep_date_str)
-        return key in real_tk and train_no not in real_tk[key]
+        if key not in real_tk or train_no in real_tk[key]:
+            return False
+        if tk_aux and _resolve_live_ticket(
+            train_no, code, ftc, ttc, dep_date_str, _hm_of(a["dep"]), _hm_of(b["arr"]), tk_aux, style_map=style_map
+        ) is not None:
+            return False
+        return True
 
     # 预建站点、出发时间二分索引与停站元数据缓存，避免大循环内重复计算与 _enrich
     available = set()
@@ -1201,7 +1334,8 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
             st_keys = [s["key"] for s in T.stops]
             st_canons = [tele_of.get(k, k) for k in st_keys]
             st_cities = [_city_of_key(s["key"], s["station_name"], city_of, tele_of) for s in T.stops]
-            m = (_train_codes(T.code), st_keys, st_canons, st_cities)
+            is_emu = parsers.is_emu_style(style_map.get(T.train_no))
+            m = (_train_codes(T.code, is_emu=is_emu), st_keys, st_canons, st_cities)
             meta_cache[T.train_no] = m
         return m
 
@@ -1252,7 +1386,8 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
             "duration_min": b["arr"] - a["dep"],
         }, t.train_no, a["station_no"], b["station_no"], a["telecode"], b["telecode"],
             _fmt(base, a["dep"] + shift)[:10], prices, seats,
-            code=t.code, duration_min=b["arr"] - a["dep"], cal=cal, sno=sno)
+            code=t.code, duration_min=b["arr"] - a["dep"], cal=cal, sno=sno,
+            dep_hm=_hm_of(a["dep"]), arr_hm=_hm_of(b["arr"]), tk_aux=tk_aux)
 
     # 先算时刻表直达，立即得到最优直达用时用于绕行剪枝上界
     direct = []
@@ -1272,7 +1407,7 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
                     l = leg(A, i, j, shift_a)
                     direct.append({"total_min": dur, "date_assumed": True,
                                    "source_date": A.train_date, "legs": [l]})
-                    if not _leg_conflict_raw(A.train_no, A.stops[i], A.stops[j], dep_date_a):
+                    if not _leg_conflict_raw(A.train_no, A.stops[i], A.stops[j], dep_date_a, A.code):
                         if best_min is None or dur < best_min:
                             best_min = dur
 
@@ -1322,7 +1457,7 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
                     forbidden_canon.add(a_canons[s_idx])
                     seen_cities.add(sc_city)
                     continue
-                if _leg_conflict_raw(A.train_no, A.stops[i], S, dep_date_a):
+                if _leg_conflict_raw(A.train_no, A.stops[i], S, dep_date_a, A.code):
                     forbidden.add(sk)
                     forbidden_canon.add(a_canons[s_idx])
                     seen_cities.add(sc_city)
@@ -1425,7 +1560,7 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
                                         _add_prune(prune_stats, "total_time")
                                     elif detour_cap and total_min > detour_cap:
                                         _add_prune(prune_stats, "detour")
-                                    elif not (real_tk and _leg_conflict_raw(B.train_no, B.stops[k], B.stops[y], b_dep_date)):
+                                    elif not (real_tk and _leg_conflict_raw(B.train_no, B.stops[k], B.stops[y], b_dep_date, B.code)):
                                         b_arr_abs = B.stops[y]["arr"] + b_shift
                                         raw_transfers.append((
                                             total_min, wait, a_dep, b_arr_abs,
@@ -1638,8 +1773,8 @@ class TreePruneController:
         hop_sets = []
         for city, key, name in chain:
             if self.pruned_provinces:
-                p = self._get_prov_locked(city, key, name)
-                if p and p in self.pruned_provinces:
+                p_eff = self._get_prov_locked(city, key, name) or "未识别省份"
+                if p_eff in self.pruned_provinces:
                     return True
             c = _norm_tree_tok(city)
             c_bare = c[:-1] if c.endswith("市") and len(c) > 1 else c
@@ -1690,8 +1825,8 @@ class TreePruneController:
                     new_nd["count"] = sum(int(c.get("count") or 0) for c in pruned_ch) if not nd.get("more_children") else nd["count"]
                 kept.append(new_nd)
                 continue
-            pv_nd = china_geo.normalize_province(nd.get("province"))
-            if pv_nd and pv_nd in self.pruned_provinces:
+            pv_nd = china_geo.normalize_province(nd.get("province")) or "未识别省份"
+            if pv_nd in self.pruned_provinces:
                 continue
             if kind == "station":
                 c = _norm_tree_tok(nd.get("city"))
@@ -1921,7 +2056,7 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                   init_sub_cb=None, depth_sub_cb=None,
                   geo_index=None, cross_cfg=None, truncation_out=None,
                   result_limit: int = 0, total_out: list | None = None,
-                  tree_ctrl: TreePruneController | None = None) -> list[dict]:
+                  tree_ctrl: TreePruneController | None = None, tk_aux=None) -> list[dict]:
     """BFS 多程换乘，返回 3..max_legs 程的换乘方案（反向可达时间下界剪枝 + 二分时间窗 + Top-K 延迟丰富化 + 交互分支树）。"""
     if max_legs < 3:
         if total_out is not None:
@@ -1951,6 +2086,7 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
 
     real_tk = real_tk or {}
     n2c = n2c or {}
+    style_map = _style_map()
     city_of, _, tele_of = cities
     name_of = {tc: nm for nm, tc in tele_of.items()}
     seats_keys = set(seats)
@@ -1963,8 +2099,8 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
     if not prov_of and (has_prov_filter or tree_ctrl is not None):
         prov_of = _build_prov_map(cities, geo_index=geo_index)
 
-    def _prov_key(k: str, nm: str) -> str:
-        return _station_province(k, nm, city_of, prov_of)
+    def _prov_key(k: str, nm: str, ct: str = "") -> str:
+        return _station_province(k, nm, city_of, prov_of, city_hint=ct)
 
     def _prov_ok(k: str, nm: str) -> bool:
         if not has_prov_filter:
@@ -1987,7 +2123,8 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
             if init_sub_cb is not None:
                 init_sub_cb(int((si_raw + 1) * 30 / max(1, n_sv)), 100,
                             f"构建多程路网（{n_sv} 车次）：建索引 {si_raw + 1}/{n_sv}")
-        if has_pfx_filter and not _code_allowed(sv.get("code"), inc_pfx, exc_pfx):
+        is_emu = parsers.is_emu_style(style_map.get(sv["train_no"]))
+        if has_pfx_filter and not _code_allowed(sv.get("code"), inc_pfx, exc_pfx, is_emu=is_emu):
             _add_prune(prune_stats, "custom_rule")
             continue
         si = len(allowed_sv)
@@ -1997,7 +2134,7 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
         s_canons = [tele_of.get(k, k) for k in s_keys]
         s_cities = [_city_of_key(st["key"], st["name"], city_of, tele_of) for st in stops]
         dest_idx = tuple(idx for idx, st in enumerate(stops) if st["enabled"] and st["key"] in tkeys)
-        sv_meta.append((_train_codes(sv.get("code")), s_keys, s_canons, s_cities, dest_idx))
+        sv_meta.append((_train_codes(sv.get("code"), is_emu=is_emu), s_keys, s_canons, s_cities, dest_idx))
         for i, st in enumerate(stops):
             if st["enabled"]:
                 by_station_raw.setdefault(st["key"], []).append((st["dep"] % 1440, si, i))
@@ -2143,11 +2280,29 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
         ttc = b["telecode"] or n2c.get(b["name"])
         if not ftc or not ttc:
             return False
-        key = (ftc, ttc, _fmt_epoch(dep_epoch)[:10])
-        return key in real_tk and sv["train_no"] not in real_tk[key]
+        dep_date = _fmt_epoch(dep_epoch)[:10]
+        key = (ftc, ttc, dep_date)
+        if key not in real_tk or sv["train_no"] in real_tk[key]:
+            return False
+        if tk_aux and _resolve_live_ticket(
+            sv["train_no"], sv.get("code"), ftc, ttc, dep_date,
+            _hm_of(a["dep"]), _hm_of(b["arr"]), tk_aux, style_map=style_map
+        ) is not None:
+            return False
+        return True
 
     def has_seat_raw(sv, a, b, dep_epoch: int) -> bool:
-        return bool(seats_keys) and (sv["train_no"], a["telecode"], b["telecode"], _fmt_epoch(dep_epoch)[:10]) in seats_keys
+        if not seats_keys:
+            return False
+        dep_date = _fmt_epoch(dep_epoch)[:10]
+        if (sv["train_no"], a["telecode"], b["telecode"], dep_date) in seats_keys:
+            return True
+        if tk_aux:
+            return _resolve_live_ticket(
+                sv["train_no"], sv.get("code"), a["telecode"], b["telecode"], dep_date,
+                _hm_of(a["dep"]), _hm_of(b["arr"]), tk_aux, style_map=style_map
+            ) is not None
+        return False
 
     def make_leg_tuple(ref):
         si, i, j, n_shift = ref
@@ -2164,7 +2319,8 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
             "duration_min": b["arr"] - a["dep"],
         }, sv["train_no"], a["no"], b["no"], a["telecode"], b["telecode"],
             dep_date, prices, seats, code=sv["code"],
-            duration_min=b["arr"] - a["dep"], cal=cal, sno=sno)
+            duration_min=b["arr"] - a["dep"], cal=cal, sno=sno,
+            dep_hm=_hm_of(a["dep"]), arr_hm=_hm_of(b["arr"]), tk_aux=tk_aux)
 
     est_cache = {}
 
@@ -2224,7 +2380,7 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
 
             # 1) 省份汇总与「按当前落脚省 -> 城市路径 -> 车站」分层树
             last_ct, last_key, last_nm = ch[-1]
-            cur_prov = _prov_key(last_key, last_nm) or "未识别省份"
+            cur_prov = _prov_key(last_key, last_nm, last_ct) or "未识别省份"
             pa = prov_agg.get(cur_prov)
             if pa is None:
                 pa = prov_agg[cur_prov] = {"province": cur_prov, "count": 0, "min_elapsed": _INF, "min_cost": None, "samples": []}
@@ -2262,7 +2418,7 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                 n_ch = len(ch)
                 for idx_h, (ct, key, nm) in enumerate(ch):
                     c_label = ct or nm or key
-                    hop_prov = _prov_key(key, nm)
+                    hop_prov = _prov_key(key, nm, ct)
                     path_acc.append(c_label)
                     c_key = ("city", c_label)
                     c_node = cur["children"].get(c_key)
@@ -2330,7 +2486,10 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
         nodes, more_top = _serialize(root, 0, cap0=45, cap_sub=18)
 
         prov_nodes = []
-        for p_item in sorted(prov_root.values(), key=lambda x: (x["min_elapsed"], -x["count"], x["province"])):
+        for p_item in sorted(
+            prov_root.values(),
+            key=lambda x: (1 if x["province"] == "未识别省份" else 0, x["min_elapsed"], -x["count"], x["province"]),
+        ):
             p_ch, p_more = _serialize(p_item, 0, cap0=22, cap_sub=12)
             prov_nodes.append({
                 "kind": "province",
@@ -2355,7 +2514,10 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
                 "min_cost": pa["min_cost"],
                 "samples": pa["samples"],
             }
-            for pa in sorted(prov_agg.values(), key=lambda x: (x["min_elapsed"], -x["count"], x["province"]))
+            for pa in sorted(
+                prov_agg.values(),
+                key=lambda x: (1 if x["province"] == "未识别省份" else 0, x["min_elapsed"], -x["count"], x["province"]),
+            )
         ]
 
         return {
@@ -3243,7 +3405,7 @@ def _get_date_cache(ver: tuple, target_date: str, sno_base: dict) -> dict:
         return hit
 
     prices = _price_map(target_date)
-    seats, real_tk, direct_tickets = _seat_map(target_date)
+    seats, real_tk, direct_tickets, tk_aux = _seat_map(target_date)
     overrides = db.get_conn().execute(
         "SELECT train_no,telecode,station_no FROM train_stops "
         "WHERE telecode IS NOT NULL AND train_date=?",
@@ -3255,7 +3417,8 @@ def _get_date_cache(ver: tuple, target_date: str, sno_base: dict) -> dict:
             sno[(tn, tc)] = s_no
     else:
         sno = sno_base
-    entry = {"prices": prices, "seats": seats, "real_tk": real_tk, "direct_tickets": direct_tickets, "sno": sno}
+    entry = {"prices": prices, "seats": seats, "real_tk": real_tk,
+             "direct_tickets": direct_tickets, "tk_aux": tk_aux, "sno": sno}
 
     with _CACHE_LOCK:
         if _DATE_CACHE_VER != ver:
@@ -3414,6 +3577,7 @@ def search(from_q: str, to_q: str, date: str,
     seats = d_cache["seats"]
     real_tk = d_cache["real_tk"]
     direct_tickets = d_cache["direct_tickets"]
+    tk_aux = d_cache["tk_aux"]
     sno = d_cache["sno"]
     n2c = g["n2c"]
     cal = g["cal"]
@@ -3450,19 +3614,30 @@ def search(from_q: str, to_q: str, date: str,
                             prices, seats, cal, sno, cities, cross_extra=cross_extra,
                             cancel_event=cancel_event, prune_cfg=prune_cfg, prune_stats=prune_stats,
                             sub_cb=sub_step, need_transfers=need_transfers,
-                            geo_index=geo_index, cross_cfg=cross_cfg, truncation_out=truncation_flag)
+                            geo_index=geo_index, cross_cfg=cross_cfg, truncation_out=truncation_flag,
+                            tk_aux=tk_aux)
+
+    style_map = _style_map()
 
     def _assumed_conflict(p) -> bool:
         """推算方案（无当日真实数据平移而来）若与实际余票冲突，则以实际余票为准剔除。"""
         if not p.get("date_assumed") or not real_tk:
             return False
         for l in p["legs"]:
+            if "seats" in l:
+                continue
             ftc = l.get("from_telecode") or n2c.get(l.get("from"))
             ttc = l.get("to_telecode") or n2c.get(l.get("to"))
-            key = (ftc, ttc, l["depart"][:10])
+            dep_date = l["depart"][:10]
+            key = (ftc, ttc, dep_date)
             if None in key:
                 continue
             if key in real_tk and l["train_no"] not in real_tk[key]:
+                if _resolve_live_ticket(
+                    l["train_no"], l.get("train"), ftc, ttc, dep_date,
+                    l["depart"][11:16], l["arrive"][11:16], tk_aux, style_map=style_map
+                ) is not None:
+                    continue
                 return True
         return False
 
@@ -3477,23 +3652,29 @@ def search(from_q: str, to_q: str, date: str,
                                sub_cb=sub_step, sub_cap=tt_sub_cap,
                                real_tk=real_tk, n2c=n2c, init_best_min=init_best_min,
                                need_transfers=need_transfers,
-                               geo_index=geo_index, cross_cfg=cross_cfg, truncation_out=truncation_flag)
+                               geo_index=geo_index, cross_cfg=cross_cfg, truncation_out=truncation_flag,
+                               tk_aux=tk_aux)
 
     def rank(p):
         return (0 if any("prices" in l for l in p["legs"]) else 1,
                 1 if p.get("date_assumed") else 0)
 
+    def _canon_tn(l: dict) -> str:
+        return l.get("live_train_no") or l["train_no"]
+
     merged_d = {}
     for p in d1 + d2:
-        key = (p["legs"][0]["train_no"], p["legs"][0]["from"], p["legs"][0]["to"], p["legs"][0]["depart"])
+        l0 = p["legs"][0]
+        key = (_canon_tn(l0), l0["from"], l0["to"], l0["depart"])
         if key not in merged_d or rank(p) < rank(merged_d[key]):
             merged_d[key] = p
     direct = list(merged_d.values())
     merged_t = {}
     for p in t1 + t2:
-        key = (p["legs"][0]["train_no"], p["legs"][1]["train_no"],
-               p["transfer_station"], p["legs"][1]["from"], p["legs"][0]["from"],
-               p["legs"][1]["to"], p["legs"][0]["depart"])
+        l0, l1 = p["legs"][0], p["legs"][1]
+        key = (_canon_tn(l0), _canon_tn(l1),
+               p["transfer_station"], l1["from"], l0["from"],
+               l1["to"], l0["depart"])
         if key not in merged_t or rank(p) < rank(merged_t[key]):
             merged_t[key] = p
     transfers = []
@@ -3556,7 +3737,7 @@ def search(from_q: str, to_q: str, date: str,
             ),
             geo_index=geo_index, cross_cfg=cross_cfg, truncation_out=truncation_flag,
             result_limit=limit, total_out=multi_total_box,
-            tree_ctrl=tree_ctrl,
+            tree_ctrl=tree_ctrl, tk_aux=tk_aux,
         )
         extra_multi_unreturned = max(0, multi_total_box[0] - len(multi_res))
         transfers.extend(multi_res)
@@ -3565,8 +3746,13 @@ def search(from_q: str, to_q: str, date: str,
     step(total_steps, "汇总余票直达并校验冲突")
 
     # 引擎 C：仅有余票数据的直达（直接复用内存 _DATE_CACHE['direct_tickets']，零磁盘查询）
-    have = {(p["legs"][0]["train_no"], p["legs"][0].get("from_telecode"), p["legs"][0].get("to_telecode"))
-            for p in direct}
+    have = set()
+    for p in direct:
+        l0 = p["legs"][0]
+        ftc0, ttc0 = l0.get("from_telecode"), l0.get("to_telecode")
+        have.add((l0["train_no"], ftc0, ttc0))
+        if l0.get("live_train_no"):
+            have.add((l0["live_train_no"], ftc0, ttc0))
     seen_tk = set()
     for fst in fstations:
         for tst in tstations:
@@ -3593,10 +3779,21 @@ def search(from_q: str, to_q: str, date: str,
                     "depart": _fmt(base, dep), "arrive": _fmt(base, dep + dur),
                     "duration_min": dur,
                 }, tn, fno, tno, fst["telecode"], tst["telecode"], date, prices, seats,
-                    code=st_code, duration_min=dur, cal=cal, sno=sno)]})
+                    code=st_code, duration_min=dur, cal=cal, sno=sno,
+                    dep_hm=_hm_of(dep), arr_hm=_hm_of(dep + dur), tk_aux=tk_aux)]})
 
     direct = [p for p in direct if not _assumed_conflict(p)]
     transfers = [p for p in transfers if not _assumed_conflict(p)]
+    if len(transfers) > 1:
+        dedup_t = {}
+        for p in transfers:
+            sig = tuple(
+                (_canon_tn(l), l.get("from_telecode") or l.get("from"), l.get("to_telecode") or l.get("to"), l["depart"], l["arrive"])
+                for l in p["legs"]
+            )
+            if sig not in dedup_t or rank(p) < rank(dedup_t[sig]):
+                dedup_t[sig] = p
+        transfers = list(dedup_t.values())
 
     # 汇总期绕行倍率剪枝（设至少 8 小时保底时长）与同级同枢纽支配剪枝
     detour_limit_min = None

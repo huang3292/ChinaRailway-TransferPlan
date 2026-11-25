@@ -41,6 +41,102 @@ def norm_date(s: str | None) -> str | None:
     return s
 
 
+# 2026-11-25 起普速车次调整：Z→Z, T→N, K/纯数字→V；未来 T/K 预留给高速动车组，需靠车底区分
+_EMU_STYLE_RE = re.compile(r"^(?:CRH|CR\d|ZL\d)", re.I)
+_PART_LETTER_RE = re.compile(r"^([A-Za-z]*)(\d+)$")
+_TRAIN_DIGITS_RE = re.compile(r"\d+")
+
+
+def is_emu_style(style: str | None) -> bool:
+    """判定车底车型是否为动车组（CRH/CR/ZL），避免将未来动车 T/K 误当普速别名。"""
+    if not style:
+        return False
+    first = str(style).strip().split("_")[0].strip()
+    return bool(_EMU_STYLE_RE.match(first))
+
+
+def train_digits(code: str | None) -> str:
+    """提取车次号中的首段数字（去掉字母头）。"""
+    m = _TRAIN_DIGITS_RE.search((code or "").upper())
+    return m.group(0) if m else ""
+
+
+def train_class_family(code: str | None, is_emu: bool = False) -> str:
+    """车次大类分组：同组内允许按数字做新旧车次兼容匹配，不同大类互不串车。
+
+    WHY: Z 保持 Z，T↔N 互转，K/纯数字↔V 互转；G/C/D/X/S/Y 与动车底下的 T/K 各自独立。
+    """
+    raw = (code or "").strip().upper()
+    if not raw:
+        return ""
+    part = raw.split("/")[0].strip()
+    m = _PART_LETTER_RE.match(part)
+    if not m:
+        p = part[:1]
+        return p if p.isalpha() else ""
+    pfx = m.group(1)
+    if is_emu or pfx in ("G", "C", "D", "X", "S", "Y", "Z"):
+        return pfx
+    if pfx in ("T", "N"):
+        return "TN"
+    if pfx in ("K", "V", ""):
+        return "KV"
+    return pfx
+
+
+def is_conv_code(code: str | None, is_emu: bool = False) -> bool:
+    """是否为普速列车体系（Z/T/N/K/V/纯数字，且非动车组）。"""
+    return train_class_family(code, is_emu=is_emu) in ("Z", "TN", "KV")
+
+
+def _convert_part(part: str, mode: str, is_emu: bool = False) -> str:
+    m = _PART_LETTER_RE.match(part)
+    if not m or is_emu:
+        return part
+    pfx, num = m.group(1), m.group(2)
+    if mode == "znv":
+        if pfx == "T":
+            return "N" + num
+        if pfx == "K" or pfx == "":
+            return "V" + num
+        return part
+    if mode == "ztk":
+        if pfx == "N":
+            return "T" + num
+        if pfx == "V":
+            return "K" + num
+        return part
+    return part
+
+
+def convert_train_code(code: str | None, mode: str = "raw", is_emu: bool = False) -> str:
+    """将车次号在 raw / znv(新版 ZNV) / ztk(旧版 ZTK) 间转换，保留复合斜杠车次。"""
+    s = (code or "").strip()
+    if not s or mode not in ("znv", "ztk") or is_emu:
+        return s
+    parts = [p.strip() for p in s.upper().split("/") if p.strip()]
+    if not parts:
+        return s
+    return "/".join(_convert_part(p, mode, is_emu=is_emu) for p in parts)
+
+
+def train_code_variants(code: str | None, is_emu: bool = False) -> frozenset[str]:
+    """返回车次在原值、新版(ZNV)与旧版(ZTK)口径下的全部大写分段集合。"""
+    raw = (code or "").strip().upper()
+    if not raw:
+        return frozenset()
+    out = set()
+    for part in raw.split("/"):
+        p = part.strip()
+        if not p:
+            continue
+        out.add(p)
+        if not is_emu:
+            out.add(_convert_part(p, "znv", False))
+            out.add(_convert_part(p, "ztk", False))
+    return frozenset(out)
+
+
 def parse_stations(text: str) -> list[dict]:
     m = re.search(r"station_names\s*=\s*'(.*)'", text, re.S)
     if not m:

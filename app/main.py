@@ -126,7 +126,7 @@ except ImportError:
             self.mounts.append((path.rstrip("/"), app_obj))
 
 
-from . import china_geo, db, geo, importer, transfer
+from . import china_geo, db, geo, importer, parsers, transfer
 from .crawler import CrawlCancelled, CrawlError, crawler, station_timetable_context
 
 app = FastAPI(title="12306 智能中转")
@@ -242,13 +242,9 @@ def _fmt_train(code: str | None, train_no: str | None) -> str:
     return code or train_no or "--"
 
 
-_TRAIN_DIGITS_RE = re.compile(r"\d+")
-
-
 def _train_digits(code: str | None) -> str:
     """取车次名中的数字部分（去掉字母头）。"""
-    m = _TRAIN_DIGITS_RE.search((code or "").upper())
-    return m.group(0) if m else ""
+    return parsers.train_digits(code)
 
 
 def _station_name_map(telecodes: set[str] | list[str]) -> dict[str, str]:
@@ -523,22 +519,51 @@ def crawl_station_trains(body: StationDate):
 
 class TimetableReq(BaseModel):
     train_no: str
+    live_train_no: str | None = None
     date: str | None = None
     from_telecode: str | None = None
     to_telecode: str | None = None
+
+
+def _crawl_timetable_compat(train_no: str, live_train_no: str | None = None,
+                            date: str | None = None, from_telecode: str | None = None,
+                            to_telecode: str | None = None) -> dict:
+    """兼顾 2026-11-25 改号后新旧 train_no 与停运前历史日期兜底的时刻表抓取。"""
+    candidates = [x for x in dict.fromkeys([live_train_no, train_no]) if x]
+    last_err = None
+    tried = False
+    for tn in candidates:
+        ctx = station_timetable_context(tn)
+        d = date or (ctx and ctx["date"])
+        f = from_telecode or (ctx and ctx["from"])
+        t = to_telecode or (ctx and ctx["to"])
+        if not (d and f and t):
+            continue
+        tried = True
+        try:
+            return crawler.crawl_timetable(tn, d, f, t)
+        except (CrawlError, ValueError) as e:
+            last_err = e
+            # 若原库旧号 train_no 在 >=2026-11-25 返空（已被 12306 替换为新 train_no），
+            # 退回改号前一日(2026-11-24)仍可取到同一物理车次完整停站序列。
+            if tn == train_no and d >= "2026-11-25" and "停站" in str(e):
+                try:
+                    return crawler.crawl_timetable(tn, "2026-11-24", f, t)
+                except (CrawlError, ValueError) as e2:
+                    last_err = e2
+    if last_err is not None:
+        raise last_err
+    if not tried:
+        raise HTTPException(400, "缺少日期或始发/终到站电报码，请先爬取该站经由车次或余票")
+    raise HTTPException(400, "时刻表抓取失败")
 
 
 @app.post("/api/crawl/timetable")
 def crawl_timetable(body: TimetableReq):
     if body.date:
         _check_date(body.date)
-    ctx = station_timetable_context(body.train_no)
-    date = body.date or (ctx and ctx["date"])
-    f = body.from_telecode or (ctx and ctx["from"])
-    t = body.to_telecode or (ctx and ctx["to"])
-    if not (date and f and t):
-        raise HTTPException(400, "缺少日期或始发/终到站电报码，请先爬取该站经由车次或余票")
-    return _run(crawler.crawl_timetable, body.train_no, date, f, t)
+    return _run(_crawl_timetable_compat, body.train_no, body.live_train_no,
+                body.date, body.from_telecode, body.to_telecode)
 
 
 class TicketReq(BaseModel):
@@ -670,7 +695,11 @@ def crawl_price(body: PriceReq):
 
 # ---------- 一键导入向导 / 在线模式共用 ----------
 MAX_TIMETABLES = 200   # 单次向导最多抓取的车次时刻表数（大站车次很多时封顶）
-_TRAIN_CLASS_ORDER = {"G": 0, "C": 0, "D": 0, "Z": 1, "T": 1, "K": 1, "S": 3}
+_TRAIN_CLASS_ORDER = {
+    "G": 0, "C": 0, "D": 0, "X": 0,
+    "Z": 1, "T": 1, "N": 1, "K": 1, "V": 1,
+    "S": 3,
+}
 
 
 def _train_rank(code: str | None) -> tuple[int, str]:
@@ -884,49 +913,71 @@ def station_trains(station: str, date: str | None = None):
 
 
 @app.get("/api/timetable")
-def timetable(train_no: str):
+def timetable(train_no: str, live_train_no: str | None = None):
     n2c = db.station_lookup()
-    r = db.rows("SELECT DISTINCT train_date FROM train_stops WHERE train_no=? ORDER BY train_date DESC LIMIT 1",
-                (train_no,))
-    if r:
-        stops = db.rows("""SELECT * FROM train_stops WHERE train_no=? AND train_date=? ORDER BY station_no""",
-                        (train_no, r[0]["train_date"]))
-        for s in stops:
-            if not s.get("telecode"):
-                s["telecode"] = n2c.get(s.get("station_name"))
-        code = next((s.get("station_train_code") for s in stops if s.get("station_train_code")), None)
-        if not code:
-            code = _train_code_map([train_no]).get(train_no)
-        return {"train_no": train_no, "station_train_code": code,
-                "stops": stops, "complete": True, "source": "train_stops"}
+    cand_nos = [x for x in dict.fromkeys([live_train_no, train_no]) if x]
+    for tn in cand_nos:
+        r = db.rows("SELECT DISTINCT train_date FROM train_stops WHERE train_no=? ORDER BY train_date DESC LIMIT 1",
+                    (tn,))
+        if r:
+            stops = db.rows("""SELECT * FROM train_stops WHERE train_no=? AND train_date=? ORDER BY station_no""",
+                            (tn, r[0]["train_date"]))
+            for s in stops:
+                if not s.get("telecode"):
+                    s["telecode"] = n2c.get(s.get("station_name"))
+            code = next((s.get("station_train_code") for s in stops if s.get("station_train_code")), None)
+            if not code:
+                code = _train_code_map([tn]).get(tn)
+            return {"train_no": tn, "station_train_code": code,
+                    "stops": stops, "complete": True, "source": "train_stops"}
     # 退回车站大屏：把已抓取各站的经停拼成（可能不完整的）时刻表
-    scr = db.rows("""SELECT station_train_code, station_no, station_name, station_telecode, arrive_time, start_time,
-                            stopover_time, station_train_date
-                     FROM station_trains WHERE train_no=? AND station_no IS NOT NULL
-                     ORDER BY station_no, station_train_date DESC""", (train_no,))
-    seen, stops, code = set(), [], None
-    for s in scr:
-        code = code or s.get("station_train_code")
-        if s["station_no"] in seen:
-            continue
-        seen.add(s["station_no"])
-        stops.append({"station_no": s["station_no"], "station_name": s["station_name"],
-                      "telecode": s["station_telecode"] or n2c.get(s.get("station_name")),
-                      "arrive_time": s["arrive_time"], "start_time": s["start_time"],
-                      "stopover_time": s["stopover_time"], "enabled": 1})
-    if stops:
-        return {"train_no": train_no, "station_train_code": code,
-                "stops": stops, "complete": False, "source": "station_screen"}
+    for tn in cand_nos:
+        scr = db.rows("""SELECT station_train_code, station_no, station_name, station_telecode, arrive_time, start_time,
+                                stopover_time, station_train_date
+                         FROM station_trains WHERE train_no=? AND station_no IS NOT NULL
+                         ORDER BY station_no, station_train_date DESC""", (tn,))
+        seen, stops, code = set(), [], None
+        for s in scr:
+            code = code or s.get("station_train_code")
+            if s["station_no"] in seen:
+                continue
+            seen.add(s["station_no"])
+            stops.append({"station_no": s["station_no"], "station_name": s["station_name"],
+                          "telecode": s["station_telecode"] or n2c.get(s.get("station_name")),
+                          "arrive_time": s["arrive_time"], "start_time": s["start_time"],
+                          "stopover_time": s["stopover_time"], "enabled": 1})
+        if stops:
+            return {"train_no": tn, "station_train_code": code,
+                    "stops": stops, "complete": False, "source": "station_screen"}
     raise HTTPException(404, f"车次({train_no})暂无时刻表数据")
 
 
 @app.get("/api/trains")
 def trains(q: str = "", limit: int = 50):
-    like = f"%{q}%"
-    return db.rows("""SELECT train_no, station_train_code, MAX(train_date) train_date,
-                             COUNT(*) stop_count FROM train_stops
-                      WHERE station_train_code LIKE ? OR train_no LIKE ?
-                      GROUP BY train_no LIMIT ?""", (like, like, limit))
+    qs = (q or "").strip()
+    if not qs:
+        return db.rows("""SELECT train_no, station_train_code, MAX(train_date) train_date,
+                                 COUNT(*) stop_count FROM train_stops
+                          GROUP BY train_no LIMIT ?""", (limit,))
+    up = qs.upper()
+    clauses = ["station_train_code LIKE ?", "train_no LIKE ?"]
+    params: list = [f"%{qs}%", f"%{qs}%"]
+    if up in ("K", "V", "T", "N"):
+        alt = {"K": "V", "V": "K", "T": "N", "N": "T"}[up]
+        clauses.append("station_train_code LIKE ?")
+        params.append(f"{alt}%")
+    else:
+        for mode in ("znv", "ztk"):
+            conv = parsers.convert_train_code(up, mode)
+            if conv and conv != up:
+                clauses.append("station_train_code LIKE ?")
+                params.append(f"%{conv}%")
+    params.append(limit)
+    where = " OR ".join(clauses)
+    return db.rows(f"""SELECT train_no, station_train_code, MAX(train_date) train_date,
+                              COUNT(*) stop_count FROM train_stops
+                       WHERE {where}
+                       GROUP BY train_no LIMIT ?""", tuple(params))
 
 
 @app.get("/api/tickets")
@@ -1605,6 +1656,10 @@ class PlanLeg(BaseModel):
     to_telecode: str | None = None
     from_name: str = ""
     to_name: str = ""
+    depart: str | None = None
+    arrive: str | None = None
+    from_station_no: str | None = None
+    to_station_no: str | None = None
 
 
 class PlanTicketsReq(BaseModel):
@@ -1613,6 +1668,15 @@ class PlanTicketsReq(BaseModel):
 
 def _leg_ident(l: PlanLeg) -> tuple:
     return (l.train_no, l.from_telecode or l.from_name, l.to_telecode or l.to_name, l.date)
+
+
+def _hm_slice(s: str | None) -> str:
+    v = (s or "").strip()
+    if len(v) >= 16 and v[10] in (" ", "T"):
+        return v[11:16]
+    if len(v) == 5 and v[2] == ":":
+        return v
+    return ""
 
 
 @app.post("/api/plan_tickets")
@@ -1636,6 +1700,10 @@ def plan_tickets(body: PlanTicketsReq):
             "from_name": l.from_name or (fs or {}).get("name") or "",
             "to_name": l.to_name or (ts or {}).get("name") or "",
             "date": l.date,
+            "depart": l.depart or "",
+            "arrive": l.arrive or "",
+            "fno": l.from_station_no,
+            "tno": l.to_station_no,
         })
     if not legs:
         raise HTTPException(400, "没有可查询的行程段")
@@ -1659,31 +1727,117 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
         for l in legs:
             if l.get("train"):
                 train_codes.setdefault(l["train_no"], l["train"])
+        style_map = transfer._style_map()
+
+        # 若调用方未传入 depart/arrive（如旧接口直调），从本地时刻表/大屏补出物理时刻用于跨号匹配
+        db_sched: dict[tuple[str, str, str], tuple[str, str]] = {}
+        need_sched_tns = {
+            l["train_no"] for l in legs
+            if not (_hm_slice(l.get("depart")) and _hm_slice(l.get("arrive")))
+        }
+        if need_sched_tns:
+            ph_s = ",".join("?" * len(need_sched_tns))
+            n2c = db.station_lookup()
+            dep_by: dict[tuple[str, str], str] = {}
+            arr_by: dict[tuple[str, str], str] = {}
+            for r in db.rows(
+                f"SELECT train_no,telecode,station_name,start_time,arrive_time FROM train_stops WHERE train_no IN ({ph_s}) ORDER BY train_date DESC",
+                tuple(need_sched_tns),
+            ):
+                tc = r["telecode"] or n2c.get(r["station_name"])
+                if tc:
+                    if r["start_time"] and r["start_time"] != "----":
+                        dep_by.setdefault((r["train_no"], tc), r["start_time"])
+                    if r["arrive_time"] and r["arrive_time"] != "----":
+                        arr_by.setdefault((r["train_no"], tc), r["arrive_time"])
+            for r in db.rows(
+                f"SELECT train_no,station_telecode,start_time,arrive_time FROM station_trains WHERE train_no IN ({ph_s}) ORDER BY station_train_date DESC",
+                tuple(need_sched_tns),
+            ):
+                tc = r["station_telecode"]
+                if tc:
+                    if r["start_time"] and r["start_time"] != "----":
+                        dep_by.setdefault((r["train_no"], tc), r["start_time"])
+                    if r["arrive_time"] and r["arrive_time"] != "----":
+                        arr_by.setdefault((r["train_no"], tc), r["arrive_time"])
+            for l in legs:
+                dh = dep_by.get((l["train_no"], l["from"]))
+                ah = arr_by.get((l["train_no"], l["to"]))
+                if dh and ah:
+                    db_sched[(l["train_no"], l["from"], l["to"])] = (dh, ah)
 
         pairs = list(dict.fromkeys((l["from"], l["to"], l["date"]) for l in legs))
         sno = transfer._load_sno()
         done_pairs: set[tuple] = set()
         failed_pairs: dict[tuple, str] = {}
 
-        def find_tk(maps, l: dict):
-            """先用 train_no 精确匹配；miss 时按同区间同日期的车次数字段兜底。
+        def _leg_times(l: dict) -> tuple[str, str]:
+            dh = _hm_slice(l.get("depart"))
+            ah = _hm_slice(l.get("arrive"))
+            if dh and ah:
+                return dh, ah
+            return db_sched.get((l["train_no"], l["from"], l["to"]), ("", ""))
 
-            WHY（根级口径）：2026-11-25 乘车日起国铁把普速车次头改为 V 等（K1068→V1068），
-            train_no 同步变化，方案里存的旧头车次号在实时余票里查不到。车次数字部分在
-            改头中保持不变；同数字多行时按"最后爬取为准"取 id 最大行（与重爬覆盖原则一致），
-            改头生效日前后混存的新旧行因此都收敛到最新口径。
+        def find_tk(maps, l: dict):
+            """三层实时余票匹配：train_no 精确 -> 同大类数字(T↔N,K↔V) -> 同物理时刻(K8278→V4278)。
+
+            WHY（根级口径）：2026-11-25 普速车次调整不仅改字母（K→V, T→N），8xxx/7xxx 等区间车次
+            还同步重编了数字段（如 K8278→V4278, train_no 47000K827850→47000V427810）；
+            因此仅靠 _train_digits 会漏匹配并报错。在同区间同日期下依次校验：
+            1) 精确 train_no；
+            2) 同大类数字（防 K10 误配 G10，也靠 train_style 防未来真动车 T/K 误配 N/V）；
+            3) 普速物理发/到时刻 (dep_hm, arr_hm)，唯一锚定改头+改号车次。
             """
-            tk_map, by_code = maps
+            tk_map, by_code, by_sched = maps
             r = tk_map.get((l["train_no"], l["from"], l["to"], l["date"]))
             if r:
                 return r
-            dig = _train_digits(l.get("train") or train_codes.get(l["train_no"], ""))
-            if not dig:
-                return None
-            cands = by_code.get((dig, l["from"], l["to"], l["date"]))
-            if not cands:
-                return None
-            return max(cands, key=lambda x: x["id"])
+            plan_code = l.get("train") or train_codes.get(l["train_no"], "")
+            is_emu = parsers.is_emu_style(style_map.get(l["train_no"]))
+            fam = parsers.train_class_family(plan_code, is_emu=is_emu)
+            dep_hm, arr_hm = _leg_times(l)
+
+            dig = parsers.train_digits(plan_code)
+            if dig:
+                cands = by_code.get((dig, l["from"], l["to"], l["date"]))
+                if cands:
+                    matched = [
+                        x for x in cands
+                        if (not fam or parsers.train_class_family(
+                            x["station_train_code"],
+                            is_emu=parsers.is_emu_style(style_map.get(x["train_no"])),
+                        ) == fam)
+                    ]
+                    if matched:
+                        if dep_hm and arr_hm:
+                            exact_tm = [x for x in matched if x.get("start_time") == dep_hm and x.get("arrive_time") == arr_hm]
+                            if exact_tm:
+                                return max(exact_tm, key=lambda x: x["id"])
+                        return max(matched, key=lambda x: x["id"])
+
+            if (not plan_code or parsers.is_conv_code(plan_code, is_emu=is_emu)) and dep_hm and arr_hm:
+                cands = by_sched.get((l["from"], l["to"], l["date"], dep_hm, arr_hm))
+                if cands:
+                    conv = [
+                        x for x in cands
+                        if parsers.is_conv_code(
+                            x["station_train_code"],
+                            is_emu=parsers.is_emu_style(style_map.get(x["train_no"])),
+                        )
+                    ]
+                    if conv:
+                        if fam:
+                            same_fam = [
+                                x for x in conv
+                                if parsers.train_class_family(
+                                    x["station_train_code"],
+                                    is_emu=parsers.is_emu_style(style_map.get(x["train_no"])),
+                                ) == fam
+                            ]
+                            if same_fam:
+                                return max(same_fam, key=lambda x: x["id"])
+                        return max(conv, key=lambda x: x["id"])
+            return None
 
         def build_out(maps, allow_missing_error: bool) -> dict:
             out = {}
@@ -1698,42 +1852,54 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
                     res["ticket_updated"] = ts.replace("T", " ")[:16]
                     live_code = r["station_train_code"] or ""
                     plan_code = l.get("train") or train_codes.get(l["train_no"], "")
-                    if live_code and plan_code and live_code != plan_code:
+                    if live_code and (not plan_code or live_code != plan_code):
                         res["live_train"] = live_code
+                    if r["train_no"] and r["train_no"] != l["train_no"]:
+                        res["live_train_no"] = r["train_no"]
                 elif allow_missing_error and pair in failed_pairs:
                     res["error"] = f"余票请求失败：{failed_pairs[pair]}"
                 elif allow_missing_error and pair in done_pairs:
                     res["error"] = "当日该区间余票查询中无此车次"
-                fno = l.get("fno") or (r["from_station_no"] if r else None) or sno.get((l["train_no"], l["from"]))
-                tno = l.get("tno") or (r["to_station_no"] if r else None) or sno.get((l["train_no"], l["to"]))
-                if fno and tno:
-                    fno_s, tno_s = str(fno).zfill(2), str(tno).zfill(2)
-                    pr = []
-                    for pno in dict.fromkeys([x for x in (r["train_no"] if r else None, l["train_no"]) if x]):
+
+                plan_fno = l.get("fno") or sno.get((l["train_no"], l["from"]))
+                plan_tno = l.get("tno") or sno.get((l["train_no"], l["to"]))
+                price_attempts = []
+                if r:
+                    rf = r.get("from_station_no") or plan_fno
+                    rt = r.get("to_station_no") or plan_tno
+                    if rf and rt:
+                        price_attempts.append((r["train_no"], str(rf).zfill(2), str(rt).zfill(2)))
+                if plan_fno and plan_tno:
+                    item = (l["train_no"], str(plan_fno).zfill(2), str(plan_tno).zfill(2))
+                    if item not in price_attempts:
+                        price_attempts.append(item)
+
+                pr = []
+                for pno, fno_s, tno_s in price_attempts:
+                    pr = db.rows("""SELECT seat_type,seat_name,price,train_date FROM prices
+                                    WHERE train_no=? AND from_station_no=? AND to_station_no=? AND train_date=?
+                                    ORDER BY price""",
+                                 (pno, fno_s, tno_s, l["date"]))
+                    if not pr:
                         pr = db.rows("""SELECT seat_type,seat_name,price,train_date FROM prices
-                                        WHERE train_no=? AND from_station_no=? AND to_station_no=? AND train_date=?
+                                        WHERE train_no=? AND from_station_no=? AND to_station_no=?
+                                        AND train_date=(SELECT MAX(train_date) FROM prices WHERE train_no=? AND from_station_no=? AND to_station_no=?)
                                         ORDER BY price""",
-                                     (pno, fno_s, tno_s, l["date"]))
-                        if not pr:
-                            pr = db.rows("""SELECT seat_type,seat_name,price,train_date FROM prices
-                                            WHERE train_no=? AND from_station_no=? AND to_station_no=?
-                                            AND train_date=(SELECT MAX(train_date) FROM prices WHERE train_no=? AND from_station_no=? AND to_station_no=?)
-                                            ORDER BY price""",
-                                         (pno, fno_s, tno_s, pno, fno_s, tno_s))
-                        if pr:
-                            break
+                                     (pno, fno_s, tno_s, pno, fno_s, tno_s))
                     if pr:
-                        res["prices"] = [{"seat_type": x["seat_type"], "seat": x["seat_name"], "price": x["price"]} for x in pr]
-                        if pr[0]["train_date"]:
-                            res["price_date"] = pr[0]["train_date"]
-                            if pr[0]["train_date"] != l["date"]:
-                                res["price_stale"] = True
+                        break
+                if pr:
+                    res["prices"] = [{"seat_type": x["seat_type"], "seat": x["seat_name"], "price": x["price"]} for x in pr]
+                    if pr[0]["train_date"]:
+                        res["price_date"] = pr[0]["train_date"]
+                        if pr[0]["train_date"] != l["date"]:
+                            res["price_stale"] = True
                 if res:
                     out[l["key"]] = res
             return out
 
         def load_tk(target_pairs):
-            tk_map, by_code = {}, {}
+            tk_map, by_code, by_sched = {}, {}, {}
             for f, t, d in target_pairs:
                 for r in db.rows("""SELECT t.*, r.fetched_at FROM tickets t
                                     LEFT JOIN raw_payloads r ON r.id=t.raw_id
@@ -1742,10 +1908,12 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
                     tk_map[(r["train_no"], f, t, d)] = r
                     if r["station_train_code"]:
                         train_codes.setdefault(r["train_no"], r["station_train_code"])
-                        dig = _train_digits(r["station_train_code"])
+                        dig = parsers.train_digits(r["station_train_code"])
                         if dig:
                             by_code.setdefault((dig, f, t, d), []).append(r)
-            return tk_map, by_code
+                    if r.get("start_time") and r.get("arrive_time"):
+                        by_sched.setdefault((f, t, d, r["start_time"], r["arrive_time"]), []).append(r)
+            return tk_map, by_code, by_sched
 
         _job_update(job_id, phase="tickets", total=len(pairs))
         for f, t, d in pairs:
@@ -1774,13 +1942,17 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
         need = {}
         for l in legs:
             r = find_tk(maps, l)
-            fno = (r["from_station_no"] if r else None) or sno.get((l["train_no"], l["from"]))
-            tno = (r["to_station_no"] if r else None) or sno.get((l["train_no"], l["to"]))
-            l["fno"], l["tno"] = fno, tno
+            if r:
+                fno = r["from_station_no"] or l.get("fno") or sno.get((l["train_no"], l["from"]))
+                tno = r["to_station_no"] or l.get("tno") or sno.get((l["train_no"], l["to"]))
+                pno = r["train_no"]
+            else:
+                fno = l.get("fno") or sno.get((l["train_no"], l["from"]))
+                tno = l.get("tno") or sno.get((l["train_no"], l["to"]))
+                pno = l["train_no"]
             if not fno or not tno or l["date"] < today:
                 continue
             fno, tno = str(fno).zfill(2), str(tno).zfill(2)
-            pno = r["train_no"] if r else l["train_no"]
             if db.rows("SELECT 1 FROM prices WHERE train_no=? AND from_station_no=? AND to_station_no=? AND train_date=? LIMIT 1",
                        (pno, fno, tno, l["date"])):
                 continue

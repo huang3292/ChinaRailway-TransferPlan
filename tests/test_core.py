@@ -2713,6 +2713,338 @@ class TestProvinceFilterAndTreeGrouping(TempDBTestCase):
         ):
             self.assertIn(marker, html_text, f"缺失省份过滤 UI 标记: {marker}")
 
+    def test_all_real_stations_province_coverage(self):
+        from app import china_geo, parsers
+
+        js_path = ROOT / "samples" / "station_name.js"
+        stations = parsers.parse_stations(js_path.read_text(encoding="utf-8"))
+        laos_cities = {"万象", "老挝万荣", "琅勃拉邦", "磨丁", "孟赛", "纳堆"}
+        for s in stations:
+            ct = (s.get("city") or "").strip()
+            if ct in laos_cities:
+                continue
+            pw = china_geo.infer_station_province(s["name"], ct)
+            pn = china_geo.infer_station_province(s["name"], "")
+            self.assertTrue(pw, f"station_name.js 归省失败(含city): {s['name']}/{ct}")
+            self.assertEqual(pw, pn, f"station_name.js 无city归省不一致: {s['name']} ({ct}->{pw} vs {pn})")
+
+        # 重点抽检曾落入 未识别省份 或前缀歧义的站点
+        for nm, ct, exp in (
+            ("武穴北", "武穴", "湖北"),
+            ("蕲春南", "蕲春", "湖北"),
+            ("浠水南", "浠水", "湖北"),
+            ("汉川北", "汉川", "湖北"),
+            ("仪征", "仪征", "江苏"),
+            ("芦溪", "芦溪", "江西"),
+            ("资溪", "资溪", "江西"),
+            ("来舟", "来舟", "福建"),
+            ("乌兰浩特", "兴安", "内蒙古"),
+            ("兴安", "桂林", "广西"),
+            ("海北", "绥化", "黑龙江"),
+            ("平湖", "深圳", "广东"),
+            ("汉口", "", "湖北"),
+            ("桃村", "", "山东"),
+        ):
+            self.assertEqual(china_geo.infer_station_province(nm, ct), exp)
+
+    def test_unknown_province_sorts_last_and_prunable(self):
+        import time
+        from app import main as main_mod
+
+        self._seed_corridor_provinces()
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("P3_UK1F", "G8015", "2026-11-25", 1, "厦门", "XMN", "----", "07:30"),
+                    ("P3_UK1F", "G8015", "2026-11-25", 2, "神秘小站", "UNK", "08:30", "08:30"),
+                    ("P3_UK2", "G8016", "2026-11-25", 1, "神秘小站", "UNK", "----", "09:10"),
+                    ("P3_UK2", "G8016", "2026-11-25", 2, "济南西", "JND", "13:10", "13:10"),
+                ],
+            )
+        main_mod.jobs.clear()
+        main_mod._job_cancels.clear()
+        main_mod._job_trees.clear()
+
+        req = main_mod.TransferSearchReq(
+            from_station="厦门", to_station="威海", date="2026-11-25",
+            min_wait=30, max_wait=120, max_legs=3, expand_city=False, allow_cross_station=False,
+            tree_prune_mode="step",
+        )
+        jid = main_mod.start_transfers(req)["job_id"]
+        st = None
+        for _ in range(80):
+            st = main_mod.job_status(jid)
+            if st.get("tree_paused"):
+                break
+            time.sleep(0.05)
+        self.assertTrue(st and st.get("tree_paused"))
+        snap = st["tree_snapshot"]
+        prov_labels = [n["label"] for n in snap.get("provinces", [])]
+        self.assertIn("未识别省份", prov_labels)
+        self.assertEqual(prov_labels[-1], "未识别省份")
+        sum_provs = [x["province"] for x in snap.get("province_summary", [])]
+        self.assertEqual(sum_provs[-1], "未识别省份")
+
+        pr = main_mod.prune_job_tree(jid, main_mod.TreePruneReq(prune_provinces=["未识别省份"], action="prune"))
+        self.assertNotIn("未识别省份", [n["label"] for n in pr["tree_snapshot"].get("provinces", [])])
+        main_mod.prune_job_tree(jid, main_mod.TreePruneReq(action="continue_all"))
+        for _ in range(80):
+            st = main_mod.job_status(jid)
+            if st["status"] != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(st["status"], "done")
+        chains = {tuple(l["train"] for l in p["legs"]) for p in st["result"]["transfers"]}
+        self.assertNotIn(("G8015", "G8016", "G8014"), chains)
+        self.assertIn(("G8003", "G8013", "G8014"), chains)
+
+
+class TestZnvZtkCompat(TempDBTestCase):
+    def test_parsers_znv_ztk_conversion_and_emu_guard(self):
+        # 普速 T↔N, K/纯数字↔V, Z↔Z 及复合斜杠车次
+        self.assertEqual(parsers.convert_train_code("K8278/K8275", "znv"), "V8278/V8275")
+        self.assertEqual(parsers.convert_train_code("V8278/V8275", "ztk"), "K8278/K8275")
+        self.assertEqual(parsers.convert_train_code("T181", "znv"), "N181")
+        self.assertEqual(parsers.convert_train_code("N181", "ztk"), "T181")
+        self.assertEqual(parsers.convert_train_code("Z104", "znv"), "Z104")
+        self.assertEqual(parsers.convert_train_code("6061", "znv"), "V6061")
+        self.assertEqual(parsers.convert_train_code("6061", "ztk"), "6061")
+
+        # 未来高速动车组 T/K（CR400/CRH/ZL 车底）不与普速 N/V 互通
+        self.assertTrue(parsers.is_emu_style("CR400BF-Z_重联"))
+        self.assertFalse(parsers.is_emu_style("25G"))
+        self.assertEqual(parsers.convert_train_code("T10", "znv", is_emu=True), "T10")
+        self.assertEqual(parsers.train_code_variants("T10", is_emu=True), frozenset({"T10"}))
+        self.assertEqual(parsers.train_code_variants("K411", is_emu=False), frozenset({"K411", "V411"}))
+
+        # 大类分族防 K10 串车 G10
+        self.assertEqual(parsers.train_class_family("K10"), "KV")
+        self.assertEqual(parsers.train_class_family("V10"), "KV")
+        self.assertEqual(parsers.train_class_family("6061"), "KV")
+        self.assertEqual(parsers.train_class_family("G10"), "G")
+        self.assertEqual(parsers.train_class_family("T10", is_emu=True), "T")
+        self.assertEqual(parsers.train_class_family("N10"), "TN")
+
+    def test_fare_estimate_and_calibration_across_nv_and_emu(self):
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO station_trains(station_telecode,station_name,station_train_code,train_no,station_train_date,station_no,distance) VALUES(?,?,?,?,?,?,?)",
+                [
+                    ("JNK", "济南", "K411", "K411_TN", "2026-11-24", 1, 0),
+                    ("QDK", "青岛", "K411", "K411_TN", "2026-11-24", 2, 300),
+                    ("JNK", "济南", "T100", "T100_TN", "2026-11-24", 1, 0),
+                    ("QDK", "青岛", "T100", "T100_TN", "2026-11-24", 2, 300),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO prices(train_no,train_date,from_station_no,to_station_no,seat_type,seat_name,price) VALUES(?,?,?,?,?,?,?)",
+                [
+                    ("K411_TN", "2026-11-24", "01", "02", "yz", "硬座", 80.0),
+                    ("T100_TN", "2026-11-24", "01", "02", "yz", "硬座", 90.0),
+                ],
+            )
+        self.assertEqual(fare.class_of("V411"), "K")
+        self.assertEqual(fare.class_of("N100"), "T")
+        self.assertEqual(fare.class_of("T10", style="CR400BF-Z"), "G")
+        self.assertEqual(fare.class_of("K20", style="CRH380A"), "D")
+
+        cal = fare.load_calibration()
+        self.assertIn(("K", "yz"), cal)
+        self.assertIn(("T", "yz"), cal)
+        est_v = fare.estimate("V411", km=300, cal=cal)
+        est_k = fare.estimate("K411", km=300, cal=cal)
+        self.assertIsNotNone(est_v)
+        self.assertIn("已用实际票价校准", est_v["basis"])
+        self.assertEqual(est_v["seats"]["yz"]["min"], est_k["seats"]["yz"]["min"])
+
+        est_n = fare.estimate("N100", duration_min=240, cal=cal)
+        self.assertIn("yz", est_n["seats"])
+        self.assertIn("已用实际票价校准", est_n["basis"])
+
+        # 动车组底 T/K 按 G/D 估算席别，而非硬座
+        est_emu_t = fare.estimate("T10", duration_min=120, cal=cal, style="CR400BF-Z")
+        self.assertIn("ze", est_emu_t["seats"])
+        self.assertNotIn("yz", est_emu_t["seats"])
+
+    def _seed_k8278_to_v4278_scenario(self):
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO stations(telecode,name,city,pinyin,short) VALUES(?,?,?,?,?)",
+                [
+                    ("XKS", "厦门北", "厦门", "xiamenbei", "xmb"),
+                    ("UCK", "聊城", "聊城", "liaocheng", "lc"),
+                    ("JAK", "大明湖", "济南", "daminghu", "dmh"),
+                    ("WKK", "威海", "威海", "weihai", "wh"),
+                ],
+            )
+            # 改号前本地图谱时刻表：Z104 -> K8278(47000K827850) -> K411(240000K41102)
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("5n0000Z1040F", "Z104", "2026-11-24", 1, "厦门北", "XKS", "----", "06:45"),
+                    ("5n0000Z1040F", "Z104", "2026-11-24", 8, "聊城", "UCK", "23:36", "23:42"),
+                    ("47000K827850", "K8278", "2026-11-24", 2, "聊城", "UCK", "23:58", "00:06"),
+                    ("47000K827850", "K8278", "2026-11-24", 3, "大明湖", "JAK", "01:53", "02:01"),
+                    ("240000K41102", "K411", "2026-11-24", 5, "大明湖", "JAK", "06:06", "06:14"),
+                    ("240000K41102", "K411", "2026-11-24", 11, "威海", "WKK", "14:25", "----"),
+                ],
+            )
+            # 改号后 12306 实时余票（V4278 train_no=47000V427810，数字 8278->4278；V411 train_no=240000V41100，站序 04->10）
+            conn.executemany(
+                """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
+                                       from_station_no,to_station_no,start_time,arrive_time,duration,can_web_buy,seats,seat_types)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?, ?,?)""",
+                [
+                    ("5n0000Z1040F", "Z104", "2026-11-26", "XKS", "UCK", "01", "08", "06:45", "23:36", "16:51", "Y",
+                     json.dumps({"yz": "候补", "rw": "有", "yw": "有", "wz": "有"}), "134"),
+                    ("47000V427810", "V4278", "2026-11-27", "UCK", "JAK", "02", "03", "00:06", "01:53", "01:47", "Y",
+                     json.dumps({"yz": "有", "yw": "有", "rw": "5", "wz": "有"}), "134"),
+                    ("240000V41100", "V411", "2026-11-27", "JAK", "WKK", "04", "10", "06:14", "14:25", "08:11", "Y",
+                     json.dumps({"yz": "有", "rw": "6", "yw": "有", "wz": "候补"}), "134"),
+                    # 同区间干扰动车 G4278（同数字不同大类）不应被 K8278 匹配
+                    ("24000G427800", "G4278", "2026-11-27", "UCK", "JAK", "02", "03", "00:06", "01:53", "01:47", "Y",
+                     json.dumps({"ze": "有"}), "OM"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO prices(train_no,train_date,from_station_no,to_station_no,seat_type,seat_name,price) VALUES(?,?,?,?,?,?,?)",
+                [
+                    ("5n0000Z1040F", "2026-11-26", "01", "08", "yz", "硬座", 206.0),
+                    ("47000V427810", "2026-11-27", "02", "03", "yz", "硬座", 19.5),
+                    ("240000V41100", "2026-11-27", "04", "10", "yz", "硬座", 81.0),
+                ],
+            )
+
+    def test_transfer_search_and_plan_tickets_resolve_k8278_to_v4278(self):
+        from app import main as main_mod
+
+        self._seed_k8278_to_v4278_scenario()
+        transfer.invalidate_cache()
+        res = transfer.search(
+            "厦门北", "威海", "2026-11-26",
+            min_wait=20, max_wait=360, max_legs=3,
+            expand_city=False, allow_cross_station=False,
+        )
+        chains = {tuple(l["train"] for l in p["legs"]): p for p in res["transfers"]}
+        self.assertIn(("Z104", "K8278", "K411"), chains)
+        plan = chains[("Z104", "K8278", "K411")]
+        self.assertFalse(plan.get("date_assumed"))
+        leg2, leg3 = plan["legs"][1], plan["legs"][2]
+        self.assertEqual(leg2.get("live_train"), "V4278")
+        self.assertEqual(leg2.get("live_train_no"), "47000V427810")
+        self.assertEqual(leg2["seats"]["yz"], "有")
+        self.assertEqual(leg2["prices"][0]["price"], 19.5)
+        self.assertEqual(leg3.get("live_train"), "V411")
+        self.assertEqual(leg3.get("live_train_no"), "240000V41100")
+        self.assertEqual(leg3["prices"][0]["price"], 81.0)
+
+        # 前缀过滤跨新旧号生效：筛选 V 或 K 都能保留 Z/K/V 组合，而剔除 V 不会误杀动车组 T/K
+        kept_v = transfer.filter_plans([plan], allow_prefixes="Z,V")
+        self.assertEqual(len(kept_v), 1)
+        kept_k = transfer.filter_plans([plan], allow_prefixes="Z,K")
+        self.assertEqual(len(kept_k), 1)
+        emu_plan = {"legs": [{"train": "T10", "train_style": "CR400BF-Z"}], "transfers": []}
+        self.assertEqual(len(transfer.filter_plans([emu_plan], exclude_prefixes="N")), 1)
+        self.assertEqual(len(transfer.filter_plans([emu_plan], allow_prefixes="N")), 0)
+
+        # _plan_tickets_job: 即便外围传入 K8278 (47000K827850) + K411 (240000K41102)，也能实时命中 V4278 / V411 与不同站序的新票价
+        main_mod.jobs.clear()
+        main_mod._job_cancels.clear()
+        req = main_mod.PlanTicketsReq(legs=[
+            main_mod.PlanLeg(train_no="47000K827850", train="K8278", date="2026-11-27",
+                             from_telecode="UCK", to_telecode="JAK", from_name="聊城", to_name="大明湖",
+                             depart="2026-11-27 00:06", arrive="2026-11-27 01:53",
+                             from_station_no="02", to_station_no="03"),
+            main_mod.PlanLeg(train_no="240000K41102", train="K411", date="2026-11-27",
+                             from_telecode="JAK", to_telecode="WKK", from_name="大明湖", to_name="威海",
+                             depart="2026-11-27 06:14", arrive="2026-11-27 14:25",
+                             from_station_no="05", to_station_no="11"),
+        ])
+        with mock.patch("app.main.crawler.crawl_tickets") as m_ct, mock.patch("app.main.crawler.crawl_price") as m_cp:
+            jid = main_mod.plan_tickets(req)["job_id"]
+            import time
+            st = None
+            for _ in range(80):
+                st = main_mod.job_status(jid)
+                if st["status"] != "running":
+                    break
+                time.sleep(0.05)
+        self.assertEqual(st["status"], "done")
+        r_map = st["result"]
+        k2 = "47000K827850|UCK|JAK|2026-11-27"
+        k3 = "240000K41102|JAK|WKK|2026-11-27"
+        self.assertEqual(r_map[k2]["live_train"], "V4278")
+        self.assertEqual(r_map[k2]["live_train_no"], "47000V427810")
+        self.assertEqual(r_map[k2]["seats"]["yz"], "有")
+        self.assertEqual(r_map[k2]["prices"][0]["price"], 19.5)
+        self.assertEqual(r_map[k3]["live_train"], "V411")
+        self.assertEqual(r_map[k3]["prices"][0]["price"], 81.0)
+        self.assertEqual(m_ct.call_count, 2)
+        m_cp.assert_not_called()
+
+    def test_trains_search_timetable_compat_and_ui_mode_markers(self):
+        from app import main as main_mod
+
+        self._seed_k8278_to_v4278_scenario()
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("47000V427810", "V4278", "2026-11-27", 2, "聊城", "UCK", "23:58", "00:06"),
+                    ("47000V427810", "V4278", "2026-11-27", 3, "大明湖", "JAK", "01:53", "02:01"),
+                    ("240000V41100", "V411", "2026-11-27", 4, "大明湖", "JAK", "06:06", "06:14"),
+                    ("240000V41100", "V411", "2026-11-27", 10, "威海", "WKK", "14:25", "----"),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO station_trains(station_telecode,station_name,station_train_code,train_no,station_train_date,start_station_telecode,end_station_telecode,start_train_date,station_no,arrive_time,start_time) VALUES('UCK','聊城','K8278','47000K827850','2026-11-24','LCK','QDK','2026-11-24',2,'23:58','00:06')"
+            )
+
+        # /api/trains 搜旧车次 K411 应同时命中共存的 V411；搜单字母 V 也能命中 K 系列
+        hit_k = {r["station_train_code"] for r in main_mod.trains(q="K411")}
+        self.assertEqual(hit_k, {"K411", "V411"})
+        hit_v = {r["station_train_code"] for r in main_mod.trains(q="V")}
+        self.assertIn("K411", hit_v)
+
+        # /api/timetable 优先回落 live_train_no
+        tt = main_mod.timetable(train_no="99999K827800", live_train_no="47000V427810")
+        self.assertEqual(tt["train_no"], "47000V427810")
+        self.assertEqual(tt["station_train_code"], "V4278")
+
+        # _crawl_timetable_compat：live_train_no 先试失败时，旧号 >=2026-11-25 返空会回退到 2026-11-24
+        calls = []
+        def fake_crawl_tt(tn, d, f, t):
+            calls.append((tn, d, f, t))
+            if tn == "47000V427810":
+                raise main_mod.CrawlError("接口返回停站为空")
+            if tn == "47000K827850" and d >= "2026-11-25":
+                raise main_mod.CrawlError("接口返回停站为空")
+            return {"parsed": 2}
+
+        with mock.patch("app.main.crawler.crawl_timetable", side_effect=fake_crawl_tt):
+            res_tt = main_mod._crawl_timetable_compat(
+                "47000K827850", live_train_no="47000V427810",
+                date="2026-11-27", from_telecode="UCK", to_telecode="JAK",
+            )
+        self.assertEqual(res_tt, {"parsed": 2})
+        self.assertEqual(
+            calls,
+            [
+                ("47000V427810", "2026-11-27", "UCK", "JAK"),
+                ("47000K827850", "2026-11-27", "UCK", "JAK"),
+                ("47000K827850", "2026-11-24", "UCK", "JAK"),
+            ],
+        )
+
+        # 前端 ZNV / ZTK 切换按钮与函数标记检查
+        html_text = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        for marker in (
+            "setTrainCodeMode('znv')", "setTrainCodeMode('ztk')", 'id="d-code-mode"',
+            'setTrainCodeMode', 'displayTrainCode', 'legAliasNote', 'convertTrainCode',
+        ):
+            self.assertIn(marker, html_text, f"缺失 ZNV/ZTK 前端标记: {marker}")
+
 
 if __name__ == "__main__":
     unittest.main()
