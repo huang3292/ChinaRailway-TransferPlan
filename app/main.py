@@ -271,6 +271,26 @@ def _train_code_map(train_nos: set[str] | list[str]) -> dict[str, str]:
     return out
 
 
+def _train_style_map(train_nos: set[str] | list[str]) -> dict[str, str]:
+    """查询 train_no -> 车底车型（与 transfer._style_map 同源，供前端识别 CRH/CR/ZL 动车组避免 T/K 误转 N/V）。"""
+    tns = [x for x in set(train_nos) if x]
+    if not tns:
+        return {}
+    out = {}
+    ph = ",".join("?" * len(tns))
+    for r in db.rows(
+        f"""SELECT train_no, COALESCE(NULLIF(train_style, ''), NULLIF(jiaolu_train_style, '')) AS style
+            FROM station_trains
+            WHERE train_no IN ({ph})
+              AND (COALESCE(train_style, '') <> '' OR COALESCE(jiaolu_train_style, '') <> '')
+            ORDER BY query_date DESC, id DESC""",
+        tuple(tns),
+    ):
+        if r.get("style"):
+            out.setdefault(r["train_no"], r["style"])
+    return out
+
+
 def _validate_date(d: str) -> str:
     """校验日期字符串为合法的 YYYY-MM-DD 格式。"""
     if not isinstance(d, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
@@ -589,18 +609,33 @@ def crawl_tickets(body: TicketReq):
 def _price_job(job_id, ev: threading.Event, f_tc, t_tc, date):
     crawler.set_cancel_event(ev)
     try:
-        tk = db.rows("""SELECT train_no,station_train_code,from_station_no,to_station_no,seat_types FROM tickets
-                        WHERE from_telecode=? AND to_telecode=? AND train_date=?""", (f_tc, t_tc, date))
-        _job_update(job_id, total=len(tk))
-        for r in tk:
+        tk_rows = db.rows("""SELECT train_no,station_train_code,from_station_no,to_station_no,seat_types FROM tickets
+                             WHERE from_telecode=? AND to_telecode=? AND train_date=?""", (f_tc, t_tc, date))
+        have_prices = {
+            (r["train_no"], str(r["from_station_no"] or "").zfill(2), str(r["to_station_no"] or "").zfill(2))
+            for r in db.rows("SELECT train_no,from_station_no,to_station_no FROM prices WHERE train_date=?", (date,))
+        }
+        need = []
+        seen_keys = set()
+        for r in tk_rows:
+            fno = str(r.get("from_station_no") or "").strip()
+            tno = str(r.get("to_station_no") or "").strip()
+            if not r.get("train_no") or not fno or not tno:
+                continue
+            key = (r["train_no"], fno.zfill(2), tno.zfill(2))
+            if key in have_prices or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            need.append((r, key[1], key[2]))
+        _job_update(job_id, total=len(need))
+        for r, fno_s, tno_s in need:
             if ev.is_set():
                 _job_update(job_id, status="cancelled")
                 return
             t_label = _fmt_train(r["station_train_code"], r["train_no"])
             _job_update(job_id, current=f"票价 {t_label}")
             try:
-                crawler.crawl_price(r["train_no"], r["from_station_no"], r["to_station_no"],
-                                    r["seat_types"] or "", date)
+                crawler.crawl_price(r["train_no"], fno_s, tno_s, r["seat_types"] or "", date)
             except CrawlCancelled:
                 _job_update(job_id, status="cancelled")
                 return
@@ -916,6 +951,7 @@ def station_trains(station: str, date: str | None = None):
 def timetable(train_no: str, live_train_no: str | None = None):
     n2c = db.station_lookup()
     cand_nos = [x for x in dict.fromkeys([live_train_no, train_no]) if x]
+    styles = _train_style_map(cand_nos)
     for tn in cand_nos:
         r = db.rows("SELECT DISTINCT train_date FROM train_stops WHERE train_no=? ORDER BY train_date DESC LIMIT 1",
                     (tn,))
@@ -929,6 +965,7 @@ def timetable(train_no: str, live_train_no: str | None = None):
             if not code:
                 code = _train_code_map([tn]).get(tn)
             return {"train_no": tn, "station_train_code": code,
+                    "train_style": styles.get(tn) or styles.get(train_no) or "",
                     "stops": stops, "complete": True, "source": "train_stops"}
     # 退回车站大屏：把已抓取各站的经停拼成（可能不完整的）时刻表
     for tn in cand_nos:
@@ -948,6 +985,7 @@ def timetable(train_no: str, live_train_no: str | None = None):
                           "stopover_time": s["stopover_time"], "enabled": 1})
         if stops:
             return {"train_no": tn, "station_train_code": code,
+                    "train_style": styles.get(tn) or styles.get(train_no) or "",
                     "stops": stops, "complete": False, "source": "station_screen"}
     raise HTTPException(404, f"车次({train_no})暂无时刻表数据")
 
@@ -956,28 +994,35 @@ def timetable(train_no: str, live_train_no: str | None = None):
 def trains(q: str = "", limit: int = 50):
     qs = (q or "").strip()
     if not qs:
-        return db.rows("""SELECT train_no, station_train_code, MAX(train_date) train_date,
+        rows = db.rows("""SELECT train_no, station_train_code, MAX(train_date) train_date,
                                  COUNT(*) stop_count FROM train_stops
                           GROUP BY train_no LIMIT ?""", (limit,))
-    up = qs.upper()
-    clauses = ["station_train_code LIKE ?", "train_no LIKE ?"]
-    params: list = [f"%{qs}%", f"%{qs}%"]
-    if up in ("K", "V", "T", "N"):
-        alt = {"K": "V", "V": "K", "T": "N", "N": "T"}[up]
-        clauses.append("station_train_code LIKE ?")
-        params.append(f"{alt}%")
     else:
-        for mode in ("znv", "ztk"):
-            conv = parsers.convert_train_code(up, mode)
-            if conv and conv != up:
-                clauses.append("station_train_code LIKE ?")
-                params.append(f"%{conv}%")
-    params.append(limit)
-    where = " OR ".join(clauses)
-    return db.rows(f"""SELECT train_no, station_train_code, MAX(train_date) train_date,
-                              COUNT(*) stop_count FROM train_stops
-                       WHERE {where}
-                       GROUP BY train_no LIMIT ?""", tuple(params))
+        up = qs.upper()
+        clauses = ["station_train_code LIKE ?", "train_no LIKE ?"]
+        params: list = [f"%{qs}%", f"%{qs}%"]
+        if up in ("K", "V", "T", "N"):
+            alt = {"K": "V", "V": "K", "T": "N", "N": "T"}[up]
+            clauses.append("station_train_code LIKE ?")
+            params.append(f"{alt}%")
+        else:
+            for mode in ("znv", "ztk"):
+                conv = parsers.convert_train_code(up, mode)
+                if conv and conv != up:
+                    clauses.append("station_train_code LIKE ?")
+                    params.append(f"%{conv}%")
+        params.append(limit)
+        where = " OR ".join(clauses)
+        rows = db.rows(f"""SELECT train_no, station_train_code, MAX(train_date) train_date,
+                                  COUNT(*) stop_count FROM train_stops
+                           WHERE {where}
+                           GROUP BY train_no LIMIT ?""", tuple(params))
+    styles = _train_style_map([r.get("train_no") for r in rows if r.get("train_no")])
+    for r in rows:
+        st = styles.get(r.get("train_no"))
+        if st:
+            r["train_style"] = st
+    return rows
 
 
 @app.get("/api/tickets")
@@ -992,6 +1037,7 @@ def tickets(from_station: str, to_station: str, date: str):
     if not tk_rows:
         return tk_rows
     tns = list({r["train_no"] for r in tk_rows if r.get("train_no")})
+    styles = _train_style_map(tns)
     price_buckets: dict[tuple[str, str, str], dict[str, list[dict]]] = {}
     if tns:
         ph = ",".join("?" * len(tns))
@@ -1013,6 +1059,9 @@ def tickets(from_station: str, to_station: str, date: str):
     for r in tk_rows:
         r["from_name"] = f["name"]
         r["to_name"] = t["name"]
+        st = styles.get(r.get("train_no"))
+        if st:
+            r["train_style"] = st
         fno_s = str(r.get("from_station_no") or "").zfill(2)
         tno_s = str(r.get("to_station_no") or "").zfill(2)
         by_date = price_buckets.get((r["train_no"], fno_s, tno_s), {})
@@ -1256,6 +1305,18 @@ def prune_job_tree(job_id: str, body: TreePruneReq):
     )
 
 
+def _effective_max_legs(max_legs: int, include_stations: str = "", include_stations_mode: str = "or") -> int:
+    """与 transfer.search 同步：必经 AND 站数超限时自动升程（上限 5），避免 total_steps 与分支树控制器失步。"""
+    inc_mode = "and" if str(include_stations_mode or "or").strip().lower() == "and" else "or"
+    if inc_mode == "and" and include_stations:
+        inc_st = transfer._parse_tokens(include_stations)
+        if inc_st and len(inc_st) > max_legs - 1:
+            need = len(inc_st) + 1
+            if need <= 5:
+                return need
+    return max_legs
+
+
 def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchReq):
     def on_prog(done: int, total: int, cur: str):
         _job_update(job_id, done=done, total=total, sub_done=0, sub_total=0, current=cur)
@@ -1264,8 +1325,9 @@ def _transfer_search_job(job_id: str, ev: threading.Event, body: TransferSearchR
         _job_update(job_id, sub_done=s_done, sub_total=s_total, current=cur)
 
     tree_mode = (body.tree_prune_mode or "off").strip().lower()
+    eff_legs = _effective_max_legs(body.max_legs, body.include_stations, body.include_stations_mode)
     ctrl = None
-    if tree_mode in ("live", "step") and body.max_legs >= 3:
+    if tree_mode in ("live", "step") and eff_legs >= 3:
         ctrl = transfer.TreePruneController(pause_after_layer=(tree_mode == "step"))
         with _jobs_lock:
             if job_id in jobs:
@@ -1351,7 +1413,8 @@ def start_transfers(body: TransferSearchReq):
         missing = body.from_station if not fstations else body.to_station
         miss_mode = f_mode if not fstations else t_mode
         raise HTTPException(400, db.station_resolve_error(missing, miss_mode))
-    total_steps = 6 if body.max_legs < 3 else 5 + (body.max_legs - 1)
+    eff_legs = _effective_max_legs(body.max_legs, body.include_stations, body.include_stations_mode)
+    total_steps = 6 if eff_legs < 3 else 5 + (eff_legs - 1)
     job_id, ev = _create_job({
         "status": "running", "phase": "search", "done": 0, "total": total_steps,
         "sub_done": 0, "sub_total": 0,

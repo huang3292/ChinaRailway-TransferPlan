@@ -234,7 +234,7 @@ def collect_timetable_targets(
             for r in db.rows("SELECT DISTINCT train_no FROM train_stops WHERE train_no IS NOT NULL")
         }
 
-    rank_map = {"G": 0, "C": 0, "D": 0, "Z": 1, "T": 1, "K": 1, "S": 3}
+    rank_map = {"G": 0, "C": 0, "D": 0, "X": 0, "Z": 1, "T": 1, "N": 1, "K": 1, "V": 1, "S": 3}
     items = [r for r in rows if r["train_no"] not in existing_tt]
     items.sort(key=lambda r: (
         rank_map.get(((r.get("code") or "")[:1]).upper(), 2),

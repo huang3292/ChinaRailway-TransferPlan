@@ -576,12 +576,24 @@ def _leg_min_price(leg: dict) -> float | None:
     """获取单程最低参考票价（实测票价优先，否则取估算区间下限）。"""
     prices = leg.get("prices")
     if prices:
-        vals = [float(x["price"]) for x in prices if x.get("price") is not None]
+        vals = []
+        for x in prices:
+            v = x.get("price")
+            if v is not None:
+                fv = float(v)
+                if fv > 0:
+                    vals.append(fv)
         if vals:
             return min(vals)
     est = leg.get("price_est")
     if est and isinstance(est.get("seats"), dict):
-        vals = [float(x["min"]) for x in est["seats"].values() if x.get("min") is not None]
+        vals = []
+        for x in est["seats"].values():
+            v = x.get("min")
+            if v is not None:
+                fv = float(v)
+                if fv > 0:
+                    vals.append(fv)
         if vals:
             return min(vals)
     return None
@@ -598,11 +610,13 @@ def _legs_cost(legs: list[dict]) -> tuple[float | None, bool]:
     return (total, True)
 
 
-def _train_tier(legs: list[dict]) -> int:
+def _train_tier(legs: list[dict], style_map: dict | None = None) -> int:
     """缺价时按车型做保守分级：普速/混搭(0) < 动车(1) < 高铁/城际(2)。"""
     best = 0
+    smap = style_map if style_map is not None else _style_map()
     for leg in legs:
-        codes = _train_codes(leg.get("train"))
+        st = leg.get("train_style") or (smap.get(leg["train_no"]) if leg.get("train_no") else "")
+        codes = _train_codes(leg.get("train"), is_emu=parsers.is_emu_style(st))
         if not codes:
             continue
         tier = 2 if any(c[0] in ("G", "C", "X") for c in codes) else (1 if any(c[0] == "D" for c in codes) else 0)
@@ -673,7 +687,7 @@ def _raw_leg_cost(train_no: str, code: str | None, fno, tno, ftc, ttc, dur_min: 
     if fno is not None and tno is not None:
         p = prices.get((train_no, str(fno).zfill(2), str(tno).zfill(2)))
         if p and p.get("items"):
-            vals = [float(x["price"]) for x in p["items"] if x.get("price") is not None]
+            vals = [float(x["price"]) for x in p["items"] if x.get("price") is not None and float(x["price"]) > 0]
             if vals:
                 return min(vals)
     if code and dur_min and dur_min > 0:
@@ -684,7 +698,7 @@ def _raw_leg_cost(train_no: str, code: str | None, fno, tno, ftc, ttc, dur_min: 
         est = fare.estimate(code, duration_min=dur_min, cal=cal, style=st)
         res = None
         if est and isinstance(est.get("seats"), dict):
-            vals = [float(x["min"]) for x in est["seats"].values() if x.get("min") is not None]
+            vals = [float(x["min"]) for x in est["seats"].values() if x.get("min") is not None and float(x["min"]) > 0]
             if vals:
                 res = min(vals)
         if cache is not None:
@@ -785,18 +799,28 @@ def _parse_province_tokens(val) -> set[str]:
 
 def _build_prov_map(cities: tuple, geo_index=None) -> dict[str, str]:
     city_of, _, tele_of = cities
-    lat_of = getattr(geo_index, "lat_of", {}) if geo_index is not None else {}
-    lon_of = getattr(geo_index, "lon_of", {}) if geo_index is not None else {}
+    # WHY: StationGeoIndex 将经纬度保存在 coords/all_coords -> (lat, lon)，此前读取不存在的 lat_of/lon_of 导致坐标边界回退失效。
+    coords = getattr(geo_index, "coords", {}) if geo_index is not None else {}
+    all_coords = getattr(geo_index, "all_coords", {}) if geo_index is not None else {}
+
+    def _coord(k: str | None) -> tuple[float | None, float | None]:
+        if not k:
+            return (None, None)
+        pt = coords.get(k) or all_coords.get(k)
+        return (pt[0], pt[1]) if pt else (None, None)
+
     out: dict[str, str] = {}
     for nm, tc in tele_of.items():
         ct = city_of.get(tc) or city_of.get(nm) or ""
-        p = china_geo.infer_station_province(nm, ct, lat_of.get(tc), lon_of.get(tc))
+        lat, lon = _coord(tc)
+        p = china_geo.infer_station_province(nm, ct, lat, lon)
         if p:
             out[tc] = p
             out[nm] = p
     for key, ct in city_of.items():
         if key not in out and ct:
-            p = china_geo.infer_station_province(key, ct, lat_of.get(key), lon_of.get(key))
+            lat, lon = _coord(key)
+            p = china_geo.infer_station_province(key, ct, lat, lon)
             if p:
                 out[key] = p
     return out
@@ -824,7 +848,7 @@ def _station_province(
 
 
 def _prov_allowed(prov: str, allow_provs: set[str], exc_provs: set[str], block_unknown: bool = False) -> bool:
-    if not allow_provs and not exc_provs:
+    if not allow_provs and not exc_provs and not block_unknown:
         return True
     if not prov:
         return not block_unknown
@@ -857,8 +881,9 @@ def filter_plans(
     exc_st = _parse_tokens(exclude_stations) if not isinstance(exclude_stations, (list, tuple)) else [str(x).strip().upper() for x in exclude_stations if str(x).strip()]
     allow_provs = _parse_province_tokens(allow_provinces)
     exc_provs = _parse_province_tokens(exclude_provinces)
+    prov_active = bool(allow_provs or exc_provs or block_unknown_prov)
     inc_mode = "and" if str(include_stations_mode or "or").strip().lower() == "and" else "or"
-    if not inc_pfx and not exc_pfx and not inc_st and not exc_st and allow_cross_station and not allow_provs and not exc_provs:
+    if not inc_pfx and not exc_pfx and not inc_st and not exc_st and allow_cross_station and not prov_active:
         return list(plans)
 
     if cities is None:
@@ -871,8 +896,11 @@ def filter_plans(
     else:
         city_of, _, tele_of = cities
 
+    smap = _style_map() if (inc_pfx or exc_pfx) else {}
+
     def _leg_pfx_ok(l: dict) -> bool:
-        emu = parsers.is_emu_style(l.get("train_style"))
+        st = l.get("train_style") or (smap.get(l["train_no"]) if l.get("train_no") else "")
+        emu = parsers.is_emu_style(st)
         c_raw = l.get("train")
         c_live = l.get("live_train") or l.get("ticket_live")
         if inc_pfx and not (_match_prefix(c_raw, inc_pfx, is_emu=emu) or (c_live and _match_prefix(c_live, inc_pfx, is_emu=emu))):
@@ -902,12 +930,12 @@ def filter_plans(
                 sk_key = tr.get("telecode") or sk_name
                 if idx + 1 < len(legs):
                     nl = legs[idx + 1]
-                    dk_name = nl.get("from")
-                    dk_key = nl.get("from_telecode") or dk_name
+                    dk_name = nl.get("from") or tr.get("to_station") or sk_name
+                    dk_key = nl.get("from_telecode") or nl.get("from") or tr.get("to_telecode") or tr.get("to_station") or sk_key
                 else:
                     dk_name, dk_key = sk_name, sk_key
                 pairs.append((sk_key, sk_name, dk_key, dk_name))
-            if (allow_provs or exc_provs) and any(
+            if prov_active and any(
                 not _prov_allowed(_station_province(sk, sk_n, city_of, prov_of), allow_provs, exc_provs, block_unknown=block_unknown_prov)
                 or (dk != sk and not _prov_allowed(_station_province(dk, dk_n, city_of, prov_of), allow_provs, exc_provs, block_unknown=block_unknown_prov))
                 for sk, sk_n, dk, dk_n in pairs
@@ -971,6 +999,7 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
     if cross_cfg is None:
         cross_cfg = geo.resolve_cross_cfg(cross_extra=cross_extra, geo_index=geo_index)
 
+    style_map = _style_map()
     by_station = {}
     for tn, t in trains.items():
         for k in t["obs"]:
@@ -1036,9 +1065,10 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
                     if phys not in seen_phys:
                         seen_phys.add(phys)
                         fo_cands.append((o, day_min - (o["dep"] // 1440) * 1440))
+        a_emu = parsers.is_emu_style(style_map.get(tn[0]))
         for fo, shift in fo_cands:
             a_code = fo.get("code") or t["code"]
-            a_codes = _train_codes(a_code)
+            a_codes = _train_codes(a_code, is_emu=a_emu)
             a_dep = fo["dep"] + shift
             assumed = (shift != 0) or bool(fo.get("bridged"))
             for _k, to in to_obs.get(tn, ()):
@@ -1105,7 +1135,8 @@ def _search_screen(trains, fkeys, tkeys, day_min, query_date, min_wait, max_wait
                         if not bs or "dep" not in bs:
                             continue
                         b_code = bs.get("code") or b["code"]
-                        if bn[0] == tn[0] or (a_codes and (a_codes & _train_codes(b_code))):
+                        b_emu = parsers.is_emu_style(style_map.get(bn[0]))
+                        if bn[0] == tn[0] or (a_codes and (a_codes & _train_codes(b_code, is_emu=b_emu))):
                             _add_prune(prune_stats, "repeat_train")
                             continue
                         n = (a_arr_s + eff_min - bs["dep"] + 1439) // 1440
@@ -1627,7 +1658,10 @@ def _search_timetable(trains, fkeys, tkeys, base, min_wait, max_wait, prices, se
                                    sb1["telecode"], sb2["telecode"], sb2["arr"] - sb1["dep"],
                                    prices, sno, cal, est_cache)
                 p_cost = (c1 + c2) if (c1 is not None and c2 is not None) else None
-                p_tier = _train_tier([{"train": A.code}, {"train": B.code}])
+                p_tier = _train_tier([
+                    {"train": A.code, "train_style": style_map.get(A.train_no)},
+                    {"train": B.code, "train_style": style_map.get(B.train_no)},
+                ], style_map=style_map)
                 p_hubs = ((sa2["telecode"] or t_sname or "", bool(same)),)
                 p_same = 1 if same else 0
                 p_buf = wait if same else wait - em["extra_min"]
@@ -1823,16 +1857,27 @@ class TreePruneController:
         for nd in nodes:
             kind = nd.get("kind")
             if kind == "province":
-                pv = china_geo.normalize_province(nd.get("province") or nd.get("label"))
-                if pv and pv in self.pruned_provinces:
+                pv = china_geo.normalize_province(nd.get("province") or nd.get("label")) or "未识别省份"
+                if pv in self.pruned_provinces:
                     continue
                 new_nd = dict(nd)
                 if nd.get("children"):
-                    pruned_ch = self._prune_snapshot_nodes_locked(nd["children"])
+                    old_ch = nd["children"]
+                    pruned_ch = self._prune_snapshot_nodes_locked(old_ch)
                     if not pruned_ch:
                         continue
                     new_nd["children"] = pruned_ch
-                    new_nd["count"] = sum(int(c.get("count") or 0) for c in pruned_ch) if not nd.get("more_children") else nd["count"]
+                    new_sum = sum(int(c.get("count") or 0) for c in pruned_ch)
+                    if nd.get("more_children"):
+                        old_sum = sum(int(c.get("count") or 0) for c in old_ch)
+                        new_nd["count"] = max(new_sum, int(nd.get("count") or 0) - max(0, old_sum - new_sum))
+                    else:
+                        new_nd["count"] = new_sum
+                        el_vals = [c.get("min_elapsed_min") for c in pruned_ch if c.get("min_elapsed_min") is not None]
+                        if el_vals:
+                            new_nd["min_elapsed_min"] = min(el_vals)
+                        c_vals = [c.get("min_cost") for c in pruned_ch if c.get("min_cost") is not None]
+                        new_nd["min_cost"] = min(c_vals) if c_vals else None
                 kept.append(new_nd)
                 continue
             pv_nd = china_geo.normalize_province(nd.get("province")) or "未识别省份"
@@ -1860,7 +1905,22 @@ class TreePruneController:
                     continue
                 new_nd = dict(nd)
                 if nd.get("children"):
-                    new_nd["children"] = self._prune_snapshot_nodes_locked(nd["children"])
+                    old_ch = nd["children"]
+                    pruned_ch = self._prune_snapshot_nodes_locked(old_ch)
+                    if not pruned_ch:
+                        continue
+                    new_nd["children"] = pruned_ch
+                    new_sum = sum(int(c.get("count") or 0) for c in pruned_ch)
+                    if nd.get("more_children"):
+                        old_sum = sum(int(c.get("count") or 0) for c in old_ch)
+                        new_nd["count"] = max(new_sum, int(nd.get("count") or 0) - max(0, old_sum - new_sum))
+                    else:
+                        new_nd["count"] = new_sum
+                        el_vals = [c.get("min_elapsed_min") for c in pruned_ch if c.get("min_elapsed_min") is not None]
+                        if el_vals:
+                            new_nd["min_elapsed_min"] = min(el_vals)
+                        c_vals = [c.get("min_cost") for c in pruned_ch if c.get("min_cost") is not None]
+                        new_nd["min_cost"] = min(c_vals) if c_vals else None
                 kept.append(new_nd)
         return kept
 
@@ -1919,15 +1979,21 @@ class TreePruneController:
                         self.pruned_paths.add(pt)
             for x in (unprune_cities or ()):
                 t = _norm_tree_tok(x)
+                if not t:
+                    continue
                 self.pruned_cities.discard(t)
-                if t.endswith("市") and len(t) > 1:
-                    self.pruned_cities.discard(t[:-1])
+                self.pruned_cities.discard(t[:-1] if t.endswith("市") and len(t) > 1 else t + "市")
             for x in (unprune_stations or ()):
-                self.pruned_stations.discard(_norm_tree_tok(x))
+                t = _norm_tree_tok(x)
+                if not t:
+                    continue
+                self.pruned_stations.discard(t)
+                self.pruned_stations.discard(t[:-1] if t.endswith("站") and len(t) > 1 else t + "站")
             for p in (unprune_paths or ()):
                 if isinstance(p, (list, tuple)):
                     pt = tuple(_norm_tree_tok(x) for x in p if _norm_tree_tok(x))
-                    self.pruned_paths.discard(pt)
+                    if pt:
+                        self.pruned_paths.discard(pt)
 
             eff_chain_fn = chain_fn or self._paused_chain_fn
             if self.paused and self._paused_frontier is not None and eff_chain_fn is not None:
@@ -1948,16 +2014,38 @@ class TreePruneController:
                                 self._paused_frontier, self.paused_depth, self._paused_max_legs, "paused"
                             )
             elif self.snapshot is not None and (self.pruned_provinces or self.pruned_cities or self.pruned_stations or self.pruned_paths):
-                # 实时(live)模式下一旦收到人工剪除指令，立即在当前快照树上同步剔除对应省/市/站/路径节点，UI 零延迟反馈
+                # 实时(live)模式下一旦收到人工剪除指令，立即在当前快照树上同步剔除对应省/市/站/路径节点，并重算省汇总与总数
                 new_nodes = self._prune_snapshot_nodes_locked(self.snapshot.get("nodes") or [])
+                has_provs = "provinces" in self.snapshot
                 new_provs = self._prune_snapshot_nodes_locked(self.snapshot.get("provinces") or [])
-                new_psummary = [
-                    ps for ps in (self.snapshot.get("province_summary") or [])
-                    if ps.get("province") not in self.pruned_provinces
-                ]
-                new_tot = sum(int(ps.get("count") or 0) for ps in new_psummary) if new_psummary else (
-                    sum(int(n.get("count") or 0) for n in new_nodes) if not self.snapshot.get("more_top") else self.snapshot.get("total_states", 0)
-                )
+                prov_by_name = {
+                    (china_geo.normalize_province(pn.get("province") or pn.get("label")) or "未识别省份"): pn
+                    for pn in new_provs
+                }
+                new_psummary = []
+                for ps in (self.snapshot.get("province_summary") or []):
+                    pv_ps = china_geo.normalize_province(ps.get("province")) or "未识别省份"
+                    if pv_ps in self.pruned_provinces:
+                        continue
+                    if has_provs:
+                        pn = prov_by_name.get(pv_ps)
+                        if pn is None:
+                            continue
+                        ps2 = dict(ps)
+                        ps2["count"] = pn.get("count", ps.get("count", 0))
+                        ps2["min_elapsed_min"] = pn.get("min_elapsed_min")
+                        ps2["min_cost"] = pn.get("min_cost")
+                        new_psummary.append(ps2)
+                    else:
+                        new_psummary.append(ps)
+                if has_provs:
+                    new_tot = sum(int(pn.get("count") or 0) for pn in new_provs)
+                elif self.snapshot.get("province_summary"):
+                    new_tot = sum(int(ps.get("count") or 0) for ps in new_psummary)
+                elif not self.snapshot.get("more_top"):
+                    new_tot = sum(int(n.get("count") or 0) for n in new_nodes)
+                else:
+                    new_tot = self.snapshot.get("total_states", 0)
                 self.snapshot = {
                     **self.snapshot,
                     "nodes": new_nodes,
@@ -2104,7 +2192,7 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
     allow_provs = set(prune_cfg.get("allow_provs") or ())
     exc_provs = set(prune_cfg.get("exc_provs") or ())
     block_unknown_prov = bool(prune_cfg.get("block_unknown_prov", False))
-    has_prov_filter = bool(allow_provs or exc_provs)
+    has_prov_filter = bool(allow_provs or exc_provs or block_unknown_prov)
     prov_of = dict(prune_cfg.get("prov_of") or ())
     if not prov_of and (has_prov_filter or tree_ctrl is not None):
         prov_of = _build_prov_map(cities, geo_index=geo_index)
@@ -2341,7 +2429,7 @@ def _search_multi(services, fkeys, tkeys, base_min, min_wait, max_wait, max_legs
         c = _raw_leg_cost(sv["train_no"], sv.get("code"), sa["no"], sb["no"],
                           sa["telecode"], sb["telecode"], sb["arr"] - sa["dep"],
                           prices, sno, cal, est_cache)
-        return c, _train_tier([{"train": sv.get("code")}])
+        return c, _train_tier([{"train": sv.get("code"), "train_style": style_map.get(sv["train_no"])}], style_map=style_map)
 
     def refs_cost_tier(l_refs: tuple) -> tuple[float, bool, int]:
         tot, known, mx_tier = 0.0, True, 0
@@ -3498,6 +3586,8 @@ def search(from_q: str, to_q: str, date: str,
     else:
         allow_provs, exc_provs = set(), set()
         p_mode = "off"
+    if p_mode == "off":
+        block_unknown_prov = False
 
     # WHY: 束宽(frontier_k)与支配剪枝在过滤之前按"局部最优"扔分支，会把"尚未经过必经站"的合法分支误剪；
     # 车型头(inc_pfx/exc_pfx)与排除站(exc_st)已下沉到 _search_multi 搜前筛选，同时把自动放宽束宽控制在安全上限(32–64)而非清零无限制，避免 3+ 程爆内存。
@@ -3860,7 +3950,7 @@ def search(from_q: str, to_q: str, date: str,
         transfers = kept_t
 
     # 车次头、换乘站与中转省份统一后置校验（2程方案在此同步按中转省份剪枝，3+程在 _search_multi 已前置拦截）
-    if inc_pfx or exc_pfx or inc_st or exc_st or allow_provs or exc_provs:
+    if inc_pfx or exc_pfx or inc_st or exc_st or allow_provs or exc_provs or block_unknown_prov:
         direct = filter_plans(
             direct,
             allow_prefixes=inc_pfx, exclude_prefixes=exc_pfx,
@@ -3960,6 +4050,10 @@ def search(from_q: str, to_q: str, date: str,
             "include_stations": inc_st,
             "include_stations_mode": inc_st_mode,
             "exclude_stations": exc_st,
+            "province_mode": p_mode,
+            "allow_provinces": sorted(allow_provs),
+            "exclude_provinces": sorted(exc_provs),
+            "block_unknown_prov": bool(block_unknown_prov),
             "cross_radius_km": cross_cfg["radius_km"],
             "cross_time_mode": cross_cfg["time_mode"],
             "cross_extra": cross_cfg["fixed_extra"],

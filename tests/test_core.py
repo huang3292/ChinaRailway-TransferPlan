@@ -3067,10 +3067,234 @@ class TestZnvZtkCompat(TempDBTestCase):
             self.assertIn(marker, html_text, f"缺失 ZNV/ZTK 前端标记: {marker}")
 
 
+class TestAuditFixesRegression(TempDBTestCase):
+    def test_zero_price_ignored_and_emu_tier_not_aliased(self):
+        # 实测与估算中的 0 / 非正票价不应参与最低价排序
+        leg_zero = {
+            "train_no": "5n0000Z1040F",
+            "train": "Z104",
+            "prices": [{"seat_type": "yz", "price": 0.0}, {"seat_type": "rw", "price": 353.0}],
+            "price_est": {"seats": {"yz": {"min": 0}, "yw": {"min": 200.0}}},
+        }
+        self.assertEqual(transfer._leg_min_price(leg_zero), 353.0)
+        leg_only_est = {
+            "train_no": "47000K827850",
+            "train": "K8278",
+            "prices": [{"seat_type": "yz", "price": 0.0}],
+            "price_est": {"seats": {"yz": {"min": 0}, "yw": {"min": 180.0}}},
+        }
+        self.assertEqual(transfer._leg_min_price(leg_only_est), 180.0)
+        prices = {("47000K827850", "02", "03"): {"items": [{"seat_type": "yz", "price": 0.0}, {"seat_type": "yw", "price": 95.0}]}}
+        self.assertEqual(transfer._raw_leg_cost("47000K827850", "K8278", "2", "3", "UCK", "JAK", 90, prices, {}, {}), 95.0)
+
+        # 动车组 T10（CR400BF-Z）即使按普速/动车分级也不应触发 N/V 别名误匹配
+        with db.tx() as conn:
+            conn.execute(
+                "INSERT INTO station_trains(station_telecode,station_name,station_train_code,train_no,station_train_date,train_style) VALUES('BJP','北京','T10','240000T1001','2026-11-26','CR400BF-Z')"
+            )
+        transfer.invalidate_cache()
+        self.assertEqual(transfer._train_tier([{"train_no": "240000T1001", "train": "T10"}]), 0)
+        # filter_plans 结合 style_map 区分动车组 T10 与普速 N10
+        kept = transfer.filter_plans(
+            [{"legs": [{"train_no": "240000T1001", "train": "T10"}], "transfers": []}],
+            exclude_prefixes="N",
+        )
+        self.assertEqual(len(kept), 1)
+
+    def test_build_prov_map_uses_geo_coords_fallback(self):
+        from app import geo
+
+        cities = ({"ZZX": "未知小城"}, {}, {"神秘小站": "ZZX"})
+        fake_idx = geo.StationGeoIndex(
+            stations=[{
+                "telecode": "ZZX",
+                "name": "神秘小站",
+                "city": "未知小城",
+                "lat": 24.5,
+                "lon": 118.1,
+                "geo_status": "verified",
+            }],
+            groups=[],
+            pair_overrides=[],
+            transit_cities={},
+        )
+        pmap = transfer._build_prov_map(cities, geo_index=fake_idx)
+        self.assertEqual(pmap.get("ZZX"), "福建")
+        self.assertEqual(pmap.get("神秘小站"), "福建")
+
+    def test_province_block_unknown_independent_and_tree_prune_live_recalc(self):
+        # _prov_allowed 与 filter_plans 支持独立 block_unknown_prov；而 search 在 province_mode="off" 时禁用 block_unknown_prov
+        self.assertFalse(transfer._prov_allowed("", set(), set(), block_unknown=True))
+        self.assertTrue(transfer._prov_allowed("湖北", set(), set(), block_unknown=True))
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,city) VALUES(?,?,?)",
+                [("AAA", "甲站", "甲市"), ("UUU", "未知站", ""), ("WHN", "武汉", "武汉"), ("BBB", "乙站", "乙市")],
+            )
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES(?,?,?,?,?,?,?,?,1)",
+                [
+                    ("T1", "G1", "2026-11-26", 1, "甲站", "AAA", "----", "08:00"),
+                    ("T1", "G1", "2026-11-26", 2, "未知站", "UUU", "09:00", "09:05"),
+                    ("T2", "G2", "2026-11-26", 1, "未知站", "UUU", "----", "10:00"),
+                    ("T2", "G2", "2026-11-26", 2, "乙站", "BBB", "11:00", "----"),
+                ],
+            )
+        plan_unk = {"legs": [{"train": "G1"}, {"train": "G2"}], "transfers": [{"telecode": "UUU", "station": "未知站"}]}
+        plan_hb = {"legs": [{"train": "G3"}, {"train": "G4"}], "transfers": [{"telecode": "WHN", "station": "武汉"}]}
+        self.assertEqual(len(transfer.filter_plans([plan_unk, plan_hb], block_unknown_prov=True)), 1)
+        self.assertEqual(len(transfer.filter_plans([plan_unk, plan_hb], block_unknown_prov=False)), 2)
+
+        transfer.invalidate_cache()
+        res_off = transfer.search("甲站", "乙站", "2026-11-26", max_legs=2, province_mode="off", block_unknown_prov=True, expand_city=False)
+        self.assertEqual(len(res_off["transfers"]), 1)
+        self.assertFalse(res_off["prune_config"]["block_unknown_prov"])
+        res_exc = transfer.search("甲站", "乙站", "2026-11-26", max_legs=2, province_mode="exclude", block_unknown_prov=True, expand_city=False)
+        self.assertEqual(len(res_exc["transfers"]), 0)
+        self.assertTrue(res_exc["prune_config"]["block_unknown_prov"])
+
+        # TreePruneController live 模式裁剪全部叶子后应移除空城市节点并归零 total_states，且支持 市/站 对称撤销
+        ctrl = transfer.TreePruneController(pause_after_layer=False)
+        ctrl.snapshot = {
+            "status": "running",
+            "total_states": 5,
+            "more_top": False,
+            "nodes": [
+                {
+                    "kind": "city", "label": "九江", "city": "九江", "province": "江西",
+                    "count": 5, "min_elapsed_min": 400, "min_cost": 80.0,
+                    "children": [
+                        {"kind": "station", "label": "九江", "station_key": "JJG", "city": "九江", "province": "江西",
+                         "path": ["JJG"], "count": 5, "min_elapsed_min": 400, "min_cost": 80.0}
+                    ],
+                }
+            ],
+            "provinces": [
+                {
+                    "kind": "province", "label": "江西", "province": "江西",
+                    "count": 5, "min_elapsed_min": 400, "min_cost": 80.0,
+                    "children": [
+                        {"kind": "city", "label": "九江", "city": "九江", "province": "江西",
+                         "count": 5, "min_elapsed_min": 400, "min_cost": 80.0,
+                         "children": [
+                             {"kind": "station", "label": "九江", "station_key": "JJG", "city": "九江", "province": "江西",
+                              "path": ["JJG"], "count": 5, "min_elapsed_min": 400, "min_cost": 80.0}
+                         ]}
+                    ],
+                }
+            ],
+            "province_summary": [{"province": "江西", "count": 5, "min_elapsed_min": 400, "min_cost": 80.0}],
+        }
+        st1 = ctrl.apply_command(prune_stations=["九江"])
+        snap1 = st1["tree_snapshot"]
+        self.assertEqual(snap1["nodes"], [])
+        self.assertEqual(snap1["provinces"], [])
+        self.assertEqual(snap1["province_summary"], [])
+        self.assertEqual(snap1["total_states"], 0)
+
+        # 对称 unprune: prune 存 "九江市"，unprune 传 "九江" 也应清干净
+        ctrl.apply_command(prune_cities=["九江市"], prune_stations=["九江站"])
+        ctrl.apply_command(unprune_cities=["九江"], unprune_stations=["九江"])
+        with ctrl.lock:
+            self.assertEqual(ctrl.pruned_cities, set())
+            self.assertEqual(ctrl.pruned_stations, set())
+
+    def test_main_effective_max_legs_price_skip_and_styles(self):
+        from app import main as main_mod
+        import time
+
+        self.assertEqual(main_mod._effective_max_legs(2, "武汉, 南昌", "and"), 3)
+        self.assertEqual(main_mod._effective_max_legs(2, "武汉, 南昌, 合肥, 九江", "and"), 5)
+        self.assertEqual(main_mod._effective_max_legs(2, "武汉, 南昌, 合肥, 九江, 福州", "and"), 2)
+
+        # start_transfers 应按 eff_legs 计算 total 并激活 TreePruneController
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,city) VALUES(?,?,?)",
+                [("XMS", "厦门", "厦门"), ("WHN", "武汉", "武汉"), ("NOG", "南昌", "南昌"), ("WHH", "威海", "威海")],
+            )
+        main_mod.jobs.clear()
+        main_mod._job_cancels.clear()
+        main_mod._job_trees.clear()
+
+        created_ctrls = []
+        def fake_search(*args, **kwargs):
+            created_ctrls.append(kwargs.get("tree_ctrl"))
+            return {"transfers": [], "direct": [], "prune_config": {}}
+
+        req = main_mod.TransferSearchReq(
+            from_station="厦门", to_station="威海", date="2026-11-26",
+            max_legs=2, include_stations="武汉, 南昌", include_stations_mode="and",
+            tree_prune_mode="live",
+        )
+        with mock.patch("app.main.transfer.search", side_effect=fake_search):
+            res = main_mod.start_transfers(req)
+            jid = res["job_id"]
+            st = None
+            for _ in range(80):
+                st = main_mod.job_status(jid)
+                if st["status"] != "running":
+                    break
+                time.sleep(0.02)
+        self.assertEqual(st["status"], "done")
+        self.assertEqual(st["total"], 7)  # eff_legs=3 -> 5 + (3 - 1)
+        self.assertIsNotNone(created_ctrls[0])
+
+        # _price_job: 跳过已有票价(含 zfill(2) 规范化)和缺失 station_no，且同键去重
+        with db.tx() as conn:
+            conn.executemany(
+                """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
+                                       from_station_no,to_station_no,start_time,arrive_time,duration,can_web_buy,seats,seat_types)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    ("T_CACHED", "G1", "2026-11-26", "XMS", "WHN", "1", "5", "08:00", "10:00", "02:00", "Y", "{}", "OM"),
+                    ("T_NO_SNO", "G2", "2026-11-26", "XMS", "WHN", "", "5", "09:00", "11:00", "02:00", "Y", "{}", "OM"),
+                    ("T_NEED", "G3", "2026-11-26", "XMS", "WHN", "2", "6", "10:00", "12:00", "02:00", "Y", "{}", "OM"),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO prices(train_no,train_date,from_station_no,to_station_no,seat_type,seat_name,price) VALUES('T_CACHED','2026-11-26','01','05','ze','二等座',100.0)"
+            )
+            conn.execute(
+                "INSERT INTO station_trains(station_telecode,station_name,station_train_code,train_no,station_train_date,train_style) VALUES('XMS','厦门','G3','T_NEED','2026-11-26','CR400AF')"
+            )
+            conn.execute(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled) VALUES('T_NEED','G3','2026-11-26',2,'厦门','XMS','----','10:00',1)"
+            )
+        jid_p = main_mod._create_job({"status": "running", "done": 0, "total": 0, "current": "", "errors": []})
+        with mock.patch("app.main.crawler.crawl_price") as m_cp:
+            main_mod._price_job(jid_p[0], jid_p[1], "XMS", "WHN", "2026-11-26")
+        m_cp.assert_called_once_with("T_NEED", "02", "06", "OM", "2026-11-26")
+
+        # /api/timetable, /api/trains, /api/tickets 返回 train_style
+        self.assertEqual(main_mod.timetable("T_NEED")["train_style"], "CR400AF")
+        t_rows = {r["train_no"]: r for r in main_mod.trains("G3")}
+        self.assertEqual(t_rows["T_NEED"].get("train_style"), "CR400AF")
+        tk_rows = {r["train_no"]: r for r in main_mod.tickets("厦门", "武汉", "2026-11-26")}
+        self.assertEqual(tk_rows["T_NEED"].get("train_style"), "CR400AF")
+
+    def test_crawl_all_timetables_rank_and_frontend_markers(self):
+        import crawl_all_timetables as cat
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO station_trains(station_telecode,station_name,station_train_code,train_no,station_train_date) VALUES(?,?,?,?,?)",
+                [
+                    ("XMS", "厦门", "V104", "5nV104", "2026-11-26"),
+                    ("XMS", "厦门", "X1", "5nX1", "2026-11-26"),
+                    ("XMS", "厦门", "S201", "5nS201", "2026-11-26"),
+                    ("XMS", "厦门", "N12", "5nN12", "2026-11-26"),
+                ],
+            )
+        items = cat.collect_timetable_targets("2026-11-26", target_telecodes=None, all_db_trains=False, force=False)
+        codes = [x["code"] for x in items]
+        self.assertEqual(codes, ["X1", "N12", "V104", "S201"])
+
+        html_text = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        for marker in ("function fmtErr(", "function escJsArg(", "l.live_train_no", "saveSearchPrefs()"):
+            self.assertIn(marker, html_text, f"缺失审计修复前端标记: {marker}")
+
+
 if __name__ == "__main__":
     unittest.main()
-
-
-
-
-
