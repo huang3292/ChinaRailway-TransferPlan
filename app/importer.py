@@ -28,14 +28,25 @@ def ingest(text: str, api_type: str | None = None, ctx: dict | None = None,
         else:
             records = parsers.parse_station_screen(payload, ctx)
 
-    # 单事务完成原始留档与结构化批量入库，将每次抓取的磁盘提交同步从 2~3 次降为 1 次
-    with db.tx() as conn:
+    # 单事务 + 写锁完成原始留档与结构化批量入库，将每次抓取的磁盘提交同步从 2~3 次降为 1 次
+    # WHY: 若当日大屏已停运清空(valid empty list)，必须清理旧记录，否则过时停运车次会永久残留在 station_trains 中。
+    with db._write_lock, db.tx() as conn:
         cur = conn.execute(
             "INSERT INTO raw_payloads(api_type,params,source,fetched_at,payload) VALUES(?,?,?,?,?)",
             (api_type, json.dumps(ctx, ensure_ascii=False), source,
              db.cn_now().isoformat(timespec="seconds"), text),
         )
         raw_id = cur.lastrowid
+        if api_type == "station_screen" and not records:
+            st_tc = str(ctx.get("station") or "").strip().upper()
+            d_str = str(ctx.get("date") or "").strip()
+            if len(d_str) == 8 and d_str.isdigit():
+                d_str = f"{d_str[:4]}-{d_str[4:6]}-{d_str[6:]}"
+            if st_tc and d_str:
+                conn.execute(
+                    "DELETE FROM station_trains WHERE station_telecode=? AND station_train_date=?",
+                    (st_tc, d_str),
+                )
         count = _save_with_conn(conn, api_type, records, raw_id)
         if extra_prices:
             _save_with_conn(conn, "price", extra_prices, raw_id)
@@ -52,18 +63,28 @@ def _save_with_conn(conn, api_type: str, records: list[dict], raw_id: int) -> in
             records)
     elif api_type == "left_ticket":
         rows_data = [
-            dict(r, seats=json.dumps(r["seats"], ensure_ascii=False), raw_id=raw_id)
+            dict(
+                r,
+                seats=json.dumps(r["seats"], ensure_ascii=False),
+                exchange_train_flag=r.get("exchange_train_flag") or "",
+                dw_flag=r.get("dw_flag") or "",
+                train_flag=r.get("train_flag") or "",
+                raw_id=raw_id,
+            )
             for r in records
         ]
         conn.executemany(
             """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
-                 from_station_no,to_station_no,start_time,arrive_time,duration,can_web_buy,seat_types,seats,raw_id)
+                 from_station_no,to_station_no,start_time,arrive_time,duration,can_web_buy,seat_types,seats,
+                 exchange_train_flag,dw_flag,train_flag,raw_id)
                VALUES(:train_no,:station_train_code,:train_date,:from_telecode,:to_telecode,
-                 :from_station_no,:to_station_no,:start_time,:arrive_time,:duration,:can_web_buy,:seat_types,:seats,:raw_id)
+                 :from_station_no,:to_station_no,:start_time,:arrive_time,:duration,:can_web_buy,:seat_types,:seats,
+                 :exchange_train_flag,:dw_flag,:train_flag,:raw_id)
                ON CONFLICT(train_no,train_date,from_telecode,to_telecode) DO UPDATE SET
                  station_train_code=:station_train_code,from_station_no=:from_station_no,
                  to_station_no=:to_station_no,start_time=:start_time,arrive_time=:arrive_time,
-                 duration=:duration,can_web_buy=:can_web_buy,seat_types=:seat_types,seats=:seats,raw_id=:raw_id""",
+                 duration=:duration,can_web_buy=:can_web_buy,seat_types=:seat_types,seats=:seats,
+                 exchange_train_flag=:exchange_train_flag,dw_flag=:dw_flag,train_flag=:train_flag,raw_id=:raw_id""",
             rows_data)
     elif api_type == "price":
         # 唯一键列不允许 NULL，否则 SQLite 视为互不相同导致重复；非空站序统一 zfill(2) 对齐票价表口径
@@ -106,18 +127,18 @@ def _save_with_conn(conn, api_type: str, records: list[dict], raw_id: int) -> in
         conn.executemany(
             "DELETE FROM station_trains WHERE station_telecode=? AND station_train_date=?",
             del_keys)
-        rows_data = [dict(r, raw_id=raw_id) for r in records]
+        rows_data = [dict(r, train_flag=r.get("train_flag") or "", raw_id=raw_id) for r in records]
         conn.executemany(
             """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
                  station_train_date,start_train_date,station_no,arrive_time,start_time,stopover_time,
                  arrive_day_diff,start_day_diff,start_station_name,start_station_telecode,
                  end_station_name,end_station_telecode,train_class_name,seat_types,running_fig,train_style,jiaolu_train_style,
-                 start_start_time,end_arrive_time,running_time,distance,raw_id)
+                 train_flag,start_start_time,end_arrive_time,running_time,distance,raw_id)
                VALUES(:station_telecode,:station_name,:query_date,:station_train_code,:train_no,
                  :station_train_date,:start_train_date,:station_no,:arrive_time,:start_time,:stopover_time,
                  :arrive_day_diff,:start_day_diff,:start_station_name,:start_station_telecode,
                  :end_station_name,:end_station_telecode,:train_class_name,:seat_types,:running_fig,:train_style,:jiaolu_train_style,
-                 :start_start_time,:end_arrive_time,:running_time,:distance,:raw_id)
+                 :train_flag,:start_start_time,:end_arrive_time,:running_time,:distance,:raw_id)
                ON CONFLICT(station_telecode,station_train_code,station_train_date) DO UPDATE SET
                  station_name=:station_name,query_date=:query_date,
                  train_no=:train_no,start_train_date=:start_train_date,station_no=:station_no,
@@ -126,7 +147,7 @@ def _save_with_conn(conn, api_type: str, records: list[dict], raw_id: int) -> in
                  start_station_name=:start_station_name,start_station_telecode=:start_station_telecode,
                  end_station_name=:end_station_name,end_station_telecode=:end_station_telecode,
                  train_class_name=:train_class_name,seat_types=:seat_types,running_fig=:running_fig,
-                 train_style=:train_style,jiaolu_train_style=:jiaolu_train_style,
+                 train_style=:train_style,jiaolu_train_style=:jiaolu_train_style,train_flag=:train_flag,
                  start_start_time=:start_start_time,end_arrive_time=:end_arrive_time,
                  running_time=:running_time,distance=:distance,raw_id=:raw_id""",
             rows_data)

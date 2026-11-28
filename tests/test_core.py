@@ -2577,7 +2577,8 @@ class TestProvinceFilterAndTreeGrouping(TempDBTestCase):
     def test_china_geo_mapping_and_corridor_recommend(self):
         from app import china_geo
 
-        self.assertEqual(len(china_geo.ALL_PROVINCES), 34)
+        self.assertEqual(len(china_geo.ALL_PROVINCES), 35)
+        self.assertIn("老挝", china_geo.ALL_PROVINCES)
         self.assertEqual(china_geo.infer_station_province("厦门北", "厦门"), "福建")
         self.assertEqual(china_geo.infer_station_province("建阳", "南平"), "福建")
         self.assertEqual(china_geo.infer_station_province("武夷山北", ""), "福建")
@@ -2588,7 +2589,18 @@ class TestProvinceFilterAndTreeGrouping(TempDBTestCase):
         # 无城市名时利用经纬度兜底识别（济南坐标 -> 山东）
         self.assertEqual(china_geo.infer_station_province("不知名郊县站", "", lat=36.65, lon=117.0), "山东")
 
-        # 厦门 -> 威海 走廊不得包含广东、台湾、辽宁
+        # 中老铁路 6 站 + 香港西九龙正确归省，且境内边境站不被老挝质心误吸
+        for sname, scity in [
+            ("万象", "万象"), ("磨丁", "磨丁"), ("琅勃拉邦", "琅勃拉邦"),
+            ("孟赛", "孟赛"), ("纳堆", "纳堆"), ("万荣", "老挝万荣"),
+        ]:
+            self.assertEqual(china_geo.infer_station_province(sname, scity), "老挝")
+        self.assertEqual(china_geo.infer_station_province("香港西九龙", "香港"), "香港")
+        self.assertEqual(china_geo.infer_station_province("磨憨", "磨憨"), "云南")
+        # 即使给定近云南坐标，未知站不得通过 220km 兜底落入老挝
+        self.assertNotEqual(china_geo.infer_station_province("云南边境不知名站", "", lat=21.2, lon=101.6), "老挝")
+
+        # 厦门 -> 威海 走廊不得包含广东、台湾、辽宁、老挝
         rec_std = china_geo.recommend_corridor_provinces("厦门", "威海", widen="standard")
         self.assertIn("福建", rec_std["provinces"])
         self.assertIn("浙江", rec_std["provinces"])
@@ -2596,6 +2608,13 @@ class TestProvinceFilterAndTreeGrouping(TempDBTestCase):
         self.assertNotIn("广东", rec_std["provinces"])
         self.assertNotIn("台湾", rec_std["provinces"])
         self.assertNotIn("辽宁", rec_std["provinces"])
+        self.assertNotIn("老挝", rec_std["provinces"])
+
+        # 国内走廊不含老挝，涉老挝端点时才纳入
+        rec_dom = china_geo.recommend_corridor_provinces("昆明", "西双版纳", widen="standard")
+        self.assertNotIn("老挝", rec_dom["provinces"])
+        rec_laos = china_geo.recommend_corridor_provinces("昆明", "万象", widen="standard")
+        self.assertIn("老挝", rec_laos["provinces"])
 
         rec_wide = china_geo.recommend_corridor_provinces("建阳", "威海", widen="wide")
         self.assertTrue(len(rec_wide["provinces"]) >= len(rec_std["provinces"]))
@@ -2646,8 +2665,8 @@ class TestProvinceFilterAndTreeGrouping(TempDBTestCase):
 
         # 3) API 端点 /api/provinces/meta 与 /api/provinces/recommend 验证 + 400 校验
         meta = main_mod.provinces_meta()
-        self.assertEqual(len(meta["provinces"]), 34)
-        self.assertEqual(len(meta["regions"]), 8)
+        self.assertEqual(len(meta["provinces"]), 35)
+        self.assertEqual(len(meta["regions"]), 9)
         rec_api = main_mod.recommend_provinces(from_station="厦门", to_station="威海", widen="standard")
         self.assertIn("浙江", rec_api["provinces"])
         self.assertNotIn("广东", rec_api["provinces"])
@@ -2977,7 +2996,10 @@ class TestZnvZtkCompat(TempDBTestCase):
                              depart="2026-11-27 06:16", arrive="2026-11-27 07:41",
                              from_station_no="07", to_station_no="08"),
         ])
-        with mock.patch("app.main.crawler.crawl_tickets") as m_ct, mock.patch("app.main.crawler.crawl_price") as m_cp:
+        import datetime as _dt
+        with mock.patch("app.db.cn_today", return_value=_dt.date(2026, 11, 27)), \
+             mock.patch("app.main.crawler.crawl_tickets") as m_ct, \
+             mock.patch("app.main.crawler.crawl_price") as m_cp:
             jid = main_mod.plan_tickets(req)["job_id"]
             import time
             st = None
@@ -3294,6 +3316,731 @@ class TestAuditFixesRegression(TempDBTestCase):
         html_text = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         for marker in ("function fmtErr(", "function escJsArg(", "l.live_train_no", "saveSearchPrefs()"):
             self.assertIn(marker, html_text, f"缺失审计修复前端标记: {marker}")
+
+    def test_geo_update_station_allows_laos_and_rejects_random_foreign(self):
+        from app import main as main_mod
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,city) VALUES(?,?,?)",
+                [("YTM", "万象", "万象"), ("XMN", "厦门", "厦门")],
+            )
+        # 南向扩展边界点 (16.5, 102.6) 超出 CHINA_BBOX(min_lat=17.5) 但处于老挝境内范围，允许保存
+        res = main_mod.geo_update_station("YTM", main_mod.GeoStationReq(lat=16.5, lon=102.6))
+        self.assertAlmostEqual(res["station"]["lat"], 16.5, places=2)
+        self.assertAlmostEqual(res["station"]["lon"], 102.6, places=2)
+
+        # 国内车站厦门给予境外坐标应被拒绝
+        with self.assertRaises(main_mod.HTTPException) as ctx:
+            main_mod.geo_update_station("XMN", main_mod.GeoStationReq(lat=16.5, lon=102.6))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_filter_plans_before_detour_and_dominance_plus_exclude_no_auto_relax(self):
+        # 当存在更快的被排除 G 车时，exclude_prefixes="G" 不应被 G 车卡紧 detour_limit_min 或支配放行的 K/D 车，
+        # 且 exclude_prefixes 单独设置不得触发 auto_relaxed=True (防止 4x frontier_k 膨胀)
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,city) VALUES(?,?,?)",
+                [("XMS", "厦门", "厦门"), ("HGH", "杭州", "杭州"), ("WHH", "威海", "威海")],
+            )
+            conn.executemany(
+                """INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled)
+                   VALUES(?,?,?,?,?,?,?,?,1)""",
+                [
+                    # 被排除的超快 G 车链路: 厦门 08:00 -> 杭州 10:00 -> 威海 12:00 (4h)
+                    ("T_G1", "G10", "2026-11-26", 1, "厦门", "XMS", "----", "08:00"),
+                    ("T_G1", "G10", "2026-11-26", 2, "杭州", "HGH", "10:00", "10:00"),
+                    ("T_G2", "G12", "2026-11-26", 1, "杭州", "HGH", "----", "10:40"),
+                    ("T_G2", "G12", "2026-11-26", 2, "威海", "WHH", "12:00", "12:00"),
+                    # 合法的非 G 慢车链路: 厦门 08:00 -> 杭州 14:00 -> 威海 22:00 (14h, > 4h*2=8h)
+                    ("T_K1", "K10", "2026-11-26", 1, "厦门", "XMS", "----", "08:00"),
+                    ("T_K1", "K10", "2026-11-26", 2, "杭州", "HGH", "14:00", "14:00"),
+                    ("T_K2", "K12", "2026-11-26", 1, "杭州", "HGH", "----", "14:40"),
+                    ("T_K2", "K12", "2026-11-26", 2, "威海", "WHH", "22:00", "22:00"),
+                ],
+            )
+
+        res = transfer.search(
+            "厦门", "威海", "2026-11-26",
+            min_wait=30, max_wait=120, max_legs=2,
+            exclude_prefixes="G", detour_ratio=1.5, prune_dominated=True,
+            expand_city=False, allow_cross_station=False,
+        )
+        self.assertFalse(res["prune_config"]["auto_relaxed"])
+        chains = [tuple(l["train"] for l in p["legs"]) for p in res["transfers"]]
+        self.assertIn(("K10", "K12"), chains)
+        self.assertNotIn(("G10", "G12"), chains)
+
+    def test_complete_screen_from_tt_across_distant_dates_and_empty_date(self):
+        from types import SimpleNamespace
+        from app import transfer as tr_mod
+
+        # screen 日期为 2026-11-26 (距 2026-11-01 已超过 7 天) 且缺首末站
+        sd_min = tr_mod._date_min("2026-11-26")
+        screen = {
+            ("T_LONG", sd_min): {
+                "code": "K88",
+                "start_name": "上海",
+                "end_name": "北京",
+                "sd_min": sd_min,
+                "obs": {
+                    "HFH": {"name": "合肥", "telecode": "HFH", "no": 2, "arr": sd_min + 600, "dep": sd_min + 610},
+                },
+            }
+        }
+        tt = [
+            SimpleNamespace(
+                train_no="T_LONG", code="K88", train_date="2026-11-01",
+                stops=[
+                    {"station_no": 1, "station_name": "上海", "telecode": "SHH", "key": "SHH", "arr": 360, "dep": 360, "enabled": 1},
+                    {"station_no": 2, "station_name": "合肥", "telecode": "HFH", "key": "HFH", "arr": 600, "dep": 610, "enabled": 1},
+                    {"station_no": 3, "station_name": "北京", "telecode": "BJP", "key": "BJP", "arr": 1080, "dep": 1080, "enabled": 1},
+                ],
+            )
+        ]
+        tr_mod._complete_screen_from_tt(screen, tt)
+        obs = screen[("T_LONG", sd_min)]["obs"]
+        self.assertIn("SHH", obs)
+        self.assertIn("BJP", obs)
+        self.assertTrue(obs["SHH"].get("bridged"))
+        self.assertEqual(obs["BJP"]["arr"], sd_min + 1080)
+
+    def test_empty_screen_ingest_cleans_stale_and_clear_cache_keeps_empty_date(self):
+        from app import importer
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO station_trains(station_telecode,station_name,station_train_code,train_no,station_train_date) VALUES(?,?,?,?,?)",
+                [
+                    ("XMS", "厦门", "G1", "T1", "2026-11-26"),
+                    ("XMS", "厦门", "G2", "T2", "2026-11-25"),
+                    ("XMS", "厦门", "G3", "T3", ""),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time) VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    ("T2", "G2", "2026-11-25", 1, "厦门", "XMS", "----", "08:00"),
+                    ("T3", "G3", "", 1, "厦门", "XMS", "----", "09:00"),
+                ],
+            )
+        # 空大屏写入清理当日过时车次
+        importer.ingest('{"data": []}', api_type="station_screen", source="test", ctx={"station": "XMS", "date": "20261126"})
+        rows_26 = db.rows("SELECT train_no FROM station_trains WHERE station_telecode='XMS' AND station_train_date='2026-11-26'")
+        self.assertEqual(rows_26, [])
+
+        # clear_cache(before_date='2026-11-26') 只清理早于该日期的有效日期行，不得误删空日期行
+        db.clear_cache(before_date="2026-11-26")
+        st_left = [r["train_no"] for r in db.rows("SELECT train_no FROM station_trains ORDER BY train_no")]
+        tt_left = [r["train_no"] for r in db.rows("SELECT train_no FROM train_stops ORDER BY train_no")]
+        self.assertEqual(st_left, ["T3"])
+        self.assertEqual(tt_left, ["T3"])
+
+    def test_multiday_price_lookup_and_zero_duration_guard(self):
+        from app import transfer as tr_mod
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,city) VALUES(?,?,?)",
+                [("XMS", "厦门", "厦门"), ("HGH", "杭州", "杭州"), ("WHH", "威海", "威海")],
+            )
+            conn.executemany(
+                """INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled)
+                   VALUES(?,?,?,?,?,?,?,?,1)""",
+                [
+                    # 合法多日接续: D+0 20:00 厦门 -> D+1 08:00 杭州；D+1 09:00 杭州 -> D+1 15:00 威海
+                    ("T_M1", "K101", "2026-11-26", 1, "厦门", "XMS", "----", "20:00"),
+                    ("T_M1", "K101", "2026-11-26", 2, "杭州", "HGH", "08:00", "08:00"),
+                    ("T_M2", "K102", "2026-11-26", 1, "杭州", "HGH", "----", "09:00"),
+                    ("T_M2", "K102", "2026-11-26", 2, "威海", "WHH", "15:00", "15:00"),
+                    # 0 时长幽灵记录，应被跳过
+                    ("T_ZERO", "K999", "2026-11-26", 1, "厦门", "XMS", "----", "10:00"),
+                    ("T_ZERO", "K999", "2026-11-26", 2, "杭州", "HGH", "10:00", "10:00"),
+                ],
+            )
+            # 为 K102 同时写入 D+0(100元) 和 D+1(150元) 票价，跨天第2程(D+1)应精确命中 150 元且 stale=False
+            conn.executemany(
+                "INSERT INTO prices(train_no,train_date,from_station_no,to_station_no,seat_type,seat_name,price) VALUES(?,?,?,?,?,?,?)",
+                [
+                    ("T_M2", "2026-11-26", "01", "02", "yz", "硬座", 100.0),
+                    ("T_M2", "2026-11-27", "01", "02", "yz", "硬座", 150.0),
+                ],
+            )
+        res = transfer.search(
+            "厦门", "威海", "2026-11-26",
+            min_wait=30, max_wait=180, max_legs=2, expand_city=False, allow_cross_station=False,
+        )
+        all_chains = {tuple(l["train"] for l in p["legs"]): p for p in res["transfers"]}
+        self.assertIn(("K101", "K102"), all_chains)
+        self.assertNotIn(("K999", "K102"), all_chains)
+        leg2 = all_chains[("K101", "K102")]["legs"][1]
+        self.assertEqual(leg2["depart"][:10], "2026-11-27")
+        self.assertFalse(leg2.get("price_stale"))
+        self.assertEqual(leg2["prices"][0]["price"], 150.0)
+        self.assertEqual(tr_mod._pick_price_rec({"items": [{"price": 100}], "date": "2026-11-26", "stale": True, "by_date": {"2026-11-27": [{"price": 150}]}}, "2026-11-27"), ([{"price": 150}], "2026-11-27", False))
+
+    def test_route_job_price_zfill_and_tree_ctrl_cross_station_adaptive(self):
+        from app import main as main_mod
+        from app import transfer as tr_mod
+        import time
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,city) VALUES(?,?,?)",
+                [("XMS", "厦门", "厦门"), ("WHH", "威海", "威海")],
+            )
+            conn.executemany(
+                "INSERT INTO station_trains(station_telecode,station_name,station_train_code,train_no,station_train_date) VALUES(?,?,?,?,?)",
+                [("XMS", "厦门", "K10", "T_R1", "2026-11-26")],
+            )
+            conn.executemany(
+                """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
+                                       from_station_no,to_station_no,start_time,arrive_time,duration,can_web_buy,seats,seat_types)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    ("T_R1", "K10", "2026-11-26", "XMS", "WHH", "1", "8", "08:00", "20:00", "12:00", "Y", "{}", "13"),
+                    ("T_R2", "K11", "2026-11-26", "XMS", "WHH", "", "8", "09:00", "21:00", "12:00", "Y", "{}", "13"),
+                ],
+            )
+        jid, ev = main_mod._create_job({"status": "running", "done": 0, "total": 0, "phase": "init", "current": "", "log": [], "errors": []})
+        with mock.patch("app.main.crawler.crawl_station_trains", return_value={"parsed": 1}), \
+             mock.patch("app.main.crawler.crawl_timetable"), \
+             mock.patch("app.main.crawler.crawl_tickets"), \
+             mock.patch("app.main.crawler.crawl_price") as m_cp:
+            main_mod._route_job(jid, ev, "XMS", "WHH", "2026-11-26", True, "single", None, None)
+        m_cp.assert_called_once_with("T_R1", "01", "08", "13", "2026-11-26")
+
+        # TreePruneController: live 自适应冷却随构建耗时增大 + 异站双端剪枝
+        ctrl = tr_mod.TreePruneController(pause_after_layer=False)
+        self.assertFalse(ctrl.has_rules())
+        ctrl.update_live_snapshot(
+            [], 1, 3, "running",
+            lambda *a: (time.sleep(0.25), {"total_states": 1, "provinces": [], "nodes": [], "province_summary": []})[1],
+            force=True,
+        )
+        self.assertGreaterEqual(ctrl._live_cooldown, 0.5)
+        ctrl.apply_command(prune_stations=["BJP"])
+        self.assertTrue(ctrl.has_rules())
+        self.assertTrue(ctrl.is_cross_dep_pruned([], "北京", "BJP", "北京"))
+        ctrl.apply_command(unprune_stations=["BJP"])
+        ctrl.apply_command(prune_cities=["北京"])
+        self.assertTrue(ctrl.is_cross_dep_pruned([], "北京", "BXP", "北京西"))
+
+
+class TestTrainFeaturesAndBadges(TempDBTestCase):
+    def test_parsers_and_sample_feature_extraction(self):
+        # 1. 真实样本：leftTicket_BJP_SHH.json & queryTrainByStation_BJP.json
+        lt_payload = json.loads((SAMPLES / "leftTicket_BJP_SHH.json").read_text(encoding="utf-8"))
+        lt_rows = parsers.parse_left_ticket(lt_payload, {"date": "2026-11-20"})
+        self.assertGreater(len(lt_rows), 10)
+        # 样本中所有解析记录均包含新标志字段键
+        for r in lt_rows:
+            self.assertIn("exchange_train_flag", r)
+            self.assertIn("dw_flag", r)
+            self.assertIn("train_flag", r)
+        # 从真实样本应能提取到 复兴号 / 智能动车 / 静 / 兑 等至少若干特征
+        lt_feats = [
+            parsers.extract_train_features(
+                dw_flag=r["dw_flag"],
+                exchange_train_flag=r["exchange_train_flag"],
+                train_flag=r["train_flag"],
+            )
+            for r in lt_rows
+        ]
+        self.assertTrue(any(f["is_fuxing"] for f in lt_feats))
+        self.assertTrue(any(f["is_smart"] for f in lt_feats))
+        self.assertTrue(any("兑" in f["tags"] or "静" in f["tags"] for f in lt_feats))
+
+        scr_payload = json.loads((SAMPLES / "queryTrainByStation_BJP.json").read_text(encoding="utf-8"))
+        scr_rows = parsers.parse_station_screen(scr_payload, {"station": "BJP", "date": "2026-11-20"})
+        self.assertGreater(len(scr_rows), 10)
+        self.assertTrue(any(r.get("train_flag") for r in scr_rows))
+        scr_feats = [
+            parsers.extract_train_features(
+                train_style=r.get("train_style") or r.get("jiaolu_train_style"),
+                train_flag=r.get("train_flag"),
+            )
+            for r in scr_rows
+        ]
+        self.assertTrue(any(f["style"] for f in scr_feats))
+        self.assertTrue(any(f["is_fuxing"] for f in scr_feats))
+
+        # 2. 全量标志位矩阵：智(5 / #Z / -S/-AS/-BS/-Z)、复(1 / CR / ZL200J)、静(Q)、馨(R)、动感号(D)、铺(p6)、敬(p7)、兑(ex=1)
+        f_full = parsers.extract_train_features(
+            train_style="CR400BF-Z_重联",
+            dw_flag="5#1#Q#0#0#D#1#1",
+            exchange_train_flag="1",
+            train_flag="",
+        )
+        self.assertEqual(f_full["style"], "CR400BF-Z")
+        self.assertTrue(f_full["is_smart"])
+        self.assertTrue(f_full["is_fuxing"])
+        self.assertEqual(f_full["tags"], ["静", "动感号", "铺", "敬", "兑"])
+
+        f_sleep = parsers.extract_train_features(train_style="CRH1E", dw_flag="0#0#R#0#0#0#1#z")
+        self.assertFalse(f_sleep["is_smart"])
+        self.assertFalse(f_sleep["is_fuxing"])
+        self.assertEqual(f_sleep["tags"], ["馨", "铺"])
+
+        for smart_style in ("CR400AF-S", "CR400BF-AS", "CR400BF-BS", "CR400AF-Z"):
+            fs = parsers.extract_train_features(train_style=smart_style)
+            self.assertTrue(fs["is_smart"], smart_style)
+            self.assertTrue(fs["is_fuxing"], smart_style)
+
+        for fx_style in ("CR400BF", "CR200J", "ZL200J"):
+            ff = parsers.extract_train_features(train_style=fx_style)
+            self.assertFalse(ff["is_smart"], fx_style)
+            self.assertTrue(ff["is_fuxing"], fx_style)
+
+        f_crh = parsers.extract_train_features(train_style="CRH1A")
+        self.assertEqual(f_crh["style"], "CRH1A")
+        self.assertFalse(f_crh["is_smart"])
+        self.assertFalse(f_crh["is_fuxing"])
+
+        f_tf = parsers.extract_train_features(train_flag="Q1#Z#1")
+        self.assertTrue(f_tf["is_smart"])
+        self.assertTrue(f_tf["is_fuxing"])
+        self.assertEqual(f_tf["tags"], ["静"])
+
+    def test_legacy_db_migration_and_backfill_preserves_newer_seats(self):
+        import sqlite3
+
+        # 构造缺少新列的旧版库：验证 init_db() 自动加列 + 从 raw_payloads 回填且不覆盖更新后的 seats/raw_id
+        db.close_conn()
+        legacy_path = Path(self._tmp.name) / "legacy.db"
+        conn = sqlite3.connect(legacy_path)
+        conn.executescript("""
+            CREATE TABLE raw_payloads(id INTEGER PRIMARY KEY AUTOINCREMENT, api_type TEXT NOT NULL, params TEXT, source TEXT NOT NULL, fetched_at TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE station_trains(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, station_telecode TEXT NOT NULL, station_name TEXT,
+              query_date TEXT, station_train_code TEXT NOT NULL, train_no TEXT, station_train_date TEXT,
+              start_train_date TEXT, station_no INTEGER, arrive_time TEXT, start_time TEXT, stopover_time TEXT,
+              arrive_day_diff INTEGER, start_day_diff INTEGER, start_station_name TEXT, start_station_telecode TEXT,
+              end_station_name TEXT, end_station_telecode TEXT, train_class_name TEXT, seat_types TEXT,
+              running_fig TEXT, train_style TEXT, jiaolu_train_style TEXT, start_start_time TEXT,
+              end_arrive_time TEXT, running_time TEXT, distance INTEGER, raw_id INTEGER,
+              UNIQUE(station_telecode, station_train_code, station_train_date)
+            );
+            CREATE TABLE tickets(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, train_no TEXT NOT NULL, station_train_code TEXT,
+              train_date TEXT NOT NULL, from_telecode TEXT, to_telecode TEXT, from_station_no TEXT,
+              to_station_no TEXT, start_time TEXT, arrive_time TEXT, duration TEXT, can_web_buy TEXT,
+              seat_types TEXT, seats TEXT, raw_id INTEGER,
+              UNIQUE(train_no, train_date, from_telecode, to_telecode)
+            );
+        """)
+        fields = [""] * 58
+        fields[2] = "240000G1010A"
+        fields[3] = "G101"
+        fields[6] = "BJP"
+        fields[7] = "SHH"
+        fields[8] = "08:00"
+        fields[9] = "12:30"
+        fields[10] = "04:30"
+        fields[11] = "Y"
+        fields[13] = "20261128"
+        fields[16] = "01"
+        fields[17] = "05"
+        fields[30] = "10"  # 旧 payload 中的 ze
+        fields[35] = "O"
+        fields[36] = "1"
+        fields[46] = "5#1#Q#0#0#0#1#1"
+        fields[57] = "Q1#Z#1"
+        lt_js = json.dumps({"data": {"result": ["|".join(fields)]}})
+        scr_js = json.dumps({
+            "data": [{
+                "station_train_code": "G101", "train_no": "240000G1010A",
+                "station_telecode": "BJP", "station_name": "北京南",
+                "train_style": "CR400BF-Z", "train_flag": "Q1#Z#1",
+                "start_train_date": "20261128",
+            }]
+        })
+        conn.execute(
+            "INSERT INTO raw_payloads(id,api_type,params,source,fetched_at,payload) VALUES(1,'left_ticket',?,?,?,?,?)"[:0]
+            or "INSERT INTO raw_payloads(id,api_type,params,source,fetched_at,payload) VALUES(1,'left_ticket','{}','test','2026-11-27T08:00:00',?)",
+            (lt_js,),
+        )
+        conn.execute(
+            "INSERT INTO raw_payloads(id,api_type,params,source,fetched_at,payload) VALUES(2,'station_screen',?,?,?,?)",
+            (json.dumps({"station": "BJP", "date": "2026-11-28"}), "test", "2026-11-27T08:00:00", scr_js),
+        )
+        # 故意写入较新的 seats / raw_id=99，回填新列时绝不能覆盖已有 seats/raw_id
+        conn.execute(
+            """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
+                                   from_station_no,to_station_no,start_time,arrive_time,duration,can_web_buy,seat_types,seats,raw_id)
+               VALUES('240000G1010A','G101','2026-11-28','BJP','SHH','01','05','08:00','12:30','04:30','Y','O','{"ze":"无"}',99)"""
+        )
+        conn.execute(
+            """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                                          station_train_date,start_train_date,train_style,raw_id)
+               VALUES('BJP','北京南','2026-11-28','G101','240000G1010A','2026-11-28','2026-11-28','CR400BF-Z',2)"""
+        )
+        conn.commit()
+        conn.close()
+
+        db.DB_PATH = legacy_path
+        db.init_db()
+
+        tk = db.rows("SELECT seats,raw_id,exchange_train_flag,dw_flag,train_flag FROM tickets WHERE train_no='240000G1010A'")[0]
+        self.assertEqual(tk["seats"], '{"ze":"无"}')
+        self.assertEqual(tk["raw_id"], 99)
+        self.assertEqual(tk["exchange_train_flag"], "1")
+        self.assertEqual(tk["dw_flag"], "5#1#Q#0#0#0#1#1")
+        self.assertEqual(tk["train_flag"], "Q1#Z#1")
+
+        st = db.rows("SELECT train_style,train_flag FROM station_trains WHERE train_no='240000G1010A'")[0]
+        self.assertEqual(st["train_style"], "CR400BF-Z")
+        self.assertEqual(st["train_flag"], "Q1#Z#1")
+
+    def test_search_and_browse_endpoints_expose_features_and_root_fallback(self):
+        from app import main as main_mod
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,city) VALUES(?,?,?)",
+                [("BJP", "北京", "北京"), ("TJP", "天津", "天津"), ("SHH", "上海", "上海")],
+            )
+            # 大屏记录 train_no 版本位不同 (..0A)，时刻表与余票用 ..0C，验证 10 位根码+车次号只读外观兜底
+            conn.execute(
+                """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                                              station_train_date,start_train_date,station_no,arrive_time,start_time,
+                                              train_style,train_flag)
+                   VALUES('BJP','北京','2026-11-28','G101','240000G1010A','2026-11-28','2026-11-28',1,'----','08:00','CR400BF-AS','Q1#Z#1')"""
+            )
+            conn.executemany(
+                """INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled)
+                   VALUES(?,?,?,?,?,?,?,?,1)""",
+                [
+                    ("240000G1010C", "G101", "2026-11-28", 1, "北京", "BJP", "----", "08:00"),
+                    ("240000G1010C", "G101", "2026-11-28", 2, "天津", "TJP", "08:35", "08:40"),
+                    ("240000G20201", "G202", "2026-11-28", 1, "天津", "TJP", "----", "09:30"),
+                    ("240000G20201", "G202", "2026-11-28", 2, "上海", "SHH", "14:00", "14:00"),
+                ],
+            )
+            conn.execute(
+                """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,train_no,
+                                              station_train_date,start_train_date,station_no,arrive_time,start_time,
+                                              train_style,train_flag)
+                   VALUES('TJP','天津','2026-11-28','G202','240000G20209','2026-11-28','2026-11-28',1,'----','09:30','CRH1A','')"""
+            )
+            conn.execute(
+                """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
+                                       from_station_no,to_station_no,start_time,arrive_time,duration,can_web_buy,
+                                       seats,seat_types,exchange_train_flag,dw_flag,train_flag)
+                   VALUES('240000G1010C','G101','2026-11-28','BJP','TJP','01','02','08:00','08:35','00:35','Y',
+                          '{"ze":"有"}','O','1','5#1#Q#0#0#0#z#1','')"""
+            )
+
+        res = transfer.search("北京", "上海", "2026-11-28", min_wait=20, max_wait=180, max_legs=2, expand_city=False)
+        self.assertEqual(len(res["transfers"]), 1)
+        leg1, leg2 = res["transfers"][0]["legs"]
+        self.assertEqual(leg1["train_style"], "CR400BF-AS")
+        self.assertTrue(leg1["is_smart"])
+        self.assertTrue(leg1["is_fuxing"])
+        self.assertEqual(leg1["train_tags"], ["静", "敬", "兑"])
+        self.assertEqual(leg2["train_style"], "CRH1A")
+        self.assertFalse(leg2.get("is_smart"))
+        self.assertFalse(leg2.get("is_fuxing"))
+
+        tk_api = main_mod.tickets("BJP", "TJP", "2026-11-28")
+        self.assertEqual(tk_api[0]["train_style"], "CR400BF-AS")
+        self.assertTrue(tk_api[0]["is_smart"])
+        self.assertEqual(tk_api[0]["train_tags"], ["静", "敬", "兑"])
+
+        tt_api = main_mod.timetable("240000G1010C")
+        self.assertEqual(tt_api["train_style"], "CR400BF-AS")
+        self.assertTrue(tt_api["is_smart"])
+        self.assertIn("敬", tt_api["train_tags"])
+
+        tr_api = main_mod.trains("G101")
+        self.assertEqual(tr_api[0]["train_style"], "CR400BF-AS")
+        self.assertTrue(tr_api[0]["is_fuxing"])
+
+        st_api = main_mod.station_trains("BJP", "2026-11-28")
+        self.assertEqual(st_api[0]["train_style"], "CR400BF-AS")
+        self.assertIn("静", st_api[0]["train_tags"])
+
+    def test_plan_tickets_bounded_style_screens_and_dedup(self):
+        from datetime import timedelta
+        from app import main as main_mod
+
+        today_str = db.cn_today().isoformat()
+        fut_str = (db.cn_today() + timedelta(days=2)).isoformat()
+        past_str = (db.cn_today() - timedelta(days=2)).isoformat()
+
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,city) VALUES(?,?,?)",
+                [
+                    ("SHH", "上海", "上海"),
+                    ("NJH", "南京", "南京"),
+                    ("HGH", "杭州", "杭州"),
+                    ("WHN", "武汉", "武汉"),
+                    ("XMS", "厦门", "厦门"),
+                ],
+            )
+
+        legs = [
+            # SHH 覆盖 2 条缺车型行程段（最高优先级）
+            {"key": "1", "train_no": "T_S1", "train": "G1", "from": "SHH", "to": "NJH", "date": fut_str},
+            {"key": "2", "train_no": "T_S2", "train": "G2", "from": "SHH", "to": "HGH", "date": fut_str},
+            # NJH 覆盖 2 条
+            {"key": "3", "train_no": "T_N1", "train": "G3", "from": "NJH", "to": "WHN", "date": fut_str},
+            {"key": "4", "train_no": "T_N2", "train": "G4", "from": "NJH", "to": "SHH", "date": fut_str},
+            # HGH 仅 1 条（超出 max_style_screens=2 上限，不应被请求）
+            {"key": "5", "train_no": "T_H1", "train": "D5", "from": "HGH", "to": "XMS", "date": fut_str},
+            # 过去日期不应查余票也不应补查大屏
+            {"key": "6", "train_no": "T_P1", "train": "K6", "from": "XMS", "to": "SHH", "date": past_str},
+        ]
+
+        def fake_crawl_screen(telecode, date):
+            if telecode == "SHH":
+                with db.tx() as conn:
+                    conn.executemany(
+                        """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,
+                                                      train_no,station_train_date,start_train_date,train_style,train_flag)
+                           VALUES(?,?,?,?,?,?,?,?,?)""",
+                        [
+                            ("SHH", "上海", date, "G1", "T_S1", date, date, "CR400BF", ""),
+                            ("SHH", "上海", date, "G2", "T_S2", date, date, "CR400AF-S", "Q1#Z#1"),
+                        ],
+                    )
+            elif telecode == "NJH":
+                with db.tx() as conn:
+                    conn.execute(
+                        """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,
+                                                      train_no,station_train_date,start_train_date,train_style,train_flag)
+                           VALUES('NJH','南京',?,'G3','T_N1',?,?,'CRH1A','')""",
+                        (date, date, date),
+                    )
+            return {"parsed": 1}
+
+        jid, ev = main_mod._create_job({"status": "running", "done": 0, "total": 0, "errors": [], "result": {}})
+        with mock.patch("app.main.crawler.crawl_tickets"), \
+             mock.patch("app.main.crawler.crawl_price"), \
+             mock.patch("app.main.crawler.crawl_station_trains", side_effect=fake_crawl_screen) as m_scr:
+            main_mod._plan_tickets_job(jid, ev, legs, fetch_styles=True, max_style_screens=2)
+
+        called = [c.args for c in m_scr.call_args_list]
+        self.assertEqual(len(called), 2)
+        self.assertEqual({tc for tc, _ in called}, {"SHH", "NJH"})
+        self.assertTrue(all(d >= today_str for _, d in called))
+
+        res = main_mod.jobs[jid]["result"]
+        self.assertEqual(res["1"]["train_style"], "CR400BF")
+        self.assertTrue(res["1"]["is_fuxing"])
+        self.assertEqual(res["2"]["train_style"], "CR400AF-S")
+        self.assertTrue(res["2"]["is_smart"])
+        self.assertIn("静", res["2"]["train_tags"])
+        self.assertEqual(res["3"]["train_style"], "CRH1A")
+        self.assertFalse(res["3"].get("is_fuxing"))
+
+        # 重复执行同样缺失车型补查（含已有库/已尝试标记），SHH/NJH/HGH 若已尝试/入库不重复抓取 SHH & NJH
+        jid2, ev2 = main_mod._create_job({"status": "running", "done": 0, "total": 0, "errors": [], "result": {}})
+        with mock.patch("app.main.crawler.crawl_tickets"), \
+             mock.patch("app.main.crawler.crawl_price"), \
+             mock.patch("app.main.crawler.crawl_station_trains", side_effect=fake_crawl_screen) as m_scr2:
+            main_mod._plan_tickets_job(jid2, ev2, legs[:4], fetch_styles=True, max_style_screens=2)
+        self.assertEqual(m_scr2.call_count, 0)
+
+        # /api/crawl/tickets with_styles=True 只为始发站补抓一次，且大屏报错不阻断余票返回
+        with mock.patch("app.main.crawler.crawl_tickets", return_value={"saved": 5}), \
+             mock.patch("app.main.crawler.crawl_station_trains", side_effect=RuntimeError("mock screen fail")) as m_tscr:
+            tk_res = main_mod.crawl_tickets(
+                main_mod.TicketReq(from_station="HGH", to_station="XMS", date=fut_str, with_styles=True)
+            )
+        self.assertEqual(tk_res["saved"], 5)
+        self.assertEqual(m_tscr.call_count, 1)
+
+    def test_frontend_ui_badges_and_auto_style_hooks(self):
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        for token in (
+            "function styleBadges(arg)",
+            "rail-badges",
+            'id="s-auto-style"',
+            'id="c-styles"',
+            "fetch_styles",
+            "智能动车",
+            "复兴号",
+            "l.train_tags",
+            "l.is_smart",
+            "l.is_fuxing",
+            "with_styles",
+        ):
+            self.assertIn(token, html)
+
+
+class TestRailLineInference(TempDBTestCase):
+    def test_all_line_stations_exist_in_official_station_names(self):
+        from app import rail_lines
+
+        official = {s["name"] for s in parsers.parse_stations((SAMPLES / "station_name.js").read_text(encoding="utf-8"))}
+        missing = []
+        for lname, _, _, paths in rail_lines.LINE_DEFS:
+            for path in paths:
+                for st in path:
+                    if st not in official:
+                        missing.append((lname, st))
+        for pair in list(rail_lines.AMBIGUOUS_NONSTOP_PAIRS) + list(rail_lines.SAME_HUB_APPROACHES):
+            for st in pair:
+                if st not in official:
+                    missing.append(("pair", st))
+        self.assertEqual(missing, [])
+
+    def test_certain_vs_ambiguous_fujian_and_trunk_corridors(self):
+        from app import rail_lines
+
+        # 1. 福州→延平：绝对确定走合福高铁
+        r_hf = rail_lines.infer_leg_lines("福州", "延平", train_code="G163", train_style="CR400BF-Z")
+        self.assertIsNotNone(r_hf)
+        self.assertTrue(r_hf["certain"])
+        self.assertEqual(r_hf["summary"], "合福高铁")
+        self.assertEqual(r_hf["certain_summary"], "合福高铁")
+
+        # 2. 厦门北→漳州 一站直达：杭深/龙厦/甬广三线共廊，不盲目拍板
+        r_xz = rail_lines.infer_leg_lines("厦门北", "漳州", train_code="G325", train_style="CR400BF")
+        self.assertIsNotNone(r_xz)
+        self.assertFalse(r_xz["certain"])
+        self.assertEqual(r_xz["certain_summary"], "")
+        self.assertEqual(set(r_xz["segments"][0]["lines"]), {"甬广高铁(福厦段)", "杭深线", "龙厦线"})
+        self.assertTrue(r_xz["summary"].endswith("?"))
+
+        # 2b. 停靠角美：剔除甬广高铁(福厦段)，缩窄为 杭深线/龙厦线
+        r_jm = rail_lines.infer_leg_lines("厦门北", "漳州", train_code="D6412", stop_names=["厦门北", "角美", "漳州"])
+        self.assertFalse(r_jm["certain"])
+        self.assertEqual(set(r_jm["segments"][0]["lines"]), {"杭深线", "龙厦线"})
+
+        # 2c. 普速 K 车走 厦门北→漳州：杭深与福厦高铁不跑普速 K，收窄至 龙厦线
+        r_k = rail_lines.infer_leg_lines("厦门北", "漳州", train_code="K904")
+        self.assertTrue(r_k["certain"])
+        self.assertEqual(r_k["summary"], "龙厦线")
+
+        # 3. 同城枢纽接入吸收：福州→福州南→泉州南→厦门北，靠泉州南确定整段走 甬广高铁(福厦段)
+        r_fg = rail_lines.infer_leg_lines(
+            "福州", "厦门北", train_code="G1651", stop_names=["福州", "福州南", "福清西", "泉州南", "厦门北"]
+        )
+        self.assertTrue(r_fg["certain"])
+        self.assertEqual(r_fg["summary"], "甬广高铁(福厦段)")
+
+        # 4. 前确定 + 后共廊待定：福州南→泉州南→厦门北→漳州
+        r_mix = rail_lines.infer_leg_lines(
+            "福州南", "漳州", train_code="G1651", stop_names=["福州南", "泉州南", "厦门北", "漳州"]
+        )
+        self.assertFalse(r_mix["certain"])
+        self.assertEqual(r_mix["certain_summary"], "甬广高铁(福厦段) → 待定")
+
+        # 5. 跨线串联：福州→延平→上饶→南昌西 => 合福高铁 → 沪昆高铁
+        r_cross = rail_lines.infer_leg_lines(
+            "福州", "南昌西", train_code="G168", stop_names=["福州", "延平", "上饶", "南昌西"]
+        )
+        self.assertTrue(r_cross["certain"])
+        self.assertEqual(r_cross["summary"], "合福高铁 → 沪昆高铁")
+
+        # 6. 杭州东→福州：直跳防误判；停延平 vs 停温州南分别消歧
+        r_hz_fz = rail_lines.infer_leg_lines("杭州东", "福州", train_code="G163")
+        self.assertFalse(r_hz_fz["certain"])
+        r_hz_hf = rail_lines.infer_leg_lines("杭州东", "福州", train_code="G163", stop_names=["杭州东", "上饶", "延平", "福州"])
+        self.assertTrue(r_hz_hf["certain"])
+        self.assertEqual(r_hz_hf["summary"], "沪昆高铁 → 合福高铁")
+        r_hz_hs = rail_lines.infer_leg_lines("杭州东", "福州", train_code="D3201", stop_names=["杭州东", "宁波", "温州南", "福州"])
+        self.assertTrue(r_hz_hs["certain"])
+        self.assertEqual(r_hz_hs["summary"], "杭深线")
+
+        # 7. 牵引制式与车型区分共站平行线（南京→上海）：G 走沪宁城际、K/CR200J 走京沪线、未知车型 D 保留双候选
+        self.assertEqual(rail_lines.infer_leg_lines("南京", "上海", train_code="G7001")["summary"], "沪宁城际")
+        self.assertEqual(rail_lines.infer_leg_lines("南京", "上海", train_code="K155")["summary"], "京沪线")
+        self.assertEqual(
+            rail_lines.infer_leg_lines("南京", "上海", train_code="D701", train_style="CR200J")["summary"],
+            "京沪线",
+        )
+        r_d_unk = rail_lines.infer_leg_lines("南京", "上海", train_code="D305")
+        self.assertFalse(r_d_unk["certain"])
+        self.assertEqual(set(r_d_unk["segments"][0]["lines"]), {"沪宁城际", "京沪线"})
+
+    def test_transfer_main_apis_and_ui_rail_line_integration(self):
+        from datetime import timedelta
+        from app import main as main_mod
+
+        fut_str = (db.cn_today() + timedelta(days=2)).isoformat()
+        with db.tx() as conn:
+            conn.executemany(
+                "INSERT INTO stations(telecode,name,city) VALUES(?,?,?)",
+                [
+                    ("FZS", "福州", "福州"),
+                    ("YPS", "延平", "南平"),
+                    ("XKS", "厦门北", "厦门"),
+                    ("ZUS", "漳州", "漳州"),
+                    ("NKH", "南京", "南京"),
+                    ("SHH", "上海", "上海"),
+                ],
+            )
+            conn.executemany(
+                """INSERT INTO train_stops(train_no,station_train_code,train_date,station_no,station_name,telecode,arrive_time,start_time,enabled)
+                   VALUES(?,?,?,?,?,?,?,?,1)""",
+                [
+                    ("57000G16800", "G168", "2026-11-28", 1, "福州", "FZS", "----", "08:00"),
+                    ("57000G16800", "G168", "2026-11-28", 2, "古田北", "", "08:22", "08:24"),
+                    ("57000G16800", "G168", "2026-11-28", 3, "延平", "YPS", "08:40", "08:40"),
+                    ("57000G32500", "G325", "2026-11-28", 1, "厦门北", "XKS", "----", "09:00"),
+                    ("57000G32500", "G325", "2026-11-28", 2, "漳州", "ZUS", "09:19", "09:19"),
+                    ("55000D30500", "D305", "2026-11-28", 1, "南京", "NKH", "----", "10:00"),
+                    ("55000D30500", "D305", "2026-11-28", 2, "上海", "SHH", "12:30", "12:30"),
+                ],
+            )
+            conn.execute(
+                """INSERT INTO tickets(train_no,station_train_code,train_date,from_telecode,to_telecode,
+                                       from_station_no,to_station_no,start_time,arrive_time,duration,can_web_buy,seats,seat_types)
+                   VALUES('57000G16800','G168','2026-11-28','FZS','YPS','01','03','08:00','08:40','00:40','Y','{"ze":"有"}','O')"""
+            )
+
+        res_hf = transfer.search("福州", "延平", "2026-11-28", max_legs=1, expand_city=False)
+        leg_hf = res_hf["direct"][0]["legs"][0]
+        self.assertTrue(leg_hf["rail_lines"]["certain"])
+        self.assertEqual(leg_hf["rail_lines"]["summary"], "合福高铁")
+
+        res_xz = transfer.search("厦门北", "漳州", "2026-11-28", max_legs=1, expand_city=False)
+        leg_xz = res_xz["direct"][0]["legs"][0]
+        self.assertFalse(leg_xz["rail_lines"]["certain"])
+        self.assertEqual(leg_xz["rail_lines"]["certain_summary"], "")
+
+        tk_api = main_mod.tickets("FZS", "YPS", "2026-11-28")
+        self.assertEqual(tk_api[0]["rail_lines"]["summary"], "合福高铁")
+
+        tt_api = main_mod.timetable("57000G16800")
+        self.assertEqual(tt_api["rail_lines"]["summary"], "合福高铁")
+        self.assertEqual(tt_api["stops"][1]["rail_line"]["label"], "合福高铁")
+
+        tr_api = main_mod.trains("G168")
+        self.assertEqual(tr_api[0]["rail_lines"]["summary"], "合福高铁")
+
+        # 补查车型获取到 CRH2B 后，D305(南京→上海) 在 build_out 自动消歧为确定 沪宁城际
+        def fake_screen_nj(tc, date):
+            with db.tx() as conn:
+                conn.execute(
+                    """INSERT INTO station_trains(station_telecode,station_name,query_date,station_train_code,
+                                                  train_no,station_train_date,start_train_date,train_style)
+                       VALUES('NKH','南京',?,'D305','55000D30500',?,?,'CRH2B')""",
+                    (date, date, date),
+                )
+            return {"parsed": 1}
+
+        jid, ev = main_mod._create_job({"status": "running", "done": 0, "total": 0, "errors": [], "result": {}})
+        with mock.patch("app.main.crawler.crawl_tickets"), \
+             mock.patch("app.main.crawler.crawl_price"), \
+             mock.patch("app.main.crawler.crawl_station_trains", side_effect=fake_screen_nj):
+            main_mod._plan_tickets_job(
+                jid, ev,
+                [{"key": "k1", "train_no": "55000D30500", "train": "D305", "from": "NKH", "to": "SHH",
+                  "from_name": "南京", "to_name": "上海", "date": fut_str}],
+                fetch_styles=True, max_style_screens=2,
+            )
+        rl_out = main_mod.jobs[jid]["result"]["k1"]["rail_lines"]
+        self.assertTrue(rl_out["certain"])
+        self.assertEqual(rl_out["summary"], "沪宁城际")
+
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        for token in ('id="s-line-mode"', 'id="d-line-mode"', "railLineMode", "function lineBadge(arg)", "rline-ok", "rline-cand"):
+            self.assertIn(token, html)
 
 
 if __name__ == "__main__":

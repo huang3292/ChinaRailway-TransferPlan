@@ -58,6 +58,8 @@ except ImportError:
             return tp(**val)
         if tp is bool and not isinstance(val, bool):
             return str(val).strip().lower() in ("1", "true", "yes", "on") if isinstance(val, str) else bool(val)
+        if tp is str and val is not None and not isinstance(val, str):
+            return str(val)
         if tp is int and not isinstance(val, int):
             return int(val)
         if tp is float and not isinstance(val, float):
@@ -126,7 +128,7 @@ except ImportError:
             self.mounts.append((path.rstrip("/"), app_obj))
 
 
-from . import china_geo, db, geo, importer, parsers, transfer
+from . import china_geo, db, geo, importer, parsers, rail_lines, transfer
 from .crawler import CrawlCancelled, CrawlError, crawler, station_timetable_context
 
 app = FastAPI(title="12306 智能中转")
@@ -289,6 +291,56 @@ def _train_style_map(train_nos: set[str] | list[str]) -> dict[str, str]:
         if r.get("style"):
             out.setdefault(r["train_no"], r["style"])
     return out
+
+
+_style_tried_lock = threading.Lock()
+_TRIED_STYLE_SCREENS: set[tuple[str, str, str]] = set()
+MAX_PLAN_STYLE_SCREENS = 6
+
+
+def _station_screen_cached(telecode: str, date: str) -> bool:
+    if db.rows(
+        "SELECT 1 FROM station_trains WHERE station_telecode=? AND station_train_date=? LIMIT 1",
+        (telecode, date),
+    ):
+        return True
+    k = (str(db.DB_PATH), telecode, date)
+    with _style_tried_lock:
+        return k in _TRIED_STYLE_SCREENS
+
+
+def _ensure_station_style_screen(telecode: str, date: str) -> bool:
+    """仅当该站当日无大屏入库且未尝试过时抓取一次车站大屏（1次请求覆盖整站全部经由车次车型）。"""
+    if _station_screen_cached(telecode, date):
+        return False
+    k = (str(db.DB_PATH), telecode, date)
+    with _style_tried_lock:
+        if len(_TRIED_STYLE_SCREENS) > 5000:
+            _TRIED_STYLE_SCREENS.clear()
+        _TRIED_STYLE_SCREENS.add(k)
+    crawler.crawl_station_trains(telecode, date)
+    return True
+
+
+def _apply_train_features(item: dict, style: str = "", dw_flag: str = "",
+                          ex_flag: str = "", train_flag: str = "") -> dict:
+    if style:
+        item["train_style"] = style
+    if train_flag and not item.get("train_flag"):
+        item["train_flag"] = train_flag
+    feat = parsers.extract_train_features(
+        train_style=style or item.get("train_style") or item.get("jiaolu_train_style"),
+        dw_flag=dw_flag or item.get("dw_flag"),
+        exchange_train_flag=ex_flag or item.get("exchange_train_flag"),
+        train_flag=train_flag or item.get("train_flag"),
+    )
+    if feat["is_smart"]:
+        item["is_smart"] = True
+    if feat["is_fuxing"]:
+        item["is_fuxing"] = True
+    if feat["tags"]:
+        item["train_tags"] = feat["tags"]
+    return item
 
 
 def _validate_date(d: str) -> str:
@@ -591,6 +643,7 @@ class TicketReq(BaseModel):
     to_station: str
     date: str
     with_prices: bool = False
+    with_styles: bool = False
 
 
 @app.post("/api/crawl/tickets")
@@ -598,6 +651,12 @@ def crawl_tickets(body: TicketReq):
     _check_date(body.date)
     f, t = _station_or_400(body.from_station), _station_or_400(body.to_station)
     result = _run(crawler.crawl_tickets, f["telecode"], t["telecode"], body.date)
+    if body.with_styles and body.date >= db.cn_today().isoformat():
+        try:
+            _run(_ensure_station_style_screen, f["telecode"], body.date)
+        except Exception:
+            # 车站大屏补抓车型属增量装饰，失败不影响余票主流程返回
+            pass
     if body.with_prices:
         job_id, ev = _create_job({"status": "running", "done": 0, "total": 0, "errors": []})
         threading.Thread(target=_price_job, args=(job_id, ev, f["telecode"], t["telecode"], body.date),
@@ -880,10 +939,10 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
                         WHERE from_telecode IN ({phf}) AND to_telecode IN ({pht}) AND train_date=?""",
                     (*ftcs, *ttcs, date),
                 )
-                if (
+                if r["from_station_no"] and r["to_station_no"] and (
                     r["train_no"],
-                    str(r["from_station_no"] or "").zfill(2),
-                    str(r["to_station_no"] or "").zfill(2),
+                    str(r["from_station_no"]).zfill(2),
+                    str(r["to_station_no"]).zfill(2),
                 ) not in have_prices
             ]
             with _jobs_lock:
@@ -891,8 +950,8 @@ def _route_job(job_id: str, ev: threading.Event, from_q: str, to_q: str, date: s
             _job_update(job_id, phase="price", total=cur_total + len(tk))
             for r in tk:
                 run(f"票价 {_fmt_train(r['station_train_code'], r['train_no'])}",
-                    crawler.crawl_price, r["train_no"], r["from_station_no"] or "",
-                    r["to_station_no"] or "", r["seat_types"] or "", date)
+                    crawler.crawl_price, r["train_no"], str(r["from_station_no"]).zfill(2),
+                    str(r["to_station_no"]).zfill(2), r["seat_types"] or "", date)
 
         _job_update(job_id, phase="done", status="done")
     except CrawlCancelled:
@@ -941,10 +1000,15 @@ def station_trains(station: str, date: str | None = None):
         _check_date(date)
     s = _station_or_400(station)
     if date:
-        return db.rows("""SELECT * FROM station_trains WHERE station_telecode=? AND station_train_date=?
+        rows = db.rows("""SELECT * FROM station_trains WHERE station_telecode=? AND station_train_date=?
                           ORDER BY start_time""", (s["telecode"], date))
-    return db.rows("""SELECT * FROM station_trains WHERE station_telecode=?
-                      ORDER BY station_train_date, start_time LIMIT 500""", (s["telecode"],))
+    else:
+        rows = db.rows("""SELECT * FROM station_trains WHERE station_telecode=?
+                          ORDER BY station_train_date, start_time LIMIT 500""", (s["telecode"],))
+    for r in rows:
+        _apply_train_features(r, style=(r.get("train_style") or r.get("jiaolu_train_style") or ""),
+                              train_flag=(r.get("train_flag") or ""))
+    return rows
 
 
 @app.get("/api/timetable")
@@ -952,6 +1016,18 @@ def timetable(train_no: str, live_train_no: str | None = None):
     n2c = db.station_lookup()
     cand_nos = [x for x in dict.fromkeys([live_train_no, train_no]) if x]
     styles = _train_style_map(cand_nos)
+    tk_flags = {}
+    if cand_nos:
+        ph_f = ",".join("?" * len(cand_nos))
+        for rf in db.rows(
+            f"""SELECT train_no, exchange_train_flag, dw_flag, train_flag
+                FROM tickets WHERE train_no IN ({ph_f})
+                  AND (COALESCE(dw_flag,'')<>'' OR COALESCE(exchange_train_flag,'')='1' OR COALESCE(train_flag,'')<>'')
+                ORDER BY train_date DESC, id DESC LIMIT 1""",
+            tuple(cand_nos),
+        ):
+            tk_flags = rf
+            break
     for tn in cand_nos:
         r = db.rows("SELECT DISTINCT train_date FROM train_stops WHERE train_no=? ORDER BY train_date DESC LIMIT 1",
                     (tn,))
@@ -964,9 +1040,33 @@ def timetable(train_no: str, live_train_no: str | None = None):
             code = next((s.get("station_train_code") for s in stops if s.get("station_train_code")), None)
             if not code:
                 code = _train_code_map([tn]).get(tn)
-            return {"train_no": tn, "station_train_code": code,
-                    "train_style": styles.get(tn) or styles.get(train_no) or "",
-                    "stops": stops, "complete": True, "source": "train_stops"}
+            st, scr_flag = transfer._lookup_train_meta(
+                tn, live_train_no if tn == train_no else train_no, code, style_map=styles
+            )
+            res = {"train_no": tn, "station_train_code": code,
+                   "train_style": st or styles.get(tn) or styles.get(train_no) or "",
+                   "stops": stops, "complete": True, "source": "train_stops"}
+            if len(stops) >= 2:
+                rl = rail_lines.infer_leg_lines(
+                    stops[0].get("station_name") or "",
+                    stops[-1].get("station_name") or "",
+                    train_code=code or "",
+                    train_style=res["train_style"],
+                    stop_names=[s.get("station_name") or "" for s in stops],
+                )
+                if rl:
+                    res["rail_lines"] = rl
+                hops = rail_lines.infer_timetable_hops(stops, train_code=code or "", train_style=res["train_style"])
+                for s, h in zip(stops, hops):
+                    if h:
+                        s["rail_line"] = h
+            return _apply_train_features(
+                res,
+                style=res["train_style"],
+                dw_flag=tk_flags.get("dw_flag") or "",
+                ex_flag=tk_flags.get("exchange_train_flag") or "",
+                train_flag=tk_flags.get("train_flag") or scr_flag,
+            )
     # 退回车站大屏：把已抓取各站的经停拼成（可能不完整的）时刻表
     for tn in cand_nos:
         scr = db.rows("""SELECT station_train_code, station_no, station_name, station_telecode, arrive_time, start_time,
@@ -984,9 +1084,33 @@ def timetable(train_no: str, live_train_no: str | None = None):
                           "arrive_time": s["arrive_time"], "start_time": s["start_time"],
                           "stopover_time": s["stopover_time"], "enabled": 1})
         if stops:
-            return {"train_no": tn, "station_train_code": code,
-                    "train_style": styles.get(tn) or styles.get(train_no) or "",
-                    "stops": stops, "complete": False, "source": "station_screen"}
+            st, scr_flag = transfer._lookup_train_meta(
+                tn, live_train_no if tn == train_no else train_no, code, style_map=styles
+            )
+            res = {"train_no": tn, "station_train_code": code,
+                   "train_style": st or styles.get(tn) or styles.get(train_no) or "",
+                   "stops": stops, "complete": False, "source": "station_screen"}
+            if len(stops) >= 2:
+                rl = rail_lines.infer_leg_lines(
+                    stops[0].get("station_name") or "",
+                    stops[-1].get("station_name") or "",
+                    train_code=code or "",
+                    train_style=res["train_style"],
+                    stop_names=[s.get("station_name") or "" for s in stops],
+                )
+                if rl:
+                    res["rail_lines"] = rl
+                hops = rail_lines.infer_timetable_hops(stops, train_code=code or "", train_style=res["train_style"])
+                for s, h in zip(stops, hops):
+                    if h:
+                        s["rail_line"] = h
+            return _apply_train_features(
+                res,
+                style=res["train_style"],
+                dw_flag=tk_flags.get("dw_flag") or "",
+                ex_flag=tk_flags.get("exchange_train_flag") or "",
+                train_flag=tk_flags.get("train_flag") or scr_flag,
+            )
     raise HTTPException(404, f"车次({train_no})暂无时刻表数据")
 
 
@@ -1019,9 +1143,17 @@ def trains(q: str = "", limit: int = 50):
                            GROUP BY train_no LIMIT ?""", tuple(params))
     styles = _train_style_map([r.get("train_no") for r in rows if r.get("train_no")])
     for r in rows:
-        st = styles.get(r.get("train_no"))
-        if st:
-            r["train_style"] = st
+        st, scr_flag = transfer._lookup_train_meta(
+            r.get("train_no"), None, r.get("station_train_code"), style_map=styles
+        )
+        _apply_train_features(r, style=st, train_flag=scr_flag)
+        seq = transfer._lookup_stop_names(r.get("train_no"), None, r.get("station_train_code"))
+        if seq and len(seq) >= 2:
+            rl = rail_lines.infer_leg_lines(
+                seq[0], seq[-1], train_code=r.get("station_train_code") or "", train_style=st, stop_names=seq
+            )
+            if rl:
+                r["rail_lines"] = rl
     return rows
 
 
@@ -1059,9 +1191,25 @@ def tickets(from_station: str, to_station: str, date: str):
     for r in tk_rows:
         r["from_name"] = f["name"]
         r["to_name"] = t["name"]
-        st = styles.get(r.get("train_no"))
-        if st:
-            r["train_style"] = st
+        st, scr_flag = transfer._lookup_train_meta(
+            r.get("train_no"), None, r.get("station_train_code"), style_map=styles
+        )
+        _apply_train_features(
+            r,
+            style=st,
+            dw_flag=r.get("dw_flag") or "",
+            ex_flag=r.get("exchange_train_flag") or "",
+            train_flag=(r.get("train_flag") or "") or scr_flag,
+        )
+        rl = rail_lines.infer_leg_lines(
+            f["name"],
+            t["name"],
+            train_code=r.get("station_train_code") or "",
+            train_style=st,
+            stop_names=transfer._lookup_stop_names(r.get("train_no"), None, r.get("station_train_code")),
+        )
+        if rl:
+            r["rail_lines"] = rl
         fno_s = str(r.get("from_station_no") or "").zfill(2)
         tno_s = str(r.get("to_station_no") or "").zfill(2)
         by_date = price_buckets.get((r["train_no"], fno_s, tno_s), {})
@@ -1481,7 +1629,11 @@ class GeoStationReq(BaseModel):
 def geo_update_station(telecode: str, body: GeoStationReq):
     tc = (telecode or "").strip().upper()
     if body.lat is not None and body.lon is not None and not geo.in_china_bbox(body.lat, body.lon):
-        raise HTTPException(400, "经纬度超出中国境内边界，拒绝保存")
+        st_info = db.resolve_station(tc) or {}
+        st_prov = china_geo.infer_station_province(st_info.get("name"), st_info.get("city"))
+        laos_ok = (st_prov == "老挝") and (13.5 <= body.lat <= 23.0 and 100.0 <= body.lon <= 108.0)
+        if not laos_ok:
+            raise HTTPException(400, "经纬度超出中国境内边界，拒绝保存")
     _run(
         db.update_station_coords,
         tc, body.lat, body.lon, "manual", body.coord_status,
@@ -1727,6 +1879,8 @@ class PlanLeg(BaseModel):
 
 class PlanTicketsReq(BaseModel):
     legs: list[PlanLeg]
+    fetch_styles: bool = False
+    max_style_screens: int = MAX_PLAN_STYLE_SCREENS
 
 
 def _leg_ident(l: PlanLeg) -> tuple:
@@ -1770,13 +1924,20 @@ def plan_tickets(body: PlanTicketsReq):
         })
     if not legs:
         raise HTTPException(400, "没有可查询的行程段")
+    max_sc = max(0, min(int(body.max_style_screens or 0), 10))
     job_id, ev = _create_job({"status": "running", "phase": "tickets", "done": 0, "total": 0,
                                "current": "正在准备查询余票...", "errors": [], "result": {}})
-    threading.Thread(target=_plan_tickets_job, args=(job_id, ev, legs), daemon=True).start()
+    threading.Thread(
+        target=_plan_tickets_job,
+        args=(job_id, ev, legs),
+        kwargs={"fetch_styles": bool(body.fetch_styles), "max_style_screens": max_sc},
+        daemon=True,
+    ).start()
     return {"job_id": job_id, "legs": len(legs)}
 
 
-def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
+def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict],
+                      fetch_styles: bool = False, max_style_screens: int = MAX_PLAN_STYLE_SCREENS):
     crawler.set_cancel_event(ev)
     try:
         today = db.cn_today().isoformat()
@@ -1961,6 +2122,31 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
                         res["price_date"] = pr[0]["train_date"]
                         if pr[0]["train_date"] != l["date"]:
                             res["price_stale"] = True
+                plan_code_now = l.get("train") or train_codes.get(l["train_no"], "")
+                live_code_now = (r.get("station_train_code") if r else "") or ""
+                st, scr_flag = transfer._lookup_train_meta(
+                    r["train_no"] if r else None,
+                    l["train_no"],
+                    live_code_now or plan_code_now,
+                )
+                _apply_train_features(
+                    res,
+                    style=st,
+                    dw_flag=(r.get("dw_flag") if r else "") or "",
+                    ex_flag=(r.get("exchange_train_flag") if r else "") or "",
+                    train_flag=((r.get("train_flag") if r else "") or "") or scr_flag,
+                )
+                rl = rail_lines.infer_leg_lines(
+                    l.get("from_name") or tc_name.get(l["from"], ""),
+                    l.get("to_name") or tc_name.get(l["to"], ""),
+                    train_code=live_code_now or plan_code_now,
+                    train_style=st,
+                    stop_names=transfer._lookup_stop_names(
+                        r["train_no"] if r else None, l["train_no"], live_code_now or plan_code_now
+                    ),
+                )
+                if rl:
+                    res["rail_lines"] = rl
                 if res:
                     out[l["key"]] = res
             return out
@@ -2049,6 +2235,58 @@ def _plan_tickets_job(job_id: str, ev: threading.Event, legs: list[dict]):
                 _job_append(job_id, "errors", f"票价 {t_label} {fno}→{tno}: {e}")
             _job_inc(job_id, "done")
             _job_update(job_id, result=build_out(maps, True))
+
+        # 增量补抓车型：仅对缺 train_style 的车次，按出发站(station,date)去重并优先枢纽，
+        # 单批硬上限 max_style_screens（默认6次），1 次大屏请求可覆盖整站上百趟车且入库不重复查
+        if fetch_styles and max_style_screens > 0:
+            missing_counts: dict[tuple[str, str], int] = {}
+            for l in legs:
+                if l["date"] < today:
+                    continue
+                r = find_tk(maps, l)
+                code_now = ((r.get("station_train_code") if r else "") or l.get("train")
+                            or train_codes.get(l["train_no"], ""))
+                st_cur, _ = transfer._lookup_train_meta(
+                    r["train_no"] if r else None, l["train_no"], code_now
+                )
+                if not st_cur and not _station_screen_cached(l["from"], l["date"]):
+                    sk = (l["from"], l["date"])
+                    missing_counts[sk] = missing_counts.get(sk, 0) + 1
+            style_targets = [
+                k for k, _ in sorted(missing_counts.items(), key=lambda kv: -kv[1])[:max_style_screens]
+            ]
+            if style_targets:
+                with _jobs_lock:
+                    cur_total = jobs[job_id]["total"]
+                _job_update(job_id, phase="style", total=cur_total + len(style_targets))
+                for ftc, sd in style_targets:
+                    if ev.is_set():
+                        _job_update(job_id, result=build_out(maps, True), status="cancelled")
+                        return
+                    still_missing = False
+                    for l in legs:
+                        if l["from"] == ftc and l["date"] == sd:
+                            r = find_tk(maps, l)
+                            code_now = ((r.get("station_train_code") if r else "") or l.get("train")
+                                        or train_codes.get(l["train_no"], ""))
+                            st_cur, _ = transfer._lookup_train_meta(
+                                r["train_no"] if r else None, l["train_no"], code_now
+                            )
+                            if not st_cur:
+                                still_missing = True
+                                break
+                    _job_update(job_id, current=f"补查车型 {_fmt_station(tc_name.get(ftc), ftc)} ({sd})")
+                    if still_missing:
+                        try:
+                            _ensure_station_style_screen(ftc, sd)
+                        except CrawlCancelled:
+                            _job_update(job_id, result=build_out(maps, True), status="cancelled")
+                            return
+                        except Exception:
+                            # 车型大屏补查失败不阻断余票/票价成功返回
+                            pass
+                    _job_inc(job_id, "done")
+                    _job_update(job_id, result=build_out(maps, True))
 
         _job_update(job_id, result=build_out(maps, True), phase="done", status="done")
     finally:

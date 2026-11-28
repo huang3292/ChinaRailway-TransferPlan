@@ -123,6 +123,7 @@ CREATE TABLE IF NOT EXISTS station_trains(
   running_fig TEXT,
   train_style TEXT,
   jiaolu_train_style TEXT,
+  train_flag TEXT,
   start_start_time TEXT,
   end_arrive_time TEXT,
   running_time TEXT,
@@ -167,6 +168,9 @@ CREATE TABLE IF NOT EXISTS tickets(
   can_web_buy TEXT,
   seat_types TEXT,
   seats TEXT,
+  exchange_train_flag TEXT,
+  dw_flag TEXT,
+  train_flag TEXT,
   raw_id INTEGER,
   UNIQUE(train_no, train_date, from_telecode, to_telecode)
 );
@@ -275,10 +279,14 @@ def init_db():
         conn.executescript(SCHEMA)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(station_trains)")}
         added = [c for c in ("start_start_time", "end_arrive_time", "running_time", "distance",
-                             "train_style", "jiaolu_train_style") if c not in cols]
+                             "train_style", "jiaolu_train_style", "train_flag") if c not in cols]
         for c in added:
             typ = "INTEGER" if c == "distance" else "TEXT"
             conn.execute(f"ALTER TABLE station_trains ADD COLUMN {c} {typ}")
+        tk_cols = {r[1] for r in conn.execute("PRAGMA table_info(tickets)")}
+        tk_added = [c for c in ("exchange_train_flag", "dw_flag", "train_flag") if c not in tk_cols]
+        for c in tk_added:
+            conn.execute(f"ALTER TABLE tickets ADD COLUMN {c} TEXT")
         st_cols = {r[1] for r in conn.execute("PRAGMA table_info(stations)")}
         st_migrations = (
             ("lat", "REAL"),
@@ -316,6 +324,8 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rp_id_fetched ON raw_payloads(id, fetched_at)")
     if added:
         _backfill_screen()
+    if tk_added:
+        _backfill_tickets()
     bump_data_version()
 
 
@@ -331,12 +341,40 @@ def _backfill_screen():
             continue
 
 
+def _backfill_tickets():
+    """旧库升级：用原始留档补齐余票 dw_flag/exchange_train_flag/train_flag，仅更新标志列不覆盖席别余票。"""
+    from . import parsers
+
+    updates = []
+    for r in rows("SELECT params,payload FROM raw_payloads WHERE api_type='left_ticket' ORDER BY id ASC"):
+        try:
+            recs = parsers.parse_left_ticket(json.loads(r["payload"]), json.loads(r["params"] or "{}"))
+        except (ValueError, KeyError, TypeError):
+            continue
+        for rec in recs:
+            if not (rec.get("dw_flag") or rec.get("exchange_train_flag") or rec.get("train_flag")):
+                continue
+            updates.append((
+                rec.get("exchange_train_flag") or "",
+                rec.get("dw_flag") or "",
+                rec.get("train_flag") or "",
+                rec["train_no"], rec["train_date"], rec["from_telecode"], rec["to_telecode"],
+            ))
+    if updates:
+        with _write_lock, tx() as conn:
+            conn.executemany(
+                """UPDATE tickets SET exchange_train_flag=?, dw_flag=?, train_flag=?
+                   WHERE train_no=? AND train_date=? AND from_telecode=? AND to_telecode=?""",
+                updates,
+            )
+
+
 def rows(sql, params=()):
     return [dict(r) for r in get_conn().execute(sql, params).fetchall()]
 
 
 def archive_raw(api_type: str, payload: str, params: dict, source: str) -> int:
-    with tx() as conn:
+    with _write_lock, tx() as conn:
         cur = conn.execute(
             "INSERT INTO raw_payloads(api_type,params,source,fetched_at,payload) VALUES(?,?,?,?,?)",
             (api_type, json.dumps(params, ensure_ascii=False), source,
@@ -347,14 +385,16 @@ def archive_raw(api_type: str, payload: str, params: dict, source: str) -> int:
 
 def clear_cache(before_date: str | None = None, include_raw: bool = False) -> dict:
     deleted = {}
-    with tx() as conn:
+    # WHY: _write_lock 串行化写入，且空串站日期记录不属于历史日期，必须明确排除避免误删。
+    with _write_lock, tx() as conn:
         if before_date:
             deleted["station_trains"] = conn.execute(
-                "DELETE FROM station_trains WHERE station_train_date < ?", (before_date,)).rowcount
+                "DELETE FROM station_trains WHERE station_train_date != '' AND station_train_date < ?",
+                (before_date,)).rowcount
             deleted["train_stops"] = conn.execute(
                 "DELETE FROM train_stops WHERE train_date != '' AND train_date < ?", (before_date,)).rowcount
             deleted["tickets"] = conn.execute(
-                "DELETE FROM tickets WHERE train_date < ?", (before_date,)).rowcount
+                "DELETE FROM tickets WHERE train_date != '' AND train_date < ?", (before_date,)).rowcount
             deleted["prices"] = conn.execute(
                 "DELETE FROM prices WHERE train_date != '' AND train_date < ?", (before_date,)).rowcount
             if include_raw:
@@ -634,7 +674,7 @@ def get_setting(key: str, default=None):
 
 
 def set_setting(key: str, value, bump: bool = False):
-    with tx(bump=bump) as conn:
+    with _write_lock, tx(bump=bump) as conn:
         conn.execute(
             "INSERT INTO settings(key,value) VALUES(?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

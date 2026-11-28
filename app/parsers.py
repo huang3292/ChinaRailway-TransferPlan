@@ -11,6 +11,9 @@ LT = {
     "can_web_buy": 11, "start_train_date": 13,
     "from_station_no": 16, "to_station_no": 17,
     "seat_types": 35,
+    "exchange_train_flag": 36,
+    "dw_flag": 46,
+    "train_flag": 57,
 }
 SEAT_FIELDS = {
     20: "yxyz", 21: "gr", 22: "qt", 23: "rw", 24: "rz", 25: "tz", 26: "wz",
@@ -43,6 +46,8 @@ def norm_date(s: str | None) -> str | None:
 
 # 2026-11-25 起普速车次调整：Z→Z, T→N, K/纯数字→V；未来 T/K 预留给高速动车组，需靠车底区分
 _EMU_STYLE_RE = re.compile(r"^(?:CRH|CR\d|ZL\d)", re.I)
+_FX_STYLE_RE = re.compile(r"^(?:CR\d|ZL200J)", re.I)
+_SMART_STYLE_RE = re.compile(r"^CR\d{3}[A-Z]*-[A-Z]*(?:Z|S)$", re.I)
 _PART_LETTER_RE = re.compile(r"^([A-Za-z]*)(\d+)$")
 _TRAIN_DIGITS_RE = re.compile(r"\d+")
 
@@ -53,6 +58,65 @@ def is_emu_style(style: str | None) -> bool:
         return False
     first = str(style).strip().split("_")[0].strip()
     return bool(_EMU_STYLE_RE.match(first))
+
+
+def extract_train_features(
+    train_style: str | None = None,
+    dw_flag: str | None = None,
+    exchange_train_flag: str | None = None,
+    train_flag: str | None = None,
+) -> dict:
+    """从 12306 官方标志位与车底型号统一解析 智能动车/复兴号 与 静/馨/动感号/铺/敬/兑 标签。
+
+    口径依据 kyfw queryLeftTicket_end_js.js 与 bigScreen queryTrainByStation：
+    - dw_flag (leftTicket[46]): p[0]=='5' 智能动车, p[1]=='1' 复兴号, p[2][:1] Q=静/R=馨,
+      p[5]=='D' 动感号, p[6]!='z' 支持选铺(铺), p[7]!='z' 老年优惠(敬)
+    - exchange_train_flag (leftTicket[36]): '1' 支持积分兑换(兑)
+    - train_flag (bigScreen / leftTicket[57]): tf[0][:1] Q=静/R=馨, 'Z' in tf[1] 智能动车, tf[2]=='1' 复兴号
+    - 车型字符串仅作兜底：CR4xx-Z/-AZ/-BZ/-S/-AS/-BS 判智能动车；CR*/ZL200J 判复兴号
+    """
+    disp = str(train_style).strip().split("_")[0].strip() if train_style else ""
+    dw = [x.strip() for x in str(dw_flag or "").split("#")] if dw_flag else []
+    tf = [x.strip() for x in str(train_flag or "").split("#")] if train_flag else []
+
+    is_smart = bool(
+        (len(dw) > 0 and dw[0] == "5")
+        or (len(tf) > 1 and "Z" in tf[1].upper())
+        or (disp and _SMART_STYLE_RE.match(disp))
+    )
+    is_fuxing = bool(
+        is_smart
+        or (len(dw) > 1 and dw[1] == "1")
+        or (len(tf) > 2 and tf[2] == "1")
+        or (disp and _FX_STYLE_RE.match(disp))
+    )
+
+    tags: list[str] = []
+
+    def _add(tag: str):
+        if tag not in tags:
+            tags.append(tag)
+
+    q_head = (dw[2][:1] if len(dw) > 2 and dw[2] else "") or (tf[0][:1] if len(tf) > 0 and tf[0] else "")
+    if q_head == "Q":
+        _add("静")
+    elif q_head == "R":
+        _add("馨")
+    if len(dw) > 5 and dw[5] == "D":
+        _add("动感号")
+    if len(dw) > 6 and dw[6] not in ("", "z", "0"):
+        _add("铺")
+    if len(dw) > 7 and dw[7] not in ("", "z", "0"):
+        _add("敬")
+    if str(exchange_train_flag or "").strip() == "1":
+        _add("兑")
+
+    return {
+        "style": disp,
+        "is_smart": is_smart,
+        "is_fuxing": is_fuxing,
+        "tags": tags,
+    }
 
 
 def train_digits(code: str | None) -> str:
@@ -196,6 +260,9 @@ def parse_left_ticket(payload: dict, ctx: dict | None = None) -> list[dict]:
             "duration": f[LT["duration"]],
             "can_web_buy": f[LT["can_web_buy"]],
             "seat_types": f[LT["seat_types"]] if len(f) > LT["seat_types"] else "",
+            "exchange_train_flag": f[LT["exchange_train_flag"]] if len(f) > LT["exchange_train_flag"] else "",
+            "dw_flag": f[LT["dw_flag"]] if len(f) > LT["dw_flag"] else "",
+            "train_flag": f[LT["train_flag"]] if len(f) > LT["train_flag"] else "",
             "seats": seats,
         })
     return out
@@ -365,6 +432,7 @@ def parse_station_screen(payload: dict, ctx: dict) -> list[dict]:
             "running_fig": t.get("running_fig"),
             "train_style": t.get("train_style"),
             "jiaolu_train_style": t.get("jiaolu_train_style"),
+            "train_flag": t.get("train_flag"),
             "start_start_time": t.get("start_start_time"),
             "end_arrive_time": t.get("end_arrive_time"),
             "running_time": t.get("running_time"),
